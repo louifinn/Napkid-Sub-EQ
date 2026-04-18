@@ -58,22 +58,22 @@ NormalizedRange(0.5f, 500.0f, 0.0f, 0.5f) // skew=0.5 实现近似对数刻度
 
 ### 3.2 双精度 Biquad 实现
 
-采用 **直接 II 型（Direct Form II）** 结构，减少状态变量数量：
+采用 **转置直接 II 型（Transposed Direct Form II）** 结构：
 
 ```cpp
-struct Biquad {
-    double b0, b1, b2, a1, a2;  // 系数（double 计算）
-    double z1 = 0.0, z2 = 0.0;   // 状态变量
+struct BiquadState {
+    double z1 = 0.0, z2 = 0.0;
 
-    double process(double in) {
-        double w = in - a1 * z1 - a2 * z2;
-        double out = b0 * w + b1 * z1 + b2 * z2;
-        z2 = z1;
-        z1 = w;
+    double process(double in, const BiquadCoefficients& c) {
+        double out = c.b0 * in + z1;
+        z1 = c.b1 * in - c.a1 * out + z2;
+        z2 = c.b2 * in - c.a2 * out;
         return out;
     }
 };
 ```
+
+> **变更原因**：标准 Direct Form II 在 0.5Hz + 低 Q 的极端系数下，中间变量 `w` 会指数增长导致数值不稳定。Transposed DF2 动态范围更小，且配合 per-channel 独立状态后完全消除了通道间串扰。
 
 ### 3.3 节点级联架构
 
@@ -89,9 +89,9 @@ struct Biquad {
 
 ### 3.4 系数更新策略
 
-- **平滑更新**: 参数改变时，在音频线程内逐样本线性插值过渡到新系数，避免"咔嗒"声
-- **快照更新**: 非实时参数（如 Bypass）可立即切换
-- **线程安全**: 使用 `std::atomic` 或 `AudioProcessorValueTreeState` 的线程安全机制
+- **快照更新**: 参数改变时立即计算新系数并替换。未实现跨样本平滑插值（增益变化可能产生轻微 click，建议在宿主中使用自动化平滑）
+- **线程安全**: 系数更新仅在音频线程（`processBlock` 中调用 `updateEQParameters()`）进行。GUI 线程通过 APVTS 修改参数值，但系数计算延迟到下一次音频回调，避免多线程竞争修改 Biquad 系数
+- **浮点抖动过滤**: 使用 epsilon 容差（0.001）比较参数值，避免 APVTS 原子值的微小抖动触发无意义的系数重算
 
 ---
 
@@ -108,7 +108,7 @@ struct Biquad {
 
 | 参数 | 类型 | 范围 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| Node N Enabled | Bool | true/false | true | 节点开关 |
+| Node N Enabled | Bool | true/false | **false** | 节点开关（初始未启用） |
 | Node N Frequency | Float | 0.5 ~ 500.0 Hz | 100.0 | 中心/截止频率（对数刻度） |
 | Node N Gain | Float | -24.0 ~ +24.0 dB | 0.0 | 增益 |
 | Node N Q | Float | 0.1 ~ 10.0 | 0.707 | 品质因数 |
@@ -129,16 +129,17 @@ struct Biquad {
 
 ### 5.1 布局方案：FabFilter Pro-Q2 风格
 
-窗口尺寸：**900 × 500 像素**
+窗口尺寸：**900 × 560 像素**
 
 ```
 ┌────────────────────────────────────────────────────┬──────────┐
 │  [频响曲线区域 — 对数频率轴 0.5~500Hz, 840×500]    │          │
 │  · 深灰背景 (#2a2a2a)                              │ [Master  │
-│  · 品红色频响曲线 (#e040fb)                        │  Gain    │
-│  · 白色节点手柄 (#ffffff)                           │  Slider] │
-│  · 选中节点展开参数标签                              │   60px   │
-│  · 网格线 + 频率刻度                                │          │
+│  · 品红色频响曲线 (#e040fb) + 青色相位曲线         │  Gain    │
+│  · 实时频谱填充（半透明品红色）                     │  Slider] │
+│  · 白色节点：实心圆（选中）/ 空心圆环（未选中）     │   60px   │
+│  · 选中节点展开参数标签                              │          │
+│  · 网格线 + 频率/增益/相位刻度                      │          │
 └────────────────────────────────────────────────────┴──────────┘
 ```
 
@@ -158,7 +159,7 @@ struct Biquad {
 | 左键单击 + 按住拖动 | 新建节点后直接进入拖动模式 |
 | 左键单击已有节点 | 选中该节点（取消上一个选中） |
 | 左键拖拽节点 | 同时调节 Frequency 和 Gain |
-| 滚轮在节点上 | 调节 Q 值（节点大小/颜色随 Q 变化） |
+| 滚轮在节点上 | 调节 Q 值 |
 | 右键单击节点 | 删除该节点 |
 | 右键按住 + 拖动 | 删除拖动路径上经过的所有节点 |
 | Shift+拖拽 | 仅调节 Frequency（锁定 Gain） |
@@ -171,7 +172,7 @@ struct Biquad {
 - **频率**: 显示如 "100.0 Hz"，单击进入文本编辑
 - **增益**: 显示如 "+6.0 dB"，单击进入文本编辑
 - **Q 值**: 显示如 "Q: 1.00"，可由滚轮调节，也可单击文本编辑
-- **类型**: 显示当前类型缩写（如 "Bell"），单击循环切换类型
+- **类型**: 显示当前类型名称（如 "Bell"），单击弹出下拉菜单选择类型
 
 标签自动避让边界，避免超出频响区域。节点失选时标签收起。
 
@@ -195,16 +196,14 @@ Source/
 ├── PluginProcessor.cpp      [修改] 实现处理逻辑
 ├── PluginEditor.h           [修改] 添加自定义组件引用
 ├── PluginEditor.cpp         [修改] 实现编辑器布局
-├── Interface.h              [删除] 移除 Projucer 自动生成组件
-├── Interface.cpp            [删除] 移除 Projucer 自动生成组件
 ├── SubEQ_Core.h             [新增] 双精度 Biquad + 节点管理
 ├── SubEQ_Core.cpp           [新增] 系数计算 + 信号处理
 ├── SubEQ_Parameters.h       [新增] 参数定义、APVTS 布局
-├── SubEQ_Editor/            [新增] GUI 组件目录
-│   ├── FrequencyResponse.h/.cpp     [新增] 频响曲线 + 节点绘制
-│   ├── EQNodeHandle.h/.cpp          [新增] 节点拖拽手柄 + 参数标签
-│   ├── MasterGainSlider.h/.cpp      [新增] 右侧总增益垂直滑块
-│   └── SubEQLookAndFeel.h/.cpp      [新增] 自定义外观（颜色、字体）
+├── SubEQ_Spectrum.h/.cpp    [新增] 实时频谱分析器 (8192点 FFT)
+└── SubEQ_Editor/            [新增] GUI 组件目录
+    ├── SubEQLookAndFeel.h   [新增] 自定义外观（颜色、字体）——仅头文件
+    ├── FrequencyResponse.h/.cpp     [新增] 频响曲线 + 相位曲线 + 节点绘制 + 交互
+    └── MasterGainSlider.h/.cpp      [新增] 右侧总增益垂直滑块
 ```
 
 ### 6.2 Projucer 配置变更
@@ -224,6 +223,8 @@ Source/
 | **M3** | 频响曲线 + 节点拖拽 GUI | 图形化界面，可拖拽调节 |
 | **M4** | 全部 7 种滤波器类型 + 状态保存 | 功能完整，状态可保存/恢复 |
 | **M5** | 优化 + 测试验证 | 0.5Hz 精度验证，性能测试 |
+| **M6** | 相位响应曲线 + 实时频谱 | 同步显示相位曲线；1/6 倍频程频谱分析器 |
+| **M7** | ASIO 支持 + 数值稳定性修复 | 添加 ASIO 路径；Transposed DF2 + per-channel 状态 + 稳定性检查 |
 
 ---
 
@@ -236,7 +237,11 @@ Source/
 | GUI 风格 | **FabFilter Pro-Q2 风格**，左键新建/拖动，右键删除，滚轮调Q，单击选中 |
 | 通道支持 | **仅立体声**（2进2出） |
 | Interface 类 | **移除**，完全手写 GUI |
-| 窗口尺寸 | **900 × 500 像素**，右侧 60px 总增益 Slider |
-| 颜色主题 | **深灰背景 (#2a2a2a) + 品红色频响曲线 (#e040fb) + 白色节点 (#ffffff)** |
+| 窗口尺寸 | **900 × 560 像素**，右侧 60px 总增益 Slider |
+| 颜色主题 | **深灰背景 (#2a2a2a) + 品红色频响曲线 (#e040fb) + 青色相位曲线 + 白色节点 (#ffffff)** |
+| 节点外观 | **统一外径**：选中为白色实心圆，未选中为白色空心圆环（不随 Q 变化） |
+| 节点默认状态 | **全部禁用**（false），初始无活动节点 |
 | 类型切换 | **弹出下拉菜单**（7 种类型列表选择） |
 | 键盘操作 | **不需要** |
+| 实时频谱 | **1/6 倍频程**，Catmull-Rom 样条曲线绘制 |
+| ASIO 支持 | **已添加**，Standalone 版本可用 |

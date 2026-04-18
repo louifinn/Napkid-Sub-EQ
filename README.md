@@ -16,6 +16,12 @@ Napkid Sub EQ 是一款专为低频信号处理设计的参量均衡器插件。
 
 ---
 
+## 界面预览
+
+![Napkid Sub EQ 界面截图](Interface.png)
+
+---
+
 ## 功能特性
 
 - **8 节点参数 EQ**：每个节点独立控制频率、增益、Q 值和滤波器类型
@@ -25,7 +31,7 @@ Napkid Sub EQ 是一款专为低频信号处理设计的参量均衡器插件。
 - **零延迟处理**：纯 IIR 架构，无额外处理延迟
 - **实时相位响应曲线**：与幅频曲线同步显示
 - **实时频谱分析**：1/6 倍频程分辨率，512 点 FFT，60 Hz 刷新率
-- **Pro-Q2 风格交互**：点击创建、拖拽移动、右击删除、滚轮调 Q
+- **便捷交互**：点击创建、拖拽移动、右击删除、滚轮调 Q
 - **双击重置**：节点双击归零增益和 Q 值
 - **ASIO 支持**：低延迟音频接口兼容
 
@@ -133,7 +139,7 @@ Sub EQ/
 │       ├── SubEQLookAndFeel.h       # 颜色主题和视觉常量
 │       ├── FrequencyResponse.h/.cpp # 频响曲线绘制和节点交互
 │       └── MasterGainSlider.h/.cpp  # 总增益推子
-├── Builds/VisualStudio2022/         # VS 项目生成目录
+├── Builds/VisualStudio2022/         # VS 项目生成目录（gitignored）
 ├── Napkid Sub EQ.jucer              # Projucer 项目文件
 └── README.md                        # 本文件
 ```
