@@ -1,0 +1,39 @@
+                    GNU GENERAL PUBLIC LICENSE
+                       Version 3, 29 June 2007
+
+ Copyright (C) 2026 Napkid Audio
+
+ This program is free software: you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+
+ You should have received a copy of the GNU General Public License
+ along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+================================================================================
+
+THIRD-PARTY DEPENDENCIES
+
+This project is built on top of the JUCE framework, which is available
+under the GNU General Public License v3.
+
+JUCE Framework
+  Copyright (c) 2020–2026 Raw Material Software Limited
+  License: GNU General Public License v3 (or commercial license)
+  Website: https://juce.com/
+
+VST3 Technology
+  Copyright (c) Steinberg Media Technologies GmbH
+  VST3 SDK License: Apache License 2.0
+  Website: https://www.steinberg.net/vst3
+
+ASIO Technology (optional, Standalone mode)
+  Copyright (c) Steinberg Media Technologies GmbH
+  License: Proprietary ASIO SDK License Agreement
+  Website: https://www.steinberg.net/developers/
