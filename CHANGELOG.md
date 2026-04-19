@@ -1,38 +1,38 @@
-# Changelog
+# 更新日志
 
-All notable changes to Napkid Sub EQ will be documented in this file.
+Napkid Sub EQ 的所有重要变更都将记录在此文件中。
 
 ## [0.1.1] - 2026-04-19
 
-### Added
+### 新增
 
-- **Band Pass filter type**: New "Band Pass" node type added to the 8 filter options.
-- **Smart vertical drag for non-gain types**: HP / LP / Notch / Band Pass nodes now adjust Q on vertical drag instead of gain, with the node fixed on the 0 dB reference line.
-- **Type-aware double-click reset**: Bell / Shelf / Tilt reset gain + Q; HP / LP / Notch / BP reset Q only.
+- **带通滤波器类型**: 在 8 种滤波器选项中新增了"带通"（Band Pass）节点类型。
+- **非增益类型的智能垂直拖动**: 高通 / 低通 / 陷波 / 带通节点现在通过垂直拖动调节 Q 值而非增益，节点固定在 0 dB 参考线上。
+- **类型感知双击重置**: Bell / Shelf / Tilt 双击重置增益和 Q；高通 / 低通 / 陷波 / 带通仅重置 Q。
 
-### Fixed
+### 修复
 
-- **Notch crash**: Notch nodes at center frequency produced `-Inf` dB response, causing JUCE Path assertion failure. Now clamped to `-120 ~ +60 dB` safe range.
-- **Q drag direction**: Upward drag now increases Q, downward decreases Q for all non-gain-sensitive types (intuitive match with gain drag direction).
-- **Text editor dismissal**: Text edit boxes now close when clicking or dragging anywhere outside the editor.
-- **Gain reset on type switch**: Switching from gain-sensitive type (Bell/Shelf/Tilt) to non-gain type (HP/LP/Notch/BP) now resets Gain to 0 dB automatically.
+- **陷波闪退**: 陷波节点在中心频率处产生 `-Inf` dB 响应，导致 JUCE Path 断言失败。现已钳位到 `-120 ~ +60 dB` 安全范围。
+- **Q 值拖动方向**: 向上拖动现在增大 Q，向下拖动减小 Q，所有非增益敏感类型均符合直觉（与增益拖动方向一致）。
+- **文本编辑器关闭**: 文本编辑框现在在点击或拖动编辑器外部任意位置时都会关闭。
+- **类型切换时增益重置**: 从增益敏感类型（Bell / Shelf / Tilt）切换到非增益类型（高通 / 低通 / 陷波 / 带通）时，增益自动归零至 0 dB。
 
-### Changed
+### 变更
 
-- Node vertical position is now type-aware: gain-sensitive types (Bell, LowShelf, HighShelf, Tilt) follow gain; others anchor to 0 dB.
-- **Q adjustment now uses logarithmic mapping** for both drag and scroll wheel: equal input change produces equal *ratio* change (0.1→1 takes same motion as 1→10).
-- **Frequency display precision unified**: All frequency readouts (node labels, text editor, grid tooltips) now consistently show 2 decimal places, removing the previous `≥100 Hz → 0 decimals` branch that caused inconsistent display.
+- 节点垂直位置现在具有类型感知能力：增益敏感类型（Bell、LowShelf、HighShelf、Tilt）跟随增益变化；其他类型锚定在 0 dB。
+- **Q 值调节现采用对数映射**: 拖动和滚轮均使用对数映射——相等的输入变化量产生相等的*比例*变化（0.1→1 的位移与 1→10 相同）。
+- **频率显示精度统一**: 所有频率读数（节点标签、文本编辑器、网格提示）现在统一显示 2 位小数，移除了之前 `≥100 Hz → 0 位小数` 的分支逻辑，避免了显示不一致的问题。
 
-## [0.1.0] - Initial Release
+## [0.1.0] - 初始版本
 
-### Added
+### 新增
 
-- 8-node parametric EQ (0.5 Hz ~ 500 Hz)
-- 8 filter types: Bell, High Pass, Low Pass, Low Shelf, High Shelf, Notch, Tilt, Band Pass
-- Real-time frequency response and phase curves
-- Real-time spectrum analyzer (1/6 octave, 8192-point FFT)
-- Pro-Q2 style node interaction (click, drag, right-click delete, scroll Q)
-- Double-click reset
-- Master gain control
-- VST3 / Standalone builds
-- ASIO support
+- 8 节点参数均衡器（0.5 Hz ~ 500 Hz）
+- 8 种滤波器类型：Bell、High Pass、Low Pass、Low Shelf、High Shelf、Notch、Tilt、Band Pass
+- 实时频率响应和相位曲线
+- 实时频谱分析器（1/6 倍频程，8192 点 FFT）
+- Pro-Q2 风格节点交互（点击创建、拖动移动、右击删除、滚轮调 Q）
+- 双击重置
+- 主增益控制
+- VST3 / 独立运行构建
+- ASIO 支持
