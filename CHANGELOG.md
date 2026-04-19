@@ -31,7 +31,7 @@ Napkid Sub EQ 的所有重要变更都将记录在此文件中。
 - 8 种滤波器类型：Bell、High Pass、Low Pass、Low Shelf、High Shelf、Notch、Tilt、Band Pass
 - 实时频率响应和相位曲线
 - 实时频谱分析器（1/6 倍频程，8192 点 FFT）
-- Pro-Q2 风格节点交互（点击创建、拖动移动、右击删除、滚轮调 Q）
+- Pro Q 风格节点交互（点击创建、拖动移动、右击删除、滚轮调 Q）
 - 双击重置
 - 主增益控制
 - VST3 / 独立运行构建

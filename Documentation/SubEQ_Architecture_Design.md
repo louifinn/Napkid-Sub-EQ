@@ -128,7 +128,7 @@ struct BiquadState {
 
 ## 5. 图形界面设计
 
-### 5.1 布局方案：FabFilter Pro-Q2 风格
+### 5.1 布局方案：FabFilter 风格
 
 窗口尺寸：**900 × 560 像素**
 
