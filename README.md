@@ -146,6 +146,13 @@ Sub EQ/
 
 ---
 
+## 相关文档
+
+- **[更新日志](CHANGELOG.md)** — 查看所有版本的变更记录
+- **[架构设计文档](Documentation/SubEQ_Architecture_Design.md)** — 深入了解 DSP 架构、GUI 设计和关键实现决策
+
+---
+
 ## 关键技术决策
 
 ### 为什么使用 double 精度？
