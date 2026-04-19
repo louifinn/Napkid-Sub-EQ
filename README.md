@@ -25,14 +25,14 @@ Napkid Sub EQ 是一款专为低频信号处理设计的参量均衡器插件。
 ## 功能特性
 
 - **8 节点参数 EQ**：每个节点独立控制频率、增益、Q 值和滤波器类型
-- **7 种滤波器类型**：Bell、High Pass、Low Pass、Low Shelf、High Shelf、Notch、Tilt
+- **8 种滤波器类型**：Bell、High Pass、Low Pass、Low Shelf、High Shelf、Notch、Tilt、Band Pass
 - **±24 dB 增益范围**：满足极端的增益需求
 - **双精度 IIR Biquad**：Direct Form II Transposed 结构，数值稳定
 - **零延迟处理**：纯 IIR 架构，无额外处理延迟
 - **实时相位响应曲线**：与幅频曲线同步显示
 - **实时频谱分析**：1/6 倍频程分辨率，512 点 FFT，60 Hz 刷新率
-- **便捷交互**：点击创建、拖拽移动、右击删除、滚轮调 Q
-- **双击重置**：节点双击归零增益和 Q 值
+- **便捷交互**：点击创建、拖拽移动、右击删除、滚轮调 Q（HP/LP/Notch/BP 上下拖动调 Q）
+- **双击重置**：Bell/Shelf/Tilt 双击归零增益和 Q，HP/LP/Notch/BP 双击仅重置 Q
 - **ASIO 支持**：低延迟音频接口兼容
 
 ---
@@ -102,12 +102,12 @@ Builds/VisualStudio2022/x64/Release/Standalone Plugin/
 | 操作 | 说明 |
 |------|------|
 | 左键点击空白区域 | 在点击位置创建新节点 |
-| 左键拖拽节点 | 调节频率和增益 |
+| 左键拖拽节点 | 调节频率和增益（Bell/Shelf/Tilt）或频率和 Q（HP/LP/Notch/BP） |
 | 右键点击节点 | 删除节点 |
 | 滚轮（在节点上） | 调节 Q 值 |
-| 双击节点 | 重置增益为 0 dB，Q 为 0.707 |
+| 双击节点 | 重置增益为 0 dB，Q 为 0.707（HP/LP/Notch/BP 只重置 Q） |
 | Shift + 拖拽 | 仅调节频率 |
-| Ctrl + 拖拽 | 仅调节增益 |
+| Ctrl + 拖拽 | 仅调节增益（Bell/Shelf/Tilt）或仅调节 Q（HP/LP/Notch/BP） |
 
 ### 节点参数标签
 

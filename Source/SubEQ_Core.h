@@ -3,7 +3,7 @@
 
     SubEQ_Core.h
     Double-precision Biquad filter engine for ultra-low frequency parametric EQ.
-    Covers 0.5Hz ~ 500Hz with 7 standard filter types.
+    Covers 0.5Hz ~ 500Hz with 8 standard filter types.
 
   ==============================================================================
 */
@@ -67,7 +67,8 @@ enum class FilterType
     LowShelf,
     HighShelf,
     Notch,
-    Tilt
+    Tilt,
+    BandPass
 };
 
 // Single EQ node with up to 2 cascaded biquads
@@ -117,6 +118,7 @@ private:
     void updateHighShelf();
     void updateNotch();
     void updateTilt();
+    void updateBandPass();
 
     BiquadCoefficients coeffs[2];            // Shared coefficients (up to 2 biquads)
     BiquadState states[MaxChannels][2];      // Per-channel states [channel][biquad]

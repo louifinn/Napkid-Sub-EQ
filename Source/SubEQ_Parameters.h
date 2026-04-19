@@ -57,7 +57,7 @@ inline juce::String getNodeParamName(int nodeIndex, ParamID param)
 
 inline juce::StringArray getFilterTypeChoices()
 {
-    return { "Bell", "High Pass", "Low Pass", "Low Shelf", "High Shelf", "Notch", "Tilt" };
+    return { "Bell", "High Pass", "Low Pass", "Low Shelf", "High Shelf", "Notch", "Tilt", "Band Pass" };
 }
 
 inline FilterType intToFilterType(int value)
@@ -71,6 +71,7 @@ inline FilterType intToFilterType(int value)
         case 4:  return FilterType::HighShelf;
         case 5:  return FilterType::Notch;
         case 6:  return FilterType::Tilt;
+        case 7:  return FilterType::BandPass;
         default: return FilterType::Bell;
     }
 }
@@ -86,6 +87,7 @@ inline int filterTypeToInt(FilterType type)
         case FilterType::HighShelf: return 4;
         case FilterType::Notch:     return 5;
         case FilterType::Tilt:      return 6;
+        case FilterType::BandPass:  return 7;
     }
     return 0;
 }

@@ -62,9 +62,9 @@ FrequencyResponse::~FrequencyResponse()
 void FrequencyResponse::parameterChanged(const juce::String& parameterID, float newValue)
 {
     juce::ignoreUnused(parameterID, newValue);
-    // Do NOT call processor.updateEQParameters() here.
-    // Coefficient updates must happen only on the audio thread (in processBlock)
-    // to avoid data races that corrupt biquad coefficients mid-calculation.
+    // Update coefficients immediately from GUI thread so the response curve
+    // stays in sync even when the DAW is not processing audio.
+    processor.updateEQParameters();
     parametersChanged = true;
     repaint();
 }
@@ -194,8 +194,7 @@ void FrequencyResponse::drawGrid(juce::Graphics& g)
         g.drawVerticalLine(static_cast<int>(x), area.getY(), area.getBottom());
 
         g.setColour(gridTextColour());
-        juce::String label = (freq >= 100.0f) ? juce::String(static_cast<int>(freq)) + " Hz"
-                                               : juce::String(freq, 1) + " Hz";
+        juce::String label = juce::String(freq, 2) + " Hz";
         g.drawSingleLineText(label, static_cast<int>(x) + 4, static_cast<int>(area.getY()) + 14);
         g.setColour(gridLineColour());
     }
@@ -345,6 +344,9 @@ void FrequencyResponse::updateResponsePaths()
         double w = juce::MathConstants<double>::twoPi * static_cast<double>(freq) / sampleRate;
 
         double gainDb = eqEngine.getResponseDb(w);
+        if (std::isinf(gainDb) || std::isnan(gainDb))
+            gainDb = (gainDb > 0.0) ? 60.0 : -120.0;
+        gainDb = juce::jlimit(-120.0, 60.0, gainDb);
         float gainY = gainToY(static_cast<float>(gainDb));
         double phaseDeg = eqEngine.getResponsePhaseDegrees(w);
         float phaseY = phaseToY(static_cast<float>(phaseDeg));
@@ -403,9 +405,10 @@ void FrequencyResponse::drawNodes(juce::Graphics& g)
 
         float freq = getNodeParamValue(i, SubEQ::ParamID::Freq);
         float gain = getNodeParamValue(i, SubEQ::ParamID::Gain);
+        bool gainSensitive = isGainSensitiveType(i);
 
         float x = freqToX(freq);
-        float y = gainToY(gain);
+        float y = gainSensitive ? gainToY(gain) : gainToY(0.0f);
 
         bool isSelected = (i == selectedNode);
         float radius = NodeRadius;
@@ -435,8 +438,9 @@ juce::Rectangle<float> FrequencyResponse::getNodeLabelBounds(int nodeIndex) cons
 {
     float freq = getNodeParamValue(nodeIndex, SubEQ::ParamID::Freq);
     float gain = getNodeParamValue(nodeIndex, SubEQ::ParamID::Gain);
+    bool gainSensitive = isGainSensitiveType(nodeIndex);
     float x = freqToX(freq);
-    float y = gainToY(gain);
+    float y = gainSensitive ? gainToY(gain) : gainToY(0.0f);
 
     float labelW = 180.0f;
     float labelH = 90.0f;
@@ -499,8 +503,7 @@ void FrequencyResponse::drawNodeLabel(juce::Graphics& g, int nodeIndex)
 
     // Frequency
     auto freqBounds = getFreqValueBounds(nodeIndex);
-    juce::String freqStr = (freq >= 100.0f) ? juce::String(freq, 0) + " Hz"
-                                             : juce::String(freq, 1) + " Hz";
+    juce::String freqStr = juce::String(freq, 2) + " Hz";
     g.drawText("F: " + freqStr, freqBounds.toNearestInt(), juce::Justification::left, false);
 
     // Gain
@@ -524,6 +527,19 @@ void FrequencyResponse::drawNodeLabel(juce::Graphics& g, int nodeIndex)
 void FrequencyResponse::mouseDown(const juce::MouseEvent& event)
 {
     auto pos = event.position;
+
+    // Dismiss text editor when clicking outside of it
+    if (textEditor != nullptr)
+    {
+        if (!textEditor->getBounds().contains(pos.toInt()))
+        {
+            finishTextEdit(false);
+        }
+        else
+        {
+            return; // Click inside editor, let it handle the focus
+        }
+    }
 
     if (event.mods.isRightButtonDown())
     {
@@ -578,8 +594,12 @@ void FrequencyResponse::mouseDown(const juce::MouseEvent& event)
             dragStartPos = pos;
             dragStartFreq = getNodeParamValue(node, SubEQ::ParamID::Freq);
             dragStartGain = getNodeParamValue(node, SubEQ::ParamID::Gain);
+            dragStartQ = getNodeParamValue(node, SubEQ::ParamID::Q);
             beginNodeGesture(node, SubEQ::ParamID::Freq);
-            beginNodeGesture(node, SubEQ::ParamID::Gain);
+            if (isGainSensitiveType(node))
+                beginNodeGesture(node, SubEQ::ParamID::Gain);
+            else
+                beginNodeGesture(node, SubEQ::ParamID::Q);
         }
         else
         {
@@ -598,6 +618,7 @@ void FrequencyResponse::mouseDown(const juce::MouseEvent& event)
                 dragStartPos = pos;
                 dragStartFreq = getNodeParamValue(newNode, SubEQ::ParamID::Freq);
                 dragStartGain = getNodeParamValue(newNode, SubEQ::ParamID::Gain);
+                dragStartQ = getNodeParamValue(newNode, SubEQ::ParamID::Q);
                 beginNodeGesture(newNode, SubEQ::ParamID::Freq);
                 beginNodeGesture(newNode, SubEQ::ParamID::Gain);
             }
@@ -607,6 +628,10 @@ void FrequencyResponse::mouseDown(const juce::MouseEvent& event)
 
 void FrequencyResponse::mouseDrag(const juce::MouseEvent& event)
 {
+    // Dismiss text editor on any drag
+    if (textEditor != nullptr)
+        finishTextEdit(false);
+
     if (isDeleting)
     {
         int node = findNodeAtPosition(event.position);
@@ -620,6 +645,8 @@ void FrequencyResponse::mouseDrag(const juce::MouseEvent& event)
 
     auto delta = event.position - dragStartPos;
 
+    bool gainSensitive = isGainSensitiveType(draggedNode);
+
     if (event.mods.isShiftDown())
     {
         // Shift: only frequency
@@ -628,17 +655,40 @@ void FrequencyResponse::mouseDrag(const juce::MouseEvent& event)
     }
     else if (event.mods.isCtrlDown())
     {
-        // Ctrl: only gain
-        float newGain = yToGain(gainToY(dragStartGain) + delta.y);
-        setNodeParamValue(draggedNode, SubEQ::ParamID::Gain, newGain);
+        // Ctrl: only gain (or Q for non-gain-sensitive types)
+        if (gainSensitive)
+        {
+            float newGain = yToGain(gainToY(dragStartGain) + delta.y);
+            setNodeParamValue(draggedNode, SubEQ::ParamID::Gain, newGain);
+        }
+        else
+        {
+            // Logarithmic Q mapping: equal pixel distance = equal ratio change
+            float logQ = std::log10(dragStartQ) - delta.y * 0.01f;
+            float newQ = std::pow(10.0f, logQ);
+            newQ = juce::jlimit(0.1f, 10.0f, newQ);
+            setNodeParamValue(draggedNode, SubEQ::ParamID::Q, newQ);
+        }
     }
     else
     {
-        // Normal: both frequency and gain
+        // Normal: frequency + gain (or Q for non-gain-sensitive)
         float newFreq = xToFreq(freqToX(dragStartFreq) + delta.x);
-        float newGain = yToGain(gainToY(dragStartGain) + delta.y);
         setNodeParamValue(draggedNode, SubEQ::ParamID::Freq, newFreq);
-        setNodeParamValue(draggedNode, SubEQ::ParamID::Gain, newGain);
+
+        if (gainSensitive)
+        {
+            float newGain = yToGain(gainToY(dragStartGain) + delta.y);
+            setNodeParamValue(draggedNode, SubEQ::ParamID::Gain, newGain);
+        }
+        else
+        {
+            // Logarithmic Q mapping: equal pixel distance = equal ratio change
+            float logQ = std::log10(dragStartQ) - delta.y * 0.01f;
+            float newQ = std::pow(10.0f, logQ);
+            newQ = juce::jlimit(0.1f, 10.0f, newQ);
+            setNodeParamValue(draggedNode, SubEQ::ParamID::Q, newQ);
+        }
     }
 
     parametersChanged = true;
@@ -658,7 +708,10 @@ void FrequencyResponse::mouseUp(const juce::MouseEvent& event)
     if (isDragging && draggedNode >= 0)
     {
         endNodeGesture(draggedNode, SubEQ::ParamID::Freq);
-        endNodeGesture(draggedNode, SubEQ::ParamID::Gain);
+        if (isGainSensitiveType(draggedNode))
+            endNodeGesture(draggedNode, SubEQ::ParamID::Gain);
+        else
+            endNodeGesture(draggedNode, SubEQ::ParamID::Q);
     }
 
     isDragging = false;
@@ -671,9 +724,17 @@ void FrequencyResponse::mouseDoubleClick(const juce::MouseEvent& event)
     int node = findNodeAtPosition(event.position);
     if (node >= 0)
     {
-        // Reset gain to 0 and Q to 0.707
-        setNodeParamValue(node, SubEQ::ParamID::Gain, 0.0f);
-        setNodeParamValue(node, SubEQ::ParamID::Q, 0.707f);
+        if (isGainSensitiveType(node))
+        {
+            // Gain-sensitive: reset gain to 0 and Q to 0.707
+            setNodeParamValue(node, SubEQ::ParamID::Gain, 0.0f);
+            setNodeParamValue(node, SubEQ::ParamID::Q, 0.707f);
+        }
+        else
+        {
+            // Non-gain-sensitive: only reset Q to 0.707
+            setNodeParamValue(node, SubEQ::ParamID::Q, 0.707f);
+        }
         parametersChanged = true;
         repaint();
     }
@@ -689,8 +750,10 @@ void FrequencyResponse::mouseWheelMove(const juce::MouseEvent& event,
     if (node >= 0)
     {
         float qVal = getNodeParamValue(node, SubEQ::ParamID::Q);
-        float delta = wheel.deltaY * 0.5f;
-        float newQ = juce::jlimit(0.1f, 10.0f, qVal + delta);
+        // Logarithmic Q mapping: each wheel step = fixed ratio change (~25%)
+        float logQ = std::log10(qVal) + wheel.deltaY * 0.1f;
+        float newQ = std::pow(10.0f, logQ);
+        newQ = juce::jlimit(0.1f, 10.0f, newQ);
         setNodeParamValue(node, SubEQ::ParamID::Q, newQ);
         parametersChanged = true;
         repaint();
@@ -742,7 +805,7 @@ int FrequencyResponse::findNodeAtPosition(juce::Point<float> pos) const
         float freq = getNodeParamValue(i, SubEQ::ParamID::Freq);
         float gain = getNodeParamValue(i, SubEQ::ParamID::Gain);
         float x = freqToX(freq);
-        float y = gainToY(gain);
+        float y = isGainSensitiveType(i) ? gainToY(gain) : gainToY(0.0f);
 
         float dx = pos.x - x;
         float dy = pos.y - y;
@@ -818,6 +881,13 @@ bool FrequencyResponse::isNodeEnabled(int index) const
     return getNodeParamValue(index, SubEQ::ParamID::Enabled) > 0.5f;
 }
 
+bool FrequencyResponse::isGainSensitiveType(int nodeIndex) const
+{
+    int typeIdx = static_cast<int>(getNodeParamValue(nodeIndex, SubEQ::ParamID::Type));
+    // Bell(0), LowShelf(3), HighShelf(4), Tilt(6) are gain-sensitive
+    return (typeIdx == 0 || typeIdx == 3 || typeIdx == 4 || typeIdx == 6);
+}
+
 //==============================================================================
 // Parameter Access
 //==============================================================================
@@ -876,7 +946,7 @@ void FrequencyResponse::startTextEdit(EditTarget target, int nodeIndex)
     {
         case EditTarget::Freq:
             bounds = getFreqValueBounds(nodeIndex);
-            initialText = juce::String(getNodeParamValue(nodeIndex, SubEQ::ParamID::Freq), 1);
+            initialText = juce::String(getNodeParamValue(nodeIndex, SubEQ::ParamID::Freq), 2);
             break;
         case EditTarget::Gain:
             bounds = getGainValueBounds(nodeIndex);
@@ -957,8 +1027,14 @@ void FrequencyResponse::startTypeMenu(int nodeIndex)
         {
             if (result > 0)
             {
+                bool wasGainSensitive = isGainSensitiveType(nodeIndex);
                 auto* p = getNodeParam(nodeIndex, SubEQ::ParamID::Type);
                 p->setValueNotifyingHost(p->convertTo0to1(static_cast<float>(result - 1)));
+
+                // If switching from gain-sensitive to non-gain-sensitive, reset gain to 0 dB
+                if (wasGainSensitive && !isGainSensitiveType(nodeIndex))
+                    setNodeParamValue(nodeIndex, SubEQ::ParamID::Gain, 0.0f);
+
                 parametersChanged = true;
                 repaint();
             }

@@ -42,7 +42,7 @@ NormalizedRange(0.5f, 500.0f, 0.0f, 0.5f) // skew=0.5 实现近似对数刻度
 
 ### 3.1 滤波器类型支持
 
-支持 7 种标准参量 EQ 节点类型：
+支持 8 种标准参量 EQ 节点类型：
 
 | 类型 | 英文标识 | Biquad 数量 | 用途 |
 |------|----------|-------------|------|
@@ -53,6 +53,7 @@ NormalizedRange(0.5f, 500.0f, 0.0f, 0.5f) // skew=0.5 实现近似对数刻度
 | 高频搁架 | HighShelf | 1 | 高频整体提升/衰减 |
 | 陷波 | Notch | 1 | 特定频率点完全切除 |
 | 倾斜 | Tilt | 2（级联） | 整体频响倾斜 |
+| 带通 | BandPass | 1 | 只保留特定频段 |
 
 > **Tilt 实现**: LowShelf(A) + HighShelf(1/A) 两个 Biquad 级联，等效于整体频响绕中心频率倾斜。
 
@@ -112,7 +113,7 @@ struct BiquadState {
 | Node N Frequency | Float | 0.5 ~ 500.0 Hz | 100.0 | 中心/截止频率（对数刻度） |
 | Node N Gain | Float | -24.0 ~ +24.0 dB | 0.0 | 增益 |
 | Node N Q | Float | 0.1 ~ 10.0 | 0.707 | 品质因数 |
-| Node N Type | Choice | 7 types | Bell | 滤波器类型 |
+| Node N Type | Choice | 8 types | Bell | 滤波器类型 |
 
 > **参数 ID 命名**: `nodeN_freq`, `nodeN_gain`, `nodeN_q`, `nodeN_type`, `nodeN_enabled`
 
@@ -158,13 +159,13 @@ struct BiquadState {
 | 左键单击空白处 | 在光标位置新建节点（默认 Bell），选中该节点 |
 | 左键单击 + 按住拖动 | 新建节点后直接进入拖动模式 |
 | 左键单击已有节点 | 选中该节点（取消上一个选中） |
-| 左键拖拽节点 | 同时调节 Frequency 和 Gain |
+| 左键拖拽节点 | 同时调节 Frequency 和 Gain（Bell/Shelf/Tilt）或 Frequency 和 Q（HP/LP/Notch/BP） |
 | 滚轮在节点上 | 调节 Q 值 |
 | 右键单击节点 | 删除该节点 |
 | 右键按住 + 拖动 | 删除拖动路径上经过的所有节点 |
-| Shift+拖拽 | 仅调节 Frequency（锁定 Gain） |
-| Ctrl+拖拽 | 仅调节 Gain（锁定 Frequency） |
-| 双击节点 | 重置 Gain 为 0dB，重置 Q 为 0.707 |
+| Shift+拖拽 | 仅调节 Frequency（锁定 Gain/Q） |
+| Ctrl+拖拽 | 仅调节 Gain（Bell/Shelf/Tilt）或仅调节 Q（HP/LP/Notch/BP） |
+| 双击节点 | 重置 Gain 为 0dB + Q 为 0.707（Bell/Shelf/Tilt）；仅重置 Q 为 0.707（HP/LP/Notch/BP） |
 
 ### 5.4 节点参数标签（选中时展开）
 
@@ -221,7 +222,7 @@ Source/
 | **M1** | 双精度 Biquad 核心 + 系数计算 | 可编译，单节点滤波器正常工作 |
 | **M2** | 多节点级联 + 参数系统（APVTS）| VST3 可加载，宿主可自动化参数 |
 | **M3** | 频响曲线 + 节点拖拽 GUI | 图形化界面，可拖拽调节 |
-| **M4** | 全部 7 种滤波器类型 + 状态保存 | 功能完整，状态可保存/恢复 |
+| **M4** | 全部 8 种滤波器类型 + 状态保存 | 功能完整，状态可保存/恢复 |
 | **M5** | 优化 + 测试验证 | 0.5Hz 精度验证，性能测试 |
 | **M6** | 相位响应曲线 + 实时频谱 | 同步显示相位曲线；1/6 倍频程频谱分析器 |
 | **M7** | ASIO 支持 + 数值稳定性修复 | 添加 ASIO 路径；Transposed DF2 + per-channel 状态 + 稳定性检查 |
@@ -241,7 +242,7 @@ Source/
 | 颜色主题 | **深灰背景 (#2a2a2a) + 品红色频响曲线 (#e040fb) + 青色相位曲线 + 白色节点 (#ffffff)** |
 | 节点外观 | **统一外径**：选中为白色实心圆，未选中为白色空心圆环（不随 Q 变化） |
 | 节点默认状态 | **全部禁用**（false），初始无活动节点 |
-| 类型切换 | **弹出下拉菜单**（7 种类型列表选择） |
+| 类型切换 | **弹出下拉菜单**（8 种类型列表选择） |
 | 键盘操作 | **不需要** |
 | 实时频谱 | **1/6 倍频程**，Catmull-Rom 样条曲线绘制 |
 | ASIO 支持 | **已添加**，Standalone 版本可用 |

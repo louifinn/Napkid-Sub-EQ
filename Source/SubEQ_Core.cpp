@@ -69,6 +69,7 @@ void EQNode::update(double freqHz, double gain, double qValue, FilterType type)
         case FilterType::HighShelf:  updateHighShelf(); break;
         case FilterType::Notch:      updateNotch(); break;
         case FilterType::Tilt:       updateTilt(); break;
+        case FilterType::BandPass:   updateBandPass(); break;
     }
 
     // Safety: force coefficients stable (critical for 0.5Hz + low Q)
@@ -220,6 +221,24 @@ void EQNode::updateTilt()
         coeffs[1].a1 = 2.0 * ((A2 - 1.0) - (A2 + 1.0) * cosw0) / a0;
         coeffs[1].a2 = ((A2 + 1.0) - (A2 - 1.0) * cosw0 - 2.0 * sqrtA2 * alpha) / a0;
     }
+}
+
+void EQNode::updateBandPass()
+{
+    numBiquads = 1;
+
+    const double w0 = juce::MathConstants<double>::twoPi * freq / sampleRate;
+    const double cosw0 = std::cos(w0);
+    const double sinw0 = std::sin(w0);
+    const double alpha = sinw0 / (2.0 * q);
+    const double gainLinear = dbToGain(gainDb);
+
+    const double a0 = 1.0 + alpha;
+    coeffs[0].b0 = gainLinear * alpha / a0;
+    coeffs[0].b1 = 0.0;
+    coeffs[0].b2 = -gainLinear * alpha / a0;
+    coeffs[0].a1 = (-2.0 * cosw0) / a0;
+    coeffs[0].a2 = (1.0 - alpha) / a0;
 }
 
 std::complex<double> EQNode::getResponse(double w) const noexcept

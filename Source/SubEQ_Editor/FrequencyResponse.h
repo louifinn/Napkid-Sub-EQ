@@ -62,6 +62,7 @@ private:
     juce::Point<float> dragStartPos;
     float dragStartFreq = 0.0f;
     float dragStartGain = 0.0f;
+    float dragStartQ = 0.707f;
 
     // Editing state
     enum class EditTarget { None, Freq, Gain, Q };
@@ -113,6 +114,7 @@ private:
     void createNodeAt(float freq, float gain);
     void deleteNode(int index);
     bool isNodeEnabled(int index) const;
+    bool isGainSensitiveType(int nodeIndex) const;
 
     // Parameter access helpers
     juce::RangedAudioParameter* getNodeParam(int nodeIndex, SubEQ::ParamID param);
