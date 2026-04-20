@@ -11,6 +11,7 @@
 #include <JuceHeader.h>
 #include "SubEQ_Core.h"
 #include "SubEQ_Parameters.h"
+#include "SubEQ_FFTProcessor.h"
 #include "SubEQ_Spectrum.h"
 
 //==============================================================================
@@ -66,9 +67,14 @@ public:
     SubEQ::SpectrumAnalyzer& getSpectrumAnalyzer() { return spectrumAnalyzer; }
     const SubEQ::SpectrumAnalyzer& getSpectrumAnalyzer() const { return spectrumAnalyzer; }
 
+    // Current EQ mode
+    SubEQ::EQMode getCurrentMode() const { return currentMode; }
+    int getCurrentLatencySamples() const { return reportedLatency; }
+
 private:
 
     SubEQ::EQEngine eqEngine;
+    SubEQ::FFTProcessor fftProcessor;
     SubEQ::SpectrumAnalyzer spectrumAnalyzer;
     juce::AudioProcessorValueTreeState apvts;
 
@@ -85,6 +91,11 @@ private:
     NodeParamCache nodeCache[SubEQ::NumNodes];
     float masterGainCache = 0.0f;
     bool bypassCache = false;
+    int eqModeCache = 0;
+    int reportedLatency = 0;
+    SubEQ::EQMode currentMode = SubEQ::EQMode::ZeroLatency;
+    bool modeChanged = false;
+    bool eqParamsChanged = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SubEQAudioProcessor)
 };

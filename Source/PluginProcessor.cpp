@@ -101,7 +101,14 @@ void SubEQAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     setLatencySamples (0);  // IIR biquads: zero processing latency
     eqEngine.prepare (sampleRate, samplesPerBlock);
     eqEngine.reset();
+    fftProcessor.prepare (sampleRate, samplesPerBlock, getTotalNumInputChannels());
+    fftProcessor.reset();
     spectrumAnalyzer.prepare (sampleRate);
+    currentMode = SubEQ::EQMode::ZeroLatency;
+    reportedLatency = 0;
+    eqModeCache = 0;
+    modeChanged = false;
+    eqParamsChanged = false;
     updateEQParameters();
 }
 
@@ -138,6 +145,7 @@ void SubEQAudioProcessor::updateEQParameters()
     {
         masterGainCache = masterGain;
         eqEngine.setMasterGain (static_cast<double> (masterGain));
+        eqParamsChanged = true;
     }
 
     // Update bypass
@@ -146,6 +154,16 @@ void SubEQAudioProcessor::updateEQParameters()
     {
         bypassCache = bypass;
         eqEngine.setBypass (bypass);
+        eqParamsChanged = true;
+    }
+
+    // Update EQ mode
+    int mode = static_cast<int> (apvts.getRawParameterValue ("eq_mode")->load());
+    if (mode != eqModeCache)
+    {
+        eqModeCache = mode;
+        currentMode = static_cast<SubEQ::EQMode> (mode);
+        modeChanged = true;
     }
 
     // Update each node
@@ -184,6 +202,8 @@ void SubEQAudioProcessor::updateEQParameters()
                              static_cast<double> (qVal),
                              SubEQ::intToFilterType (type));
             }
+
+            eqParamsChanged = true;
         }
     }
 }
@@ -202,17 +222,57 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     // Update EQ parameters before processing
     updateEQParameters();
 
-    // Process each channel (each channel has independent Biquad state)
-    for (int channel = 0; channel < totalNumInputChannels; ++channel)
+    // Handle mode change (latency reporting + FIR redesign)
+    if (modeChanged)
     {
-        auto* inputData = buffer.getReadPointer (channel);
-        auto* outputData = buffer.getWritePointer (channel);
+        modeChanged = false;
 
-        eqEngine.processChannel (inputData, outputData, buffer.getNumSamples(), channel);
+        int newLatency = 0;
+        if (currentMode == SubEQ::EQMode::LinearPhase || currentMode == SubEQ::EQMode::MinimumPhase)
+        {
+            fftProcessor.updateFIR (eqEngine, currentMode);
+            newLatency = fftProcessor.getLatencySamples();
+        }
+
+        if (newLatency != reportedLatency)
+        {
+            reportedLatency = newLatency;
+            setLatencySamples (reportedLatency);
+        }
+    }
+    else if (eqParamsChanged && currentMode != SubEQ::EQMode::ZeroLatency)
+    {
+        // In FIR mode, redesign FIR only when EQ parameters actually changed
+        fftProcessor.updateFIR (eqEngine, currentMode);
+
+        int newLatency = fftProcessor.getLatencySamples();
+        if (newLatency != reportedLatency)
+        {
+            reportedLatency = newLatency;
+            setLatencySamples (reportedLatency);
+        }
+    }
+    eqParamsChanged = false;
+
+    // Process audio based on current mode
+    if (currentMode == SubEQ::EQMode::ZeroLatency)
+    {
+        // IIR biquad processing
+        for (int channel = 0; channel < totalNumInputChannels; ++channel)
+        {
+            auto* inputData = buffer.getReadPointer (channel);
+            auto* outputData = buffer.getWritePointer (channel);
+            eqEngine.processChannel (inputData, outputData, buffer.getNumSamples(), channel);
+        }
+    }
+    else
+    {
+        // FIR processing
+        if (fftProcessor.isReady())
+            fftProcessor.process (buffer);
     }
 
-    // Feed audio to spectrum analyzer (use input channel 0) — AFTER IIR processing
-    // to avoid FFT blocking the audio thread's IIR processing deadline
+    // Feed audio to spectrum analyzer
     if (totalNumInputChannels > 0)
     {
         auto* inputData = buffer.getReadPointer (0);

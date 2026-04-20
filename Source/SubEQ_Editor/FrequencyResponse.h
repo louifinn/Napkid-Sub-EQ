@@ -101,6 +101,7 @@ private:
     void drawResponseCurve(juce::Graphics& g);
     void drawPhaseCurve(juce::Graphics& g);
     void drawNodes(juce::Graphics& g);
+    bool shouldShowPhaseCurve() const;
     void drawNodeLabel(juce::Graphics& g, int nodeIndex);
     juce::Rectangle<float> getNodeLabelBounds(int nodeIndex) const;
     juce::Rectangle<float> getFreqValueBounds(int nodeIndex) const;

@@ -19,11 +19,14 @@ namespace SubEQLookAndFeel
     inline juce::Colour gridLineColour()        { return juce::Colour (0x40ffffff); }
     inline juce::Colour gridTextColour()        { return juce::Colour (0x80ffffff); }
 
-    // Response curve
-    inline juce::Colour responseCurveColour()   { return juce::Colour (0xffe040fb); }
-    inline juce::Colour responseFillColour()    { return juce::Colour (0x20e040fb); }
+    // Theme colour: #FF007B (vivid rose pink)
+    constexpr juce::uint32 ThemeColour = 0xFF007B;
 
-    // Phase curve
+    // Response curve
+    inline juce::Colour responseCurveColour()   { return juce::Colour (0xff000000 | ThemeColour); }
+    inline juce::Colour responseFillColour()    { return juce::Colour (0x20000000 | ThemeColour); }
+
+    // Phase curve (complementary teal to the rose theme)
     inline juce::Colour phaseCurveColour()      { return juce::Colour (0x8000e5ff); }
     inline juce::Colour phaseGridTextColour()   { return juce::Colour (0x6000e5ff); }
 
@@ -33,26 +36,28 @@ namespace SubEQLookAndFeel
     inline juce::Colour nodeRingColour()        { return juce::Colour (0x80ffffff); }
 
     // Spectrum
-    inline juce::Colour spectrumBarColour()     { return juce::Colour (0x40e040fb); }
-    inline juce::Colour spectrumPeakColour()    { return juce::Colour (0x80e040fb); }
+    inline juce::Colour spectrumBarColour()     { return juce::Colour (0x40000000 | ThemeColour); }
+    inline juce::Colour spectrumPeakColour()    { return juce::Colour (0x80000000 | ThemeColour); }
+    inline juce::Colour spectrumLineColour()    { return juce::Colour (0x80aaaaaa); }
 
     // Labels
     inline juce::Colour labelBackgroundColour() { return juce::Colour (0xdd2a2a2a); }
     inline juce::Colour labelTextColour()       { return juce::Colour (0xffffffff); }
-    inline juce::Colour labelHighlightColour()  { return juce::Colour (0xffe040fb); }
+    inline juce::Colour labelHighlightColour()  { return juce::Colour (0xff000000 | ThemeColour); }
 
     // 0dB reference line
     inline juce::Colour zeroDbLineColour()      { return juce::Colour (0x60ffffff); }
 
     // Master gain slider
     inline juce::Colour sliderTrackColour()     { return juce::Colour (0x40ffffff); }
-    inline juce::Colour sliderThumbColour()     { return juce::Colour (0xffe040fb); }
+    inline juce::Colour sliderThumbColour()     { return juce::Colour (0xff000000 | ThemeColour); }
 
     // Layout constants
     constexpr int WindowWidth = 900;
-    constexpr int WindowHeight = 560;
+    constexpr int WindowHeight = 620;
     constexpr int MasterGainSliderWidth = 60;
     constexpr int ResponseAreaWidth = WindowWidth - MasterGainSliderWidth; // 840
+    constexpr int BottomPanelHeight = 60;
 
     // Node visual constants
     constexpr float NodeRadius = 8.0f;

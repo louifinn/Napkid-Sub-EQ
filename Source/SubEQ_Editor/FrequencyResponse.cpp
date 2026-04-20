@@ -39,6 +39,7 @@ FrequencyResponse::FrequencyResponse(SubEQAudioProcessor& proc)
     }
     apvts.addParameterListener("master_gain", this);
     apvts.addParameterListener("bypass", this);
+    apvts.addParameterListener("eq_mode", this);
 }
 
 FrequencyResponse::~FrequencyResponse()
@@ -53,6 +54,7 @@ FrequencyResponse::~FrequencyResponse()
     }
     apvts.removeParameterListener("master_gain", this);
     apvts.removeParameterListener("bypass", this);
+    apvts.removeParameterListener("eq_mode", this);
 }
 
 //==============================================================================
@@ -85,9 +87,18 @@ void FrequencyResponse::paint(juce::Graphics& g)
     drawBackground(g);
     drawGrid(g);
     drawSpectrum(g);
-    drawPhaseCurve(g);
+    if (shouldShowPhaseCurve())
+        drawPhaseCurve(g);
     drawResponseCurve(g);
     drawNodes(g);
+}
+
+bool FrequencyResponse::shouldShowPhaseCurve() const
+{
+    // Hide phase curve in FIR modes (Linear Phase and Minimum Phase)
+    // since they show IIR phase which is incorrect for FIR processing.
+    // TODO: compute and display actual FIR phase response.
+    return processor.getCurrentMode() == SubEQ::EQMode::ZeroLatency;
 }
 
 void FrequencyResponse::resized()
@@ -253,9 +264,16 @@ void FrequencyResponse::drawSpectrum(juce::Graphics& g)
         float x = freqToX(centerFreq);
         float db = spectrumData[i];
 
+        // Clamp dB to valid display range to prevent Y coordinate overflow
+        db = juce::jlimit(-120.0f, 12.0f, db);
+
         // Map dB to Y: -60dB at bottom, 0dB at top
         float norm = juce::jlimit(0.0f, 1.0f, (db + 60.0f) / 60.0f);
         float y = bottomY - height * norm;
+
+        // Skip NaN/Inf points to prevent path corruption
+        if (std::isnan(y) || std::isinf(y))
+            continue;
 
         rawPoints[numRawPoints++] = { x, y };
     }
@@ -263,62 +281,13 @@ void FrequencyResponse::drawSpectrum(juce::Graphics& g)
     if (numRawPoints < 2)
         return;
 
-    // Catmull-Rom spline interpolation for smooth curve
-    juce::Path spectrumFill;
+    // Draw spectrum as connected line segments (no fill, no spline)
     juce::Path spectrumLine;
-
-    // Start fill path at first x, bottom
-    spectrumFill.startNewSubPath(rawPoints[0].x, bottomY);
-    spectrumFill.lineTo(rawPoints[0].x, rawPoints[0].y);
     spectrumLine.startNewSubPath(rawPoints[0].x, rawPoints[0].y);
+    for (int i = 1; i < numRawPoints; ++i)
+        spectrumLine.lineTo(rawPoints[i].x, rawPoints[i].y);
 
-    auto catmullRom = [](juce::Point<float> p0, juce::Point<float> p1,
-                         juce::Point<float> p2, juce::Point<float> p3,
-                         float t, float tension) -> juce::Point<float>
-    {
-        float t2 = t * t;
-        float t3 = t2 * t;
-
-        float x = 0.5f * ((2.0f * p1.x)
-            + (-p0.x + p2.x) * t
-            + (2.0f * p0.x - 5.0f * p1.x + 4.0f * p2.x - p3.x) * t2
-            + (-p0.x + 3.0f * p1.x - 3.0f * p2.x + p3.x) * t3);
-        float y = 0.5f * ((2.0f * p1.y)
-            + (-p0.y + p2.y) * t
-            + (2.0f * p0.y - 5.0f * p1.y + 4.0f * p2.y - p3.y) * t2
-            + (-p0.y + 3.0f * p1.y - 3.0f * p2.y + p3.y) * t3);
-        return { x, y };
-    };
-
-    const int segmentsPerSpan = 8;
-    const float tension = 0.5f;
-
-    for (int i = 0; i < numRawPoints - 1; ++i)
-    {
-        juce::Point<float> p0 = (i > 0) ? rawPoints[i - 1] : rawPoints[i];
-        juce::Point<float> p1 = rawPoints[i];
-        juce::Point<float> p2 = rawPoints[i + 1];
-        juce::Point<float> p3 = (i + 2 < numRawPoints) ? rawPoints[i + 2] : p2;
-
-        for (int s = 1; s <= segmentsPerSpan; ++s)
-        {
-            float t = static_cast<float>(s) / static_cast<float>(segmentsPerSpan);
-            auto pt = catmullRom(p0, p1, p2, p3, t, tension);
-            spectrumFill.lineTo(pt.x, pt.y);
-            spectrumLine.lineTo(pt.x, pt.y);
-        }
-    }
-
-    // Close fill path
-    spectrumFill.lineTo(rawPoints[numRawPoints - 1].x, bottomY);
-    spectrumFill.closeSubPath();
-
-    // Fill under curve
-    g.setColour(spectrumBarColour());
-    g.fillPath(spectrumFill);
-
-    // Draw top edge line
-    g.setColour(spectrumPeakColour());
+    g.setColour(spectrumLineColour());
     g.strokePath(spectrumLine, juce::PathStrokeType(1.5f));
 }
 
@@ -375,17 +344,7 @@ void FrequencyResponse::updateResponsePaths()
 
 void FrequencyResponse::drawResponseCurve(juce::Graphics& g)
 {
-    auto area = getResponseArea();
-
-    // Fill under curve
-    g.setColour(responseFillColour());
-    auto fillPath = responsePath;
-    fillPath.lineTo(area.getRight(), area.getBottom());
-    fillPath.lineTo(area.getX(), area.getBottom());
-    fillPath.closeSubPath();
-    g.fillPath(fillPath);
-
-    // Draw curve line
+    // Draw curve line only (fill removed to avoid rendering artifacts)
     g.setColour(responseCurveColour());
     g.strokePath(responsePath, juce::PathStrokeType(2.0f));
 }

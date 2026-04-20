@@ -13,6 +13,7 @@
 #include "PluginProcessor.h"
 #include "SubEQ_Editor/FrequencyResponse.h"
 #include "SubEQ_Editor/MasterGainSlider.h"
+#include "SubEQ_Editor/ModeSelector.h"
 
 //==============================================================================
 class SubEQAudioProcessorEditor  : public juce::AudioProcessorEditor
@@ -28,6 +29,7 @@ private:
     SubEQAudioProcessor& audioProcessor;
     FrequencyResponse freqResponse;
     MasterGainSlider masterGainSlider;
+    ModeSelector modeSelector;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SubEQAudioProcessorEditor)
 };

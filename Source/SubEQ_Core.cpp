@@ -342,8 +342,13 @@ void EQEngine::processChannel(const float* input, float* output, int numSamples,
 
 double EQEngine::getResponseDb(double w) const noexcept
 {
+    return gainToDb(getMagnitudeLinear(w));
+}
+
+double EQEngine::getMagnitudeLinear(double w) const noexcept
+{
     if (bypass)
-        return 0.0;
+        return 1.0;
 
     std::complex<double> response(1.0, 0.0);
 
@@ -353,8 +358,11 @@ double EQEngine::getResponseDb(double w) const noexcept
             response *= nodes[i].getResponse(w);
     }
 
-    const double mag = std::abs(response) * dbToGain(masterGain);
-    return gainToDb(mag);
+    double mag = std::abs(response) * dbToGain(masterGain);
+    // Clamp to prevent Inf/NaN from propagating into FIR design
+    if (std::isnan(mag) || std::isinf(mag))
+        mag = 1.0;
+    return juce::jlimit(1.0e-12, 1.0e9, mag);
 }
 
 double EQEngine::getResponsePhaseDegrees(double w) const noexcept

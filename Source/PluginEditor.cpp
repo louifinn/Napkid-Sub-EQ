@@ -12,13 +12,22 @@
 //==============================================================================
 SubEQAudioProcessorEditor::SubEQAudioProcessorEditor (SubEQAudioProcessor& p)
     : AudioProcessorEditor (&p), audioProcessor (p),
-      freqResponse (p), masterGainSlider (p.getAPVTS())
+      freqResponse (p), masterGainSlider (p.getAPVTS()),
+      modeSelector (p.getAPVTS())
 {
     setSize (SubEQLookAndFeel::WindowWidth, SubEQLookAndFeel::WindowHeight);
     setResizable (false, false);
 
     addAndMakeVisible (freqResponse);
     addAndMakeVisible (masterGainSlider);
+    addAndMakeVisible (modeSelector);
+
+    modeSelector.setLatencyProvider ([this]() -> juce::String
+    {
+        return SubEQ::FFTProcessor::getLatencyText (
+            audioProcessor.getCurrentLatencySamples(),
+            audioProcessor.getSampleRate());
+    });
 }
 
 SubEQAudioProcessorEditor::~SubEQAudioProcessorEditor()
@@ -28,13 +37,18 @@ SubEQAudioProcessorEditor::~SubEQAudioProcessorEditor()
 //==============================================================================
 void SubEQAudioProcessorEditor::paint (juce::Graphics& g)
 {
-    // Background is drawn by child components
-    juce::ignoreUnused (g);
+    // Fill the entire editor background so the bottom panel area
+    // matches the dark grey theme even when no components cover it.
+    g.fillAll (SubEQLookAndFeel::backgroundColour());
 }
 
 void SubEQAudioProcessorEditor::resized()
 {
     auto bounds = getLocalBounds();
+
+    // Bottom panel for mode selector
+    auto bottomPanel = bounds.removeFromBottom (SubEQLookAndFeel::BottomPanelHeight);
+    modeSelector.setBounds (bottomPanel);
 
     // Frequency response takes the left portion
     auto freqBounds = bounds.removeFromLeft (SubEQLookAndFeel::ResponseAreaWidth);

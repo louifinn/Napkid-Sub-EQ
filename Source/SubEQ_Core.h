@@ -161,6 +161,9 @@ public:
     // Get overall frequency response in dB at normalized frequency w
     double getResponseDb(double w) const noexcept;
 
+    // Get overall magnitude response (linear scale, not dB) at normalized frequency w
+    double getMagnitudeLinear(double w) const noexcept;
+
     // Get overall phase response in degrees at normalized frequency w
     double getResponsePhaseDegrees(double w) const noexcept;
 

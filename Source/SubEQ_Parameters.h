@@ -92,12 +92,19 @@ inline int filterTypeToInt(FilterType type)
     return 0;
 }
 
+// Global EQ mode choices
+inline juce::StringArray getEQModeChoices()
+{
+    return { "Zero Latency", "Minimum Phase", "Linear Phase" };
+}
+
 // Create the APVTS parameter layout
 inline juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout()
 {
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
 
     auto typeChoices = getFilterTypeChoices();
+    auto modeChoices = getEQModeChoices();
 
     for (int i = 0; i < NumNodes; ++i)
     {
@@ -162,6 +169,14 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout
         "bypass",
         "Bypass",
         false
+    ));
+
+    // EQ Mode: choice, default Zero Latency (0)
+    layout.add(std::make_unique<juce::AudioParameterChoice>(
+        "eq_mode",
+        "EQ Mode",
+        modeChoices,
+        0
     ));
 
     return layout;

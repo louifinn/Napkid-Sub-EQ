@@ -3,7 +3,7 @@
 <JUCERPROJECT id="YD8LOD" name="Napkid Sub EQ" projectType="audioplug" useAppConfig="0"
               addUsingNamespaceToJuceHeader="0" jucerFormatVersion="1" pluginFormats="buildStandalone,buildVST3"
               pluginVST3Category="EQ" companyName="Napkid Audio" companyEmail="3225607112@qq.com"
-              version="0.1.1" pluginCode="Nseq" pluginManufacturer="Napkid Audio">
+              version="0.2.0" pluginCode="Nseq" pluginManufacturer="Napkid Audio">
   <MAINGROUP id="lnXInZ" name="Napkid Sub EQ">
     <GROUP id="{730EE156-EB98-7118-C7AB-A3A3DB8657E7}" name="Source">
       <FILE id="zHF3zP" name="PluginProcessor.cpp" compile="1" resource="0"
@@ -21,6 +21,10 @@
             file="Source/SubEQ_Spectrum.cpp"/>
       <FILE id="sEqS02" name="SubEQ_Spectrum.h" compile="0" resource="0"
             file="Source/SubEQ_Spectrum.h"/>
+      <FILE id="sEqF03" name="SubEQ_FFTProcessor.cpp" compile="1" resource="0"
+            file="Source/SubEQ_FFTProcessor.cpp"/>
+      <FILE id="sEqF04" name="SubEQ_FFTProcessor.h" compile="0" resource="0"
+            file="Source/SubEQ_FFTProcessor.h"/>
       <GROUP id="{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}" name="SubEQ_Editor">
         <FILE id="sEqL01" name="SubEQLookAndFeel.h" compile="0" resource="0"
               file="Source/SubEQ_Editor/SubEQLookAndFeel.h"/>
@@ -32,6 +36,10 @@
               file="Source/SubEQ_Editor/MasterGainSlider.cpp"/>
         <FILE id="sEqM02" name="MasterGainSlider.h" compile="0" resource="0"
               file="Source/SubEQ_Editor/MasterGainSlider.h"/>
+        <FILE id="sEqMS1" name="ModeSelector.cpp" compile="1" resource="0"
+              file="Source/SubEQ_Editor/ModeSelector.cpp"/>
+        <FILE id="sEqMS2" name="ModeSelector.h" compile="0" resource="0"
+              file="Source/SubEQ_Editor/ModeSelector.h"/>
       </GROUP>
     </GROUP>
   </MAINGROUP>
