@@ -32,8 +32,10 @@ private:
 
     juce::AudioProcessorValueTreeState& apvts;
     juce::ComboBox modeBox;
+    juce::ComboBox firLengthBox;
     juce::Label latencyLabel;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> modeAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> firLengthAttachment;
 
     LatencyProvider latencyProvider;
     juce::String lastLatencyText;

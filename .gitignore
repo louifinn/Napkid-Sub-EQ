@@ -1,2 +1,6 @@
 Builds/
 .vs/
+.reasonix/
+Tests/*.exe
+Tests/*.obj
+Tests/*.pdb

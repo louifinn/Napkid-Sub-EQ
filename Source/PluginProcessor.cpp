@@ -25,6 +25,20 @@ SubEQAudioProcessor::SubEQAudioProcessor()
      : apvts (*this, nullptr, juce::Identifier ("SubEQParameters"), SubEQ::createParameterLayout())
 #endif
 {
+    // Cache atomic parameter pointers once (APVTS owns them for our lifetime)
+    masterGainParam = apvts.getRawParameterValue ("master_gain");
+    bypassParam = apvts.getRawParameterValue ("bypass");
+    eqModeParam = apvts.getRawParameterValue ("eq_mode");
+    firLengthParam = apvts.getRawParameterValue ("fir_length");
+
+    for (int i = 0; i < SubEQ::NumNodes; ++i)
+    {
+        nodeParams[i][0] = apvts.getRawParameterValue (SubEQ::getNodeParamID (i, SubEQ::ParamID::Freq));
+        nodeParams[i][1] = apvts.getRawParameterValue (SubEQ::getNodeParamID (i, SubEQ::ParamID::Gain));
+        nodeParams[i][2] = apvts.getRawParameterValue (SubEQ::getNodeParamID (i, SubEQ::ParamID::Q));
+        nodeParams[i][3] = apvts.getRawParameterValue (SubEQ::getNodeParamID (i, SubEQ::ParamID::Type));
+        nodeParams[i][4] = apvts.getRawParameterValue (SubEQ::getNodeParamID (i, SubEQ::ParamID::Enabled));
+    }
 }
 
 SubEQAudioProcessor::~SubEQAudioProcessor()
@@ -66,7 +80,18 @@ bool SubEQAudioProcessor::isMidiEffect() const
 
 double SubEQAudioProcessor::getTailLengthSeconds() const
 {
-    return 0.0;
+    // FIR modes keep up to (FIR length + block latency) samples in the
+    // pipeline; report the full tail so hosts don't truncate the convolution
+    // tail on transport stop.
+    const auto mode = static_cast<SubEQ::EQMode> (currentMode.load());
+    if (mode == SubEQ::EQMode::ZeroLatency)
+        return 0.0;
+
+    const double sr = getSampleRate();
+    if (sr <= 0.0)
+        return 0.0;
+
+    return static_cast<double> (fftProcessor.getTailLengthSamples()) / sr;
 }
 
 int SubEQAudioProcessor::getNumPrograms()
@@ -102,10 +127,11 @@ void SubEQAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     eqEngine.prepare (sampleRate, samplesPerBlock);
     eqEngine.reset();
     fftProcessor.prepare (sampleRate, samplesPerBlock, getTotalNumInputChannels());
+    fftProcessor.setParameterSource (&apvts);
     fftProcessor.reset();
     spectrumAnalyzer.prepare (sampleRate);
-    currentMode = SubEQ::EQMode::ZeroLatency;
-    reportedLatency = 0;
+    currentMode.store (static_cast<int> (SubEQ::EQMode::ZeroLatency));
+    reportedLatency.store (0);
     eqModeCache = 0;
     modeChanged = false;
     eqParamsChanged = false;
@@ -140,7 +166,7 @@ bool SubEQAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) co
 void SubEQAudioProcessor::updateEQParameters()
 {
     // Update master gain (use epsilon to avoid spurious updates from float jitter)
-    float masterGain = apvts.getRawParameterValue ("master_gain")->load();
+    float masterGain = masterGainParam->load();
     if (std::abs (masterGain - masterGainCache) > 0.001f)
     {
         masterGainCache = masterGain;
@@ -149,7 +175,7 @@ void SubEQAudioProcessor::updateEQParameters()
     }
 
     // Update bypass
-    bool bypass = apvts.getRawParameterValue ("bypass")->load() > 0.5f;
+    bool bypass = bypassParam->load() > 0.5f;
     if (bypass != bypassCache)
     {
         bypassCache = bypass;
@@ -158,22 +184,30 @@ void SubEQAudioProcessor::updateEQParameters()
     }
 
     // Update EQ mode
-    int mode = static_cast<int> (apvts.getRawParameterValue ("eq_mode")->load());
+    int mode = static_cast<int> (eqModeParam->load());
     if (mode != eqModeCache)
     {
         eqModeCache = mode;
-        currentMode = static_cast<SubEQ::EQMode> (mode);
+        currentMode.store (mode);
         modeChanged = true;
+    }
+
+    // FIR length change also requires a redesign in FIR modes
+    int firLength = static_cast<int> (firLengthParam->load());
+    if (firLength != firLengthCache)
+    {
+        firLengthCache = firLength;
+        eqParamsChanged = true;
     }
 
     // Update each node
     for (int i = 0; i < SubEQ::NumNodes; ++i)
     {
-        float freq = apvts.getRawParameterValue (SubEQ::getNodeParamID (i, SubEQ::ParamID::Freq))->load();
-        float gain = apvts.getRawParameterValue (SubEQ::getNodeParamID (i, SubEQ::ParamID::Gain))->load();
-        float qVal = apvts.getRawParameterValue (SubEQ::getNodeParamID (i, SubEQ::ParamID::Q))->load();
-        int type = static_cast<int> (apvts.getRawParameterValue (SubEQ::getNodeParamID (i, SubEQ::ParamID::Type))->load());
-        bool enabled = apvts.getRawParameterValue (SubEQ::getNodeParamID (i, SubEQ::ParamID::Enabled))->load() > 0.5f;
+        float freq   = nodeParams[i][0]->load();
+        float gain   = nodeParams[i][1]->load();
+        float qVal   = nodeParams[i][2]->load();
+        int type     = static_cast<int> (nodeParams[i][3]->load());
+        bool enabled = nodeParams[i][4]->load() > 0.5f;
 
         auto& cache = nodeCache[i];
         // Epsilon comparison: prevents coefficient recalculation from tiny float jitter
@@ -222,40 +256,58 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     // Update EQ parameters before processing
     updateEQParameters();
 
+    // Advance coefficient interpolation once per block (shared by all channels)
+    eqEngine.advanceSmoothing (buffer.getNumSamples());
+
+    const auto mode = static_cast<SubEQ::EQMode> (currentMode.load());
+
     // Handle mode change (latency reporting + FIR redesign)
     if (modeChanged)
     {
         modeChanged = false;
 
-        int newLatency = 0;
-        if (currentMode == SubEQ::EQMode::LinearPhase || currentMode == SubEQ::EQMode::MinimumPhase)
-        {
-            fftProcessor.updateFIR (eqEngine, currentMode);
-            newLatency = fftProcessor.getLatencySamples();
-        }
+        // Flush the FIR pipeline on any mode switch: stale input blocks /
+        // overlap tails from a previous FIR session must never convolve with
+        // new coefficients (audible echoes/transients).
+        fftProcessor.reset();
 
-        if (newLatency != reportedLatency)
+        if (mode == SubEQ::EQMode::ZeroLatency)
         {
-            reportedLatency = newLatency;
-            setLatencySamples (reportedLatency);
+            // Back to pure IIR: report zero latency immediately
+            if (reportedLatency.load() != 0)
+            {
+                reportedLatency.store (0);
+                setLatencySamples (0);
+            }
+        }
+        else
+        {
+            // Request an asynchronous FIR redesign. Latency is reported below
+            // (after the design is published) so that PDC always matches the
+            // coefficients actually in use — no premature compensation.
+            fftProcessor.requestRedesign();
         }
     }
-    else if (eqParamsChanged && currentMode != SubEQ::EQMode::ZeroLatency)
+    else if (eqParamsChanged && mode != SubEQ::EQMode::ZeroLatency)
     {
         // In FIR mode, redesign FIR only when EQ parameters actually changed
-        fftProcessor.updateFIR (eqEngine, currentMode);
-
-        int newLatency = fftProcessor.getLatencySamples();
-        if (newLatency != reportedLatency)
-        {
-            reportedLatency = newLatency;
-            setLatencySamples (reportedLatency);
-        }
+        fftProcessor.requestRedesign();
     }
     eqParamsChanged = false;
 
+    // Pick up a freshly published FIR design and report its latency (PDC)
+    if (mode != SubEQ::EQMode::ZeroLatency)
+    {
+        int newLatency = fftProcessor.getLatencySamples();
+        if (newLatency != reportedLatency.load())
+        {
+            reportedLatency.store (newLatency);
+            setLatencySamples (newLatency);
+        }
+    }
+
     // Process audio based on current mode
-    if (currentMode == SubEQ::EQMode::ZeroLatency)
+    if (mode == SubEQ::EQMode::ZeroLatency)
     {
         // IIR biquad processing
         for (int channel = 0; channel < totalNumInputChannels; ++channel)
@@ -267,9 +319,13 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     }
     else
     {
-        // FIR processing
+        // FIR processing. Until a design is published, output silence rather
+        // than an unprocessed passthrough: with PDC still 0, a passthrough
+        // would be latency-mismatched against the compensated signal.
         if (fftProcessor.isReady())
             fftProcessor.process (buffer);
+        else
+            buffer.clear();
     }
 
     // Feed audio to spectrum analyzer

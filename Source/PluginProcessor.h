@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <JuceHeader.h>
 #include "SubEQ_Core.h"
 #include "SubEQ_Parameters.h"
@@ -67,16 +68,20 @@ public:
     SubEQ::SpectrumAnalyzer& getSpectrumAnalyzer() { return spectrumAnalyzer; }
     const SubEQ::SpectrumAnalyzer& getSpectrumAnalyzer() const { return spectrumAnalyzer; }
 
-    // Current EQ mode
-    SubEQ::EQMode getCurrentMode() const { return currentMode; }
-    int getCurrentLatencySamples() const { return reportedLatency; }
+    // Current EQ mode (atomic: written by audio thread, read by GUI thread)
+    SubEQ::EQMode getCurrentMode() const { return static_cast<SubEQ::EQMode> (currentMode.load()); }
+    int getCurrentLatencySamples() const { return reportedLatency.load(); }
 
 private:
 
     SubEQ::EQEngine eqEngine;
+    // apvts must be declared BEFORE fftProcessor: members are destroyed in
+    // reverse declaration order, and ~FFTProcessor joins its background
+    // thread (which reads apvts via setParameterSource) — apvts must outlive
+    // the FIR designer thread.
+    juce::AudioProcessorValueTreeState apvts;
     SubEQ::FFTProcessor fftProcessor;
     SubEQ::SpectrumAnalyzer spectrumAnalyzer;
-    juce::AudioProcessorValueTreeState apvts;
 
     // Parameter cache to avoid redundant coefficient updates
     struct NodeParamCache
@@ -92,8 +97,17 @@ private:
     float masterGainCache = 0.0f;
     bool bypassCache = false;
     int eqModeCache = 0;
-    int reportedLatency = 0;
-    SubEQ::EQMode currentMode = SubEQ::EQMode::ZeroLatency;
+    int firLengthCache = 0;
+
+    // Cached atomic parameter pointers (avoid per-block string lookups).
+    // Index order matches ParamID: Freq, Gain, Q, Type, Enabled.
+    std::atomic<float>* masterGainParam = nullptr;
+    std::atomic<float>* bypassParam = nullptr;
+    std::atomic<float>* eqModeParam = nullptr;
+    std::atomic<float>* firLengthParam = nullptr;
+    std::atomic<float>* nodeParams[SubEQ::NumNodes][5] = {};
+    std::atomic<int> reportedLatency { 0 };
+    std::atomic<int> currentMode { static_cast<int> (SubEQ::EQMode::ZeroLatency) };
     bool modeChanged = false;
     bool eqParamsChanged = false;
 

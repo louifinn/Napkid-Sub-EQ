@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <JuceHeader.h>
 #include "../SubEQ_Parameters.h"
 #include "SubEQLookAndFeel.h"
@@ -51,6 +52,12 @@ private:
     SubEQAudioProcessor& processor;
     juce::AudioProcessorValueTreeState& apvts;
 
+    // GUI-thread-only engine copy: mirrors APVTS parameters so the response
+    // curve is computed without touching the audio-thread engine (no locks).
+    // Refreshed via SubEQ::applyParametersToEngine on parameter changes.
+    SubEQ::EQEngine responseEngine;
+    double responseSampleRate = 0.0;
+
     // Node selection state
     int selectedNode = -1;
 
@@ -70,8 +77,9 @@ private:
     int editingNode = -1;
     std::unique_ptr<juce::TextEditor> textEditor;
 
-    // Parameter change flag
-    bool parametersChanged = true;
+    // Parameter change flag (atomic: written by APVTS listener on any thread,
+    // consumed by paint on the GUI thread)
+    std::atomic<bool> parametersChanged { true };
 
     // Cached curve paths
     juce::Path responsePath;

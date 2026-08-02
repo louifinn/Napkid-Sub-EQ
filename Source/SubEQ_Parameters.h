@@ -98,6 +98,29 @@ inline juce::StringArray getEQModeChoices()
     return { "Zero Latency", "Minimum Phase", "Linear Phase" };
 }
 
+// Apply current APVTS parameter values to an EQEngine.
+// GUI thread uses this on its own engine copy so it never writes the
+// audio-thread engine directly (see FrequencyResponse).
+inline void applyParametersToEngine(juce::AudioProcessorValueTreeState& apvts, EQEngine& engine)
+{
+    engine.setMasterGain(static_cast<double>(apvts.getRawParameterValue("master_gain")->load()));
+    engine.setBypass(apvts.getRawParameterValue("bypass")->load() > 0.5f);
+
+    for (int i = 0; i < NumNodes; ++i)
+    {
+        float freq   = apvts.getRawParameterValue(getNodeParamID(i, ParamID::Freq))->load();
+        float gain   = apvts.getRawParameterValue(getNodeParamID(i, ParamID::Gain))->load();
+        float qVal   = apvts.getRawParameterValue(getNodeParamID(i, ParamID::Q))->load();
+        int type     = static_cast<int>(apvts.getRawParameterValue(getNodeParamID(i, ParamID::Type))->load());
+        bool enabled = apvts.getRawParameterValue(getNodeParamID(i, ParamID::Enabled))->load() > 0.5f;
+
+        auto& node = engine.getNode(i);
+        node.setEnabled(enabled);
+        if (enabled)
+            node.update(static_cast<double>(freq), static_cast<double>(gain), static_cast<double>(qVal), intToFilterType(type));
+    }
+}
+
 // Create the APVTS parameter layout
 inline juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout()
 {
@@ -176,6 +199,14 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout
         "eq_mode",
         "EQ Mode",
         modeChoices,
+        0
+    ));
+
+    // FIR length (Linear / Minimum Phase modes): 4096 / 16384 / 65536
+    layout.add(std::make_unique<juce::AudioParameterChoice>(
+        "fir_length",
+        "FIR Length",
+        juce::StringArray { "4096", "16384", "65536" },
         0
     ));
 

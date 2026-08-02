@@ -60,6 +60,10 @@ void EQNode::update(double freqHz, double gain, double qValue, FilterType type)
     q = qValue;
     currentType = type;
 
+    // Remember the current coefficients as the smoothing start point before
+    // the updateXxx() helpers overwrite coeffs[] with the new target.
+    BiquadCoefficients prev[2] = { coeffs[0], coeffs[1] };
+
     switch (type)
     {
         case FilterType::Bell:       updateBell(); break;
@@ -77,6 +81,33 @@ void EQNode::update(double freqHz, double gain, double qValue, FilterType type)
     {
         if (!coeffs[i].isStable())
             coeffs[i].forceStable();
+    }
+
+    // Install the smoothing state: interpolate from prev[] to the new target
+    // over ~15 ms. A convex combination of stable biquad coefficients stays
+    // stable, so the transition cannot overshoot.
+    for (int i = 0; i < numBiquads; ++i)
+    {
+        smoothStart[i] = prev[i];
+        targetCoeffs[i] = coeffs[i];
+    }
+
+    if (smoothingEnabled)
+    {
+        smoothProgress = 0.0;
+        smoothStepPerSample = 1.0 / std::max(sampleRate * 0.015, 1.0);
+        smoothing = true;
+
+        // Immediately snap back to the interpolation start so no sample is
+        // ever processed with the un-interpolated target (the ramp begins at
+        // the old coefficients).
+        for (int i = 0; i < numBiquads; ++i)
+            coeffs[i] = smoothStart[i];
+    }
+    else
+    {
+        // No smoothing: coefficients are already the exact target
+        smoothing = false;
     }
 }
 
@@ -329,14 +360,11 @@ void EQEngine::processChannel(const float* input, float* output, int numSamples,
         }
     }
 
-    // Apply master gain, hard-clip, and convert back to float
+    // Apply master gain and convert back to float (full dynamic range;
+    // no hard clipping here — the host/output stage handles headroom)
     for (int i = 0; i < numSamples; ++i)
     {
-        double sample = tempBuffer[i] * masterGainLinear;
-        // Hard clip to prevent exceeding float range
-        if (sample > 1.0) sample = 1.0;
-        if (sample < -1.0) sample = -1.0;
-        output[i] = static_cast<float>(sample);
+        output[i] = static_cast<float>(tempBuffer[i] * masterGainLinear);
     }
 }
 

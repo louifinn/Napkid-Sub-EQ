@@ -2,6 +2,63 @@
 
 Napkid Sub EQ 的所有重要变更都将记录在此文件中。
 
+## [0.4.0] - 2026-08-02
+
+### 新增
+
+- **FFT overlap-add 卷积**：FIR 处理从逐样本直接卷积（4096 次乘加/样本）改为分块 FFT 卷积（块 512 样本，double 精度）。FIR 模式的实时 CPU 占用大幅下降，且支持更长的 FIR。
+- **可选 FIR 长度**：新增 `fir_length` 参数与底部面板选择器（4096 / 16384 / 65536，默认 4096）。更长 FIR 显著改善低频精度（65536 点 @48 kHz 频域分辨率 0.37 Hz，接近 0.5 Hz 完整周期），代价是延迟与 CPU 增加。PDC 延迟与 tail length 随选择自动报告。
+- **IIR 系数线性插值**：EQ 节点参数变化时系数在 ~15 ms 内线性过渡（凸组合保证插值过程稳定），消除手动拖拽时的 zipper noise；节点启停也有渐入效果。
+
+### Changed
+
+- **FIR 模式延迟增加 512 样本**（约 10.7 ms @48 kHz）：overlap-add 分块处理延迟，已计入 PDC 与延迟显示。
+- **Minimum Phase 群延迟估计改用 FFT 相位法**（O(N log N)），支持长 FIR（原 O(N²) 方法在 65536 点下不可行）；相位歧义（群延迟 > N/2）时保守回退全长度。
+- **DSP 数学提取为共享头文件** `SubEQ_DSPMath.h`（模板化 FFT/IDFT、nextPow2、群延迟估计），插件与回归测试共用同一实现，消除副本漂移。
+- **FFT 性能与精度优化**：twiddle 因子改为预计算查表（替代逐蝶形递推，消除累积舍入误差——float 精度提升约 150 倍，8192 点相对误差 0.36% → 0.0024%）；len=2/len=4 两级无乘特化（纯加减与 ±i 交换）；8192 点 FFT 约 72µs（double）。
+
+### 修复
+
+- **overlap-add 尾部累积错误**：修复了卷积尾部仅保留上一块贡献、丢弃更早块贡献的错误（多块跨度的长 FIR 输出错误）；回归测试捕获并验证修复。
+
+### 测试
+
+- `Tests/subeq_fft_test.cpp` 扩展至 12 项：FFT round-trip、float/double FFT 一致性、FFT vs 直接 DFT、overlap-add vs 直接卷积（N=4096/16384，误差为 0）、脉冲恒等、群延迟估计（正常 + 保守回退）、overlap-add 尺寸计算。全部通过。
+
+### 已知限制
+
+- 65536 点 FIR 的实时成本较高（每 512 样本一次 131072 点 FFT），建议仅低频精度优先的测量/母带场景使用。
+- FIR 模式的 0.5 Hz 精度仍受所选 FIR 长度限制（4096 点约 11.7 Hz 分辨率；65536 点约 0.37 Hz）。
+
+## [0.3.0] - 2026-08-02
+
+### 修复（实时安全）
+
+- **音频线程/GUI 线程数据竞争**：`FrequencyResponse::parameterChanged` 不再直接调用 `updateEQParameters()` 写引擎（该函数此前与 `processBlock` 在音频线程无锁并发写引擎与参数缓存，属数据竞争 UB）。现在 GUI 使用独立的引擎副本（`responseEngine`，经 `SubEQ::applyParametersToEngine` 从 APVTS 镜像参数）绘制响应曲线；引擎仅由音频线程写入。`reportedLatency` 与 `currentMode` 改为 `std::atomic`。
+- **FIR 系数设计移出音频线程**：模式切换或参数变化时的 FIR 重设计（此前为 O(N²) 直接 DFT/IDFT + 群延迟计算，耗时可达数十毫秒）改为后台线程（`juce::Thread`）异步执行，完成后通过发布-订阅机制原子换发系数（稳态无锁，仅版本号原子比较）。音频线程不再被系数设计阻塞。
+- **自研 radix-2 FFT**：新增内部迭代 FFT/IDFT（double 精度）替换直接 DFT/IDFT 设计路径（O(N²) → O(N log N)），进一步缩短后台设计时间；仍不依赖本环境不可用的 JUCE FFT 复数 API。
+- **后台线程生命周期修复**：`apvts` 成员声明移至 `FFTProcessor` 之前（析构逆序保证后台线程在 APVTS 销毁前 join）；`sampleRate`/`parameterSource` 改为 `std::atomic` 消除跨线程裸读写 UB。
+- **PDC 与在用系数一致性**：切换 Linear Phase 时不再提前上报固定延迟，延迟统一在系数设计发布后上报，保证宿主补偿与实际处理延迟始终匹配。
+
+### 修复（可听质量）
+
+- **移除输出硬裁剪 ±1.0**：`EQEngine::processChannel` 不再将输出硬裁剪到 ±1.0（±24 dB 增益叠加时的切顶失真与亚低频直流偏移消除），输出为全动态范围，由宿主/输出级处理。
+- **tail length 修正**：`getTailLengthSeconds()` 在 FIR 模式下返回 `FIRLength / sampleRate`，避免宿主在传输停止时截断卷积尾音。
+- **延迟线改环形缓冲**：`FFTProcessor::process` 的逐样本 4096 元素移位改为环形缓冲（每样本 O(1) 写入），显著降低 FIR 模式 CPU 占用。
+
+### 修复（其它）
+
+- **频谱 Nyquist bin 越界读取**：`SubEQ_Spectrum::performAnalysis` 不再读取 JUCE real-only FFT packed 布局中无有效数据的 `fftData[N]`/`fftData[N+1]`（此分支实际不可达，属潜在缺陷）。
+- **参数指针缓存**：`updateEQParameters` 改为使用构造函数缓存的 `std::atomic<float>*` 参数指针，消除每 block 的 42 次字符串查找。
+
+### 测试
+
+- 新增 `Tests/subeq_fft_test.cpp`：独立可执行验证（无 JUCE 依赖），覆盖自研 FFT/IDFT round-trip（N=4096）、FFT vs 直接 DFT（N=64）、环形缓冲卷积 vs 线性移位卷积（L=4096）、脉冲 FIR 恒等还原，全部通过（误差为 0）。构建：`cl /EHsc /std:c++17 Tests/subeq_fft_test.cpp`。
+
+### 已知限制
+
+- FIR（4096 点 @48 kHz）时域跨度约 85 ms、频域分辨率约 11.7 Hz，10 Hz 以下响应由插值近似，与 IIR 模式（精确）存在偏差；后续版本计划以 FFT overlap-add 卷积 + 更长 FIR 解决。
+
 ## [0.2.0] - 2026-04-20
 
 ### 新增

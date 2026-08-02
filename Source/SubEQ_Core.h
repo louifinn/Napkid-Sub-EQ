@@ -76,6 +76,9 @@ enum class FilterType
 class EQNode
 {
 public:
+    // Stereo (up to 2 channels). The bus layout check in the processor only
+    // accepts mono/stereo, so larger channel counts never reach the engine;
+    // process() silently passes through if a channel index exceeds this.
     static constexpr int MaxChannels = 2;  // Stereo (up to 2 channels)
 
     EQNode() = default;
@@ -84,10 +87,19 @@ public:
     void reset();
     void reset(int channel);
 
-    // Update filter coefficients from parameters (coefficients are shared)
+    // Update filter coefficients from parameters (coefficients are shared).
+    // With smoothing enabled, the new coefficients are reached by linear
+    // interpolation over ~15 ms (convex combination of stable coefficients
+    // stays stable).
     void update(double freqHz, double gainDb, double qValue, FilterType type);
 
-    // Process a single sample through this node for a specific channel
+    // Disable coefficient smoothing (used by the background FIR designer so
+    // frequency-response queries always see the exact target coefficients).
+    void setSmoothingEnabled(bool shouldSmooth) noexcept { smoothingEnabled = shouldSmooth; }
+
+    // Process a single sample through this node for a specific channel.
+    // Coefficient smoothing advances once per block (advanceSmoothing), so
+    // all channels always see the same coefficients.
     inline double process(double in, int channel) noexcept
     {
         if (!enabled || channel < 0 || channel >= MaxChannels)
@@ -97,6 +109,39 @@ public:
         if (numBiquads > 1)
             out = states[channel][1].process(out, coeffs[1]);
         return out;
+    }
+
+    // Advance coefficient interpolation by numSamples (called once per block,
+    // from the audio thread, so channels stay in sync). The per-block step is
+    // capped at half of the remaining ramp so the smoothing spans at least two
+    // blocks even with very large host block sizes.
+    void advanceSmoothing(int numSamples) noexcept
+    {
+        if (!smoothing)
+            return;
+
+        double step = smoothStepPerSample * static_cast<double>(numSamples);
+        if (step > 0.5)
+            step = 0.5;
+        smoothProgress += step;
+
+        if (smoothProgress >= 1.0)
+        {
+            for (int b = 0; b < numBiquads; ++b)
+                coeffs[b] = targetCoeffs[b];
+            smoothing = false;
+            return;
+        }
+
+        const double t = smoothProgress;
+        for (int b = 0; b < numBiquads; ++b)
+        {
+            coeffs[b].b0 = smoothStart[b].b0 + (targetCoeffs[b].b0 - smoothStart[b].b0) * t;
+            coeffs[b].b1 = smoothStart[b].b1 + (targetCoeffs[b].b1 - smoothStart[b].b1) * t;
+            coeffs[b].b2 = smoothStart[b].b2 + (targetCoeffs[b].b2 - smoothStart[b].b2) * t;
+            coeffs[b].a1 = smoothStart[b].a1 + (targetCoeffs[b].a1 - smoothStart[b].a1) * t;
+            coeffs[b].a2 = smoothStart[b].a2 + (targetCoeffs[b].a2 - smoothStart[b].a2) * t;
+        }
     }
 
     // Get the complex frequency response at normalized frequency w (0~pi)
@@ -120,7 +165,13 @@ private:
     void updateTilt();
     void updateBandPass();
 
-    BiquadCoefficients coeffs[2];            // Shared coefficients (up to 2 biquads)
+    BiquadCoefficients coeffs[2];            // Current (possibly interpolating) coefficients
+    BiquadCoefficients targetCoeffs[2];      // Smoothing target
+    BiquadCoefficients smoothStart[2];       // Smoothing start
+    double smoothProgress = 1.0;             // 0..1 interpolation progress (1 = done)
+    double smoothStepPerSample = 0.0;        // progress increment per sample (~15 ms)
+    bool smoothing = false;
+    bool smoothingEnabled = true;
     BiquadState states[MaxChannels][2];      // Per-channel states [channel][biquad]
     int numBiquads = 1;
 
@@ -157,6 +208,24 @@ public:
     // Bypass
     void setBypass(bool shouldBypass) noexcept { bypass = shouldBypass; }
     bool isBypassed() const noexcept { return bypass; }
+
+    // Enable/disable coefficient smoothing on all nodes
+    // (disabled on the background design engine: it must always evaluate the
+    // exact target coefficients)
+    void setSmoothingEnabled(bool shouldSmooth) noexcept
+    {
+        for (int i = 0; i < MaxNodes; ++i)
+            nodes[i].setSmoothingEnabled(shouldSmooth);
+    }
+
+    // Advance coefficient interpolation on all nodes by numSamples.
+    // Called once per audio block (audio thread) so every channel shares the
+    // same interpolation state.
+    void advanceSmoothing(int numSamples) noexcept
+    {
+        for (int i = 0; i < MaxNodes; ++i)
+            nodes[i].advanceSmoothing(numSamples);
+    }
 
     // Get overall frequency response in dB at normalized frequency w
     double getResponseDb(double w) const noexcept;

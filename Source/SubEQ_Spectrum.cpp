@@ -88,13 +88,17 @@ void SpectrumAnalyzer::performAnalysis()
     fft.performRealOnlyForwardTransform(fftData.data());
 
     // Compute per-bin power
+    // JUCE's performRealOnlyForwardTransform stores the packed spectrum as
+    // [Re(0), Re(N/2), Re(1), Im(1), ...], so bin k (1..N/2-1) lives at
+    // fftData[2k], fftData[2k+1]. The Nyquist bin has no imaginary part and
+    // its real part is at fftData[1]; we never need it (fc <= 500 Hz).
     const int numBins = FftSize / 2;
     const float binSpacing = static_cast<float>(sampleRate / FftSize);
     const float scaleFactor = 1.0f / (static_cast<float>(FftSize) * static_cast<float>(FftSize));
 
-    float binPower[numBins + 1];
+    float binPower[numBins];
     binPower[0] = 0.0f; // DC
-    for (int k = 1; k <= numBins; ++k)
+    for (int k = 1; k < numBins; ++k)
     {
         float real = fftData[k * 2];
         float imag = fftData[k * 2 + 1];
@@ -113,9 +117,10 @@ void SpectrumAnalyzer::performAnalysis()
             // Below first meaningful bin: use bin 1 power
             bandPower[b] = binPower[1];
         }
-        else if (binIndexF >= static_cast<float>(numBins))
+        else if (binIndexF >= static_cast<float>(numBins - 1))
         {
-            bandPower[b] = binPower[numBins];
+            // Above the last usable bin (Nyquist bin has no complex value)
+            bandPower[b] = binPower[numBins - 1];
         }
         else
         {

@@ -1,7 +1,7 @@
 # SubEQ v0.2.0 Bug Tracker / Work Memo
 
 > Created: 2026-04-19
-> Status: Active — pending fixes after context compact
+> Status: **已解决**（2026-08-02）— 本文档记录的频谱溢出/FFT 问题已在 v0.3.0/v0.4.0 中通过重写解决：FIR 设计改用自研 radix-2 FFT（后台线程）+ overlap-add 卷积（double 精度），不再依赖本环境不可用的 JUCE FFT 复数 API；系数发布采用发布-订阅机制。保留作为历史调查记录。
 
 ---
 

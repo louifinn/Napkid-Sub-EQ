@@ -25,6 +25,15 @@ FrequencyResponse::FrequencyResponse(SubEQAudioProcessor& proc)
     for (int i = 0; i < SpectrumBands; ++i)
         spectrumData[i] = -60.0f;
 
+    // Prepare the GUI-side response engine (re-prepared on sample rate changes)
+    responseSampleRate = (processor.getSampleRate() > 0.0) ? processor.getSampleRate() : 48000.0;
+    // The response engine never processes audio, so coefficient smoothing
+    // would freeze the curve at the interpolation start; disable it (the
+    // curve must always show the exact target coefficients).
+    responseEngine.setSmoothingEnabled(false);
+    responseEngine.prepare(responseSampleRate, 512);
+    SubEQ::applyParametersToEngine(apvts, responseEngine);
+
     // Start timer for spectrum animation (~60fps)
     startTimerHz(60);
 
@@ -64,10 +73,12 @@ FrequencyResponse::~FrequencyResponse()
 void FrequencyResponse::parameterChanged(const juce::String& parameterID, float newValue)
 {
     juce::ignoreUnused(parameterID, newValue);
-    // Update coefficients immediately from GUI thread so the response curve
-    // stays in sync even when the DAW is not processing audio.
-    processor.updateEQParameters();
-    parametersChanged = true;
+    // NOTE: this callback may run on the audio thread (DAW automation) or the
+    // GUI thread. Only set the flag here — the GUI-side engine copy
+    // (responseEngine) is refreshed from APVTS inside updateResponsePaths(),
+    // which always runs on the GUI thread, so responseEngine is never
+    // touched concurrently.
+    parametersChanged.store(true);
     repaint();
 }
 
@@ -293,17 +304,30 @@ void FrequencyResponse::drawSpectrum(juce::Graphics& g)
 
 void FrequencyResponse::updateResponsePaths()
 {
-    if (!parametersChanged)
+    if (!parametersChanged.exchange(false))
         return;
 
-    parametersChanged = false;
+    // Refresh the GUI-side engine copy here, on the GUI thread only —
+    // responseEngine must never be touched from the APVTS listener thread
+    // (see parameterChanged).
+    SubEQ::applyParametersToEngine(apvts, responseEngine);
+
     responsePath.clear();
     phasePath.clear();
 
     auto area = getResponseArea();
-    const auto& eqEngine = processor.getEQEngine();
+
+    // Re-prepare the GUI-side engine if the sample rate changed
     double sampleRate = processor.getSampleRate();
     if (sampleRate <= 0.0) sampleRate = 48000.0;
+    if (std::abs(sampleRate - responseSampleRate) > 0.5)
+    {
+        responseSampleRate = sampleRate;
+        responseEngine.prepare(responseSampleRate, 512);
+        SubEQ::applyParametersToEngine(apvts, responseEngine);
+    }
+
+    const auto& eqEngine = responseEngine;
 
     bool firstGainPoint = true;
     bool firstPhasePoint = true;

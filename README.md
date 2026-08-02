@@ -30,8 +30,10 @@ Napkid Sub EQ 是一款专为低频信号处理设计的参量均衡器插件。
 - **双精度 IIR Biquad**：Direct Form II Transposed 结构，数值稳定
 - **三种全局处理模式**（v0.2.0 新增）：
   - **Zero Latency（零延迟）**：纯 IIR 架构，无额外处理延迟
-  - **Linear Phase（线性相位）**：基于 IIR 幅频响应设计严格线性相位 FIR（4096 点），固定延迟 2047 样本
-  - **Minimum Phase（最小相位）**：基于 IIR 幅频响应设计最小相位 FIR（4096 点），通过 Cepstral 方法实现，延迟由最大群延迟动态计算
+  - **Linear Phase（线性相位）**：基于 IIR 幅频响应设计严格线性相位 FIR，固定延迟 (N-1)/2 + 512 样本块延迟
+  - **Minimum Phase（最小相位）**：基于 IIR 幅频响应设计最小相位 FIR，通过 Cepstral 方法实现，延迟由最大群延迟动态计算
+- **可选 FIR 长度**（v0.4.0 新增）：4096 / 16384 / 65536 点（Linear / Minimum Phase 模式），更长 FIR 提升低频精度（65536 点 @48 kHz 分辨率约 0.37 Hz），代价是延迟与 CPU 增加
+- **FFT overlap-add 卷积**（v0.4.0）：自研双精度 radix-2 FFT（twiddle 查表优化），FIR 处理高效且精度高
 - **自动延迟补偿（PDC）**：模式切换或参数调整时自动向宿主报告延迟，支持 DAW 插件延迟补偿
 - **实时延迟显示**：底部面板实时显示当前模式的延迟量（ms / samples）
 - **实时相位响应曲线**：与幅频曲线同步显示（零延迟模式），非零延迟模式自动隐藏
@@ -55,9 +57,9 @@ Napkid Sub EQ 是一款专为低频信号处理设计的参量均衡器插件。
 | 频谱更新率 | ~60 fps |
 | 频谱 FFT 大小 | 8192 点 |
 | 频谱 FFT 跳步 | 512 样本 |
-| FIR 长度 | 4096 点（Linear / Minimum Phase 模式） |
+| FIR 长度 | 4096 / 16384 / 65536 点（Linear / Minimum Phase 模式可选） |
 | 处理模式 | Zero Latency / Linear Phase / Minimum Phase |
-| 处理延迟 | 0 ~ 2047 samples（依模式而定） |
+| 处理延迟 | 0 ~ 65535 samples + 512 样本块延迟（依模式与 FIR 长度而定） |
 | 支持格式 | VST3, Standalone |
 | 窗口尺寸 | 900 × 620 像素 |
 | 最低采样率 | 44100 Hz |
@@ -120,8 +122,10 @@ Builds/VisualStudio2022/x64/Release/Standalone Plugin/
 
 底部面板提供处理模式选择：
 - **Zero Latency**：纯 IIR 处理，零延迟，适合实时演奏和监听
-- **Linear Phase**：严格线性相位 FIR，固定延迟 2047 样本，相位失真为零，适合母带处理
-- **Minimum Phase**：最小相位 FIR，延迟动态计算，无预振铃（pre-ringing），适合一般混音使用
+- **Linear Phase**：严格线性相位 FIR，固定延迟 (N-1)/2 + 512 样本块延迟，相位失真为零，适合母带处理
+- **Minimum Phase**：最小相位 FIR，延迟由最大群延迟动态计算，无预振铃（pre-ringing），适合一般混音使用
+
+底部面板的 **FIR Length** 选择器（4096 / 16384 / 65536）在两种 FIR 模式下生效：更长 FIR 提升低频精度（65536 点 @48 kHz 频域分辨率约 0.37 Hz，接近 0.5 Hz 完整周期），但延迟与 CPU 占用同步增加。切换时插件自动向宿主报告延迟（PDC）。
 
 切换模式时插件会自动向宿主报告延迟，确保 DAW 的延迟补偿（PDC）正常工作。
 
@@ -149,7 +153,8 @@ Sub EQ/
 │   ├── PluginProcessor.h/.cpp       # 插件处理器主体
 │   ├── PluginEditor.h/.cpp          # 插件编辑器入口
 │   ├── SubEQ_Core.h/.cpp            # 双精度 Biquad EQ 引擎
-│   ├── SubEQ_FFTProcessor.h/.cpp    # FIR 系数设计与卷积（Linear / Minimum Phase）
+│   ├── SubEQ_DSPMath.h              # 共享 DSP 数学（模板 FFT/IDFT、群延迟估计）
+│   ├── SubEQ_FFTProcessor.h/.cpp    # FIR 系数设计与 overlap-add 卷积（Linear / Minimum Phase）
 │   ├── SubEQ_Parameters.h           # APVTS 参数定义
 │   ├── SubEQ_Spectrum.h/.cpp        # 实时频谱分析器
 │   └── SubEQ_Editor/
@@ -186,12 +191,12 @@ Sub EQ/
 | 模式 | 延迟 | 相位特性 | 适用场景 |
 |------|------|----------|----------|
 | **Zero Latency** | 0 samples | 最小相位（IIR 固有） | 实时演奏、监听、低延迟要求 |
-| **Linear Phase** | 2047 samples | 严格线性相位 | 母带处理、相位敏感操作 |
-| **Minimum Phase** | 动态计算 | 最小相位（FIR 设计） | 混音、避免预振铃 |
+| **Linear Phase** | (N-1)/2 + 511 samples | 严格线性相位 | 母带处理、相位敏感操作 |
+| **Minimum Phase** | 动态（最大群延迟 + 511） | 最小相位（FIR 设计） | 混音、避免预振铃 |
 
 - **Linear Phase** 使用频域采样 + IDFT 设计对称 FIR 系数，确保严格线性相位，但引入固定延迟和预振铃
 - **Minimum Phase** 使用 Cepstral 方法从幅频响应提取最小相位 FIR，延迟由最大群延迟保守估计，无预振铃
-- 两种 FIR 模式均基于当前 IIR 幅频响应设计，确保频响一致性
+- 两种 FIR 模式均基于当前 IIR 幅频响应设计，确保频响一致性；FIR 长度（4096 / 16384 / 65536）可选，另有 512 样本 overlap-add 块处理延迟
 
 ### 为什么是 0.5 Hz 起？
 
@@ -203,6 +208,7 @@ Sub EQ/
 
 - **GUI 仅限 Windows**：当前使用 Projucer 的 VS2022 目标，GUI 渲染依赖 Windows GDI+
 - **频谱下限**：FFT bin 分辨率限制了 500 Hz 以下的精细频谱显示（8192 点 FFT @ 48 kHz 约 5.86 Hz/bin）
+- **FIR 模式低频精度与延迟的权衡**：FIR 长度可选（4096 / 16384 / 65536 点）；4096 点 @48 kHz 频域分辨率约 11.7 Hz，10 Hz 以下响应为插值近似；65536 点分辨率约 0.37 Hz，但 Linear Phase 延迟达 1.37 秒且 CPU 占用较高。FIR 模式另有 512 样本（约 10.7 ms）overlap-add 块处理延迟
 
 ---
 
