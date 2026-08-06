@@ -90,7 +90,7 @@ struct BiquadState {
 
 ### 3.4 系数更新策略
 
-- **平滑插值（v0.4.0 起）**: 参数改变时系数在约 15ms 内线性过渡（block 级推进，所有通道共享同一进度；凸组合保证插值过程稳定）。设计引擎与 GUI 响应曲线引擎禁用平滑（必须立即显示精确目标系数）
+- **平滑插值（v0.3.0 起）**: 参数改变时系数在约 15ms 内线性过渡（block 级推进，所有通道共享同一进度；凸组合保证插值过程稳定）。设计引擎与 GUI 响应曲线引擎禁用平滑（必须立即显示精确目标系数）
 - **线程安全**: 系数更新仅在音频线程（`processBlock` 中调用 `updateEQParameters()`）进行。GUI 线程通过 APVTS 修改参数值，但系数计算延迟到下一次音频回调；GUI 使用独立引擎副本（`responseEngine`）绘制响应曲线，引擎仅由音频线程写入
 - **浮点抖动过滤**: 使用 epsilon 容差（0.001）比较参数值，避免 APVTS 原子值的微小抖动触发无意义的系数重算
 
@@ -105,7 +105,7 @@ struct BiquadState {
 | Master Gain | Float | -24.0 ~ +24.0 dB | 0.0 | 总输出增益（右侧边缘垂直Slider） |
 | Bypass | Bool | true/false | false | 硬旁路 |
 | EQ Mode | Choice | Zero Latency / Minimum Phase / Linear Phase | Zero Latency | 全局处理模式（v0.2.0） |
-| FIR Length | Choice | 4096 / 16384 / 65536 | 4096 | FIR 模式长度（v0.4.0） |
+| FIR Length | Choice | 4096 / 16384 / 65536 | 4096 | FIR 模式长度（v0.3.0） |
 
 ### 4.2 节点参数（每节点，共 8 个）
 
@@ -203,7 +203,7 @@ Source/
 ├── PluginEditor.cpp         [修改] 实现编辑器布局
 ├── SubEQ_Core.h             [新增] 双精度 Biquad + 节点管理 + 系数平滑
 ├── SubEQ_Core.cpp           [新增] 系数计算 + 信号处理
-├── SubEQ_Parameters.h       [新增] 参数定义、APVTS 布局（43 参数）
+├── SubEQ_Parameters.h       [新增] 参数定义、APVTS 布局（48 参数）
 ├── SubEQ_DSPMath.h          [新增] 共享 DSP 数学（模板 FFT/IDFT、群延迟估计）
 ├── SubEQ_FFTProcessor.h/.cpp [新增] FIR 设计（后台线程）+ overlap-add 卷积
 ├── SubEQ_Spectrum.h/.cpp    [新增] 实时频谱分析器 (8192点 FFT)
@@ -257,5 +257,5 @@ Source/
 
 ---
 
-*文档版本: v0.4*
+*文档版本: v0.6*
 *最后更新: 2026-08-02*

@@ -1,10 +1,11 @@
 // Standalone regression tests for the shared DSP math in
 // Source/SubEQ_DSPMath.h (radix-2 FFT/IDFT, overlap-add convolution scheme
-// used by FFTProcessor, conservative group-delay estimator).
+// used by FFTProcessor, conservative group-delay estimator, multi-slot
+// per-size twiddle cache).
 // The code under test is included directly — no copy drift.
 //
 // Build (Windows, VS dev prompt):
-//   cl /EHsc /std:c++17 Tests/subeq_fft_test.cpp /Fe:Tests\subeq_fft_test.exe
+//   cl /EHsc /std:c++17 /O2 Tests/subeq_fft_test.cpp /Fe:Tests\subeq_fft_test.exe
 #include "../Source/SubEQ_DSPMath.h"
 
 #include <complex>
@@ -13,6 +14,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <random>
 
 using namespace SubEQ;
@@ -334,6 +336,110 @@ int main()
         check(convolutionFftSize(4096, 512) == 8192, "convFftSize(4096,512) == 8192");
         check(convolutionFftSize(65536, 512) == 131072, "convFftSize(65536,512) == 131072");
         check(convolutionFftSize(16384, 512) == 32768, "convFftSize(16384,512) == 32768");
+    }
+
+    // ---- Test 10: multi-slot twiddle cache — alternating sizes stay correct ----
+    {
+        std::mt19937 rng(77);
+        std::uniform_real_distribution<double> dist(-1.0, 1.0);
+
+        // Prewarm a few sizes, then interleave FFTs of different sizes: each
+        // size's cached table must survive other sizes being built and used
+        // (the audio thread interleaves convolution and spectrum FFT sizes).
+        prewarmTwiddleTable<double>(4096);
+        prewarmTwiddleTable<double>(8192);
+        prewarmTwiddleTable<float>(4096);
+
+        bool ok = true;
+        for (int round = 0; round < 3 && ok; ++round)
+        {
+            for (int n : { 64, 4096, 256, 8192, 128, 4096, 16384, 64 })
+            {
+                std::vector<std::complex<double>> data(n), orig(n);
+                for (auto& c : data) c = { dist(rng), dist(rng) };
+                orig = data;
+                fftInPlace(data.data(), n);
+                ifftInPlace(data.data(), n);
+                for (int i = 0; i < n && ok; ++i)
+                    ok = std::abs(data[i] - orig[i]) < 1e-10;
+            }
+        }
+        check(ok, "twiddle cache: alternating sizes keep double round-trip accuracy");
+
+        // Float slot independence: interleave other float sizes, then a 16384
+        // float FFT must still match double within the tight bound.
+        for (int n : { 256, 4096, 512 })
+        {
+            std::vector<std::complex<float>> junk(n);
+            for (auto& c : junk) c = { 0.5f, -0.25f };
+            fftInPlace(junk.data(), n);
+        }
+
+        std::vector<std::complex<double>> d(16384);
+        for (auto& c : d) c = { dist(rng), dist(rng) };
+        auto d2 = d;
+        fftInPlace(d.data(), 16384);
+
+        std::vector<std::complex<float>> f(16384);
+        for (int i = 0; i < 16384; ++i)
+            f[i] = { (float)d2[i].real(), (float)d2[i].imag() };
+        fftInPlace(f.data(), 16384);
+
+        double maxRelErr = 0.0;
+        for (int i = 0; i < 16384; ++i)
+        {
+            const double ref = std::abs(d[i]);
+            if (ref > 1e-6)
+                maxRelErr = std::max(maxRelErr,
+                    std::abs(std::complex<double>(f[i].real(), f[i].imag()) - d[i]) / ref);
+        }
+        check(maxRelErr < 1e-4, "twiddle cache: float FFT matches double at N=16384 after size mixing (maxRelErr=" + std::to_string(maxRelErr) + ")");
+    }
+
+    // ---- Test 11: computeMaxGroupDelay boundary cases ----
+    {
+        // Tiny FIR: below the minimum analysable length
+        std::vector<float> tiny(2, 1.0f);
+        check(computeMaxGroupDelay(tiny) == 0, "group delay of 2-tap FIR == 0");
+
+        // Gaussian-windowed symmetric FIR: perfectly linear phase with delay
+        // exactly (N-1)/2 (the response has no zeros, so no unwrap ambiguity)
+        const int N = 4096;
+        std::vector<float> gauss(N);
+        const double centre = (N - 1) / 2.0;
+        const double sigma = N / 8.0;
+        for (int i = 0; i < N; ++i)
+        {
+            const double t = (i - centre) / sigma;
+            gauss[i] = static_cast<float>(std::exp(-0.5 * t * t));
+        }
+        int gd = computeMaxGroupDelay(gauss);
+        check(std::abs(gd - (N - 1) / 2) <= 2,
+              "group delay of symmetric Gaussian FIR ~= (N-1)/2 (got " + std::to_string(gd) + ")");
+
+        // All-zero FIR: phase undefined everywhere -> conservative full length
+        std::vector<float> zero(N, 0.0f);
+        check(computeMaxGroupDelay(zero) == N - 1,
+              "group delay of all-zero FIR conservative == N-1");
+
+        // NaN-poisoned FIR: the estimator must never propagate NaN/inf into
+        // PDC — the result must stay inside the valid [0, N-1] range
+        std::vector<float> poison(N, 0.0f);
+        poison[10] = std::numeric_limits<float>::quiet_NaN();
+        int gdNan = computeMaxGroupDelay(poison);
+        check(gdNan >= 0 && gdNan <= N - 1,
+              "group delay of NaN FIR bounded to [0, N-1] (got " + std::to_string(gdNan) + ")");
+    }
+
+    // ---- Test 12: convolutionFftSize / nextPowerOfTwo extra cases ----
+    {
+        check(nextPowerOfTwo(1) == 1, "nextPow2(1) == 1");
+        check(nextPowerOfTwo(3) == 4, "nextPow2(3) == 4");
+        check(nextPowerOfTwo(131072) == 131072, "nextPow2(131072) == 131072");
+        check(convolutionFftSize(1, 512) == 512, "convFftSize(1,512) == 512");
+        check(convolutionFftSize(512, 512) == 1024, "convFftSize(512,512) == 1024");
+        check(convolutionFftSize(513, 512) == 1024, "convFftSize(513,512) == 1024");
+        check(convolutionFftSize(4097, 512) == 8192, "convFftSize(4097,512) == 8192");
     }
 
     if (failures == 0)

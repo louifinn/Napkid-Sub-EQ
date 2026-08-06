@@ -3,7 +3,7 @@
 <JUCERPROJECT id="YD8LOD" name="Napkid Sub EQ" projectType="audioplug" useAppConfig="0"
               addUsingNamespaceToJuceHeader="0" jucerFormatVersion="1" pluginFormats="buildStandalone,buildVST3"
               pluginVST3Category="EQ" companyName="Napkid Audio" companyEmail="3225607112@qq.com"
-              version="0.4.0" pluginCode="Nseq" pluginManufacturer="Napkid Audio">
+              version="0.3.0" pluginCode="Nseq" pluginManufacturer="Napkid Audio">
   <MAINGROUP id="lnXInZ" name="Napkid Sub EQ">
     <GROUP id="{730EE156-EB98-7118-C7AB-A3A3DB8657E7}" name="Source">
       <FILE id="zHF3zP" name="PluginProcessor.cpp" compile="1" resource="0"
@@ -28,6 +28,28 @@
       <GROUP id="{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}" name="SubEQ_Editor">
         <FILE id="sEqL01" name="SubEQLookAndFeel.h" compile="0" resource="0"
               file="Source/SubEQ_Editor/SubEQLookAndFeel.h"/>
+        <GROUP id="{B2C3D4E5-F6A7-8901-BCDE-F12345678901}" name="DesignSystem">
+          <FILE id="dSgC01" name="DesignColours.h" compile="0" resource="0"
+                file="Source/SubEQ_Editor/DesignSystem/DesignColours.h"/>
+          <FILE id="dSgC02" name="DesignConstants.h" compile="0" resource="0"
+                file="Source/SubEQ_Editor/DesignSystem/DesignConstants.h"/>
+          <FILE id="dSgF01" name="DesignFonts.cpp" compile="1" resource="0"
+                file="Source/SubEQ_Editor/DesignSystem/DesignFonts.cpp"/>
+          <FILE id="dSgF02" name="DesignFonts.h" compile="0" resource="0"
+                file="Source/SubEQ_Editor/DesignSystem/DesignFonts.h"/>
+          <FILE id="dSgA01" name="AnimationUtils.cpp" compile="1" resource="0"
+                file="Source/SubEQ_Editor/DesignSystem/AnimationUtils.cpp"/>
+          <FILE id="dSgA02" name="AnimationUtils.h" compile="0" resource="0"
+                file="Source/SubEQ_Editor/DesignSystem/AnimationUtils.h"/>
+          <FILE id="dSgL01" name="LiquidGlassEffect.cpp" compile="1" resource="0"
+                file="Source/SubEQ_Editor/DesignSystem/LiquidGlassEffect.cpp"/>
+          <FILE id="dSgL02" name="LiquidGlassEffect.h" compile="0" resource="0"
+                file="Source/SubEQ_Editor/DesignSystem/LiquidGlassEffect.h"/>
+          <FILE id="dSgLAF1" name="DesignLookAndFeel.cpp" compile="1" resource="0"
+                file="Source/SubEQ_Editor/DesignSystem/DesignLookAndFeel.cpp"/>
+          <FILE id="dSgLAF2" name="DesignLookAndFeel.h" compile="0" resource="0"
+                file="Source/SubEQ_Editor/DesignSystem/DesignLookAndFeel.h"/>
+        </GROUP>
         <FILE id="sEqF01" name="FrequencyResponse.cpp" compile="1" resource="0"
               file="Source/SubEQ_Editor/FrequencyResponse.cpp"/>
         <FILE id="sEqF02" name="FrequencyResponse.h" compile="0" resource="0"
@@ -40,6 +62,9 @@
               file="Source/SubEQ_Editor/ModeSelector.cpp"/>
         <FILE id="sEqMS2" name="ModeSelector.h" compile="0" resource="0"
               file="Source/SubEQ_Editor/ModeSelector.h"/>
+      </GROUP>
+      <GROUP id="{C3D4E5F6-A7B8-9012-CDEF-234567890123}" name="Fonts">
+        <FILE id="avnFt" name="Avenir.ttf" compile="0" resource="1" file="Source/Fonts/Avenir.ttf"/>
       </GROUP>
     </GROUP>
   </MAINGROUP>

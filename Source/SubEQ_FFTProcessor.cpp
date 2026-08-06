@@ -38,6 +38,19 @@ void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
 {
     juce::ignoreUnused(maxBlockSize);
     sampleRate.store(sr, std::memory_order_release);
+
+    // Any design started before this prepare is stale (it may have snapshotted
+    // a previous sample rate) and must not be published.
+    designEpoch.fetch_add(1, std::memory_order_release);
+
+    // Same session parameters: keep the buffers and any published design.
+    // Hosts commonly re-call prepareToPlay (transport stop/start, loop
+    // points) with an unchanged setup; dropping the published design would
+    // mute the output until the background redesign completes.
+    if (sr == preparedSampleRate && channels == numChannels && !fftWork.empty())
+        return;
+
+    preparedSampleRate = sr;
     numChannels = channels;
 
     // Pre-allocate for the longest FIR so the audio thread never allocates
@@ -52,6 +65,13 @@ void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
     for (auto& ob : outBufs)
         ob.reserve(ConvBlockLen * 2);
     fftWork.assign(maxL, { 0.0, 0.0 });
+    activeConvFFTSize = 0;
+
+    // Pre-build the twiddle tables for every selectable convolution size on
+    // this thread, so the first real-time FFT does not allocate (the cache
+    // is thread_local; prepareToPlay normally runs on the audio thread).
+    for (int i = 0; i < NumFirLengthChoices; ++i)
+        prewarmTwiddleTable<double>(convolutionFftSize(FirLengthChoices[i], ConvBlockLen));
 
     // Drop any previously published design: the engine will be redesigned
     // once the mode/parameters demand it.
@@ -117,6 +137,13 @@ void FFTProcessor::run()
                                   ? FirLengthChoices[firChoice]
                                   : DefaultFirLength;
 
+        // Capture the design epoch before snapshotting anything: if prepare()
+        // runs while this design is in flight, the design is stale (e.g. it
+        // snapshotted a previous sample rate) and must be discarded, not
+        // published — otherwise the audio thread would consume coefficients
+        // computed for the wrong sample rate until the next redesign.
+        const int epoch = designEpoch.load(std::memory_order_acquire);
+
         // Build an engine snapshot owned by this thread; the parameter values
         // are read atomically from the APVTS, so no lock is needed.
         const double sr = sampleRate.load(std::memory_order_acquire);
@@ -146,9 +173,17 @@ void FFTProcessor::run()
 
         newState->freqCoeffs = spec;   // double precision frequency response
 
+        // A prepare() during the design invalidated it — drop the result.
+        if (epoch != designEpoch.load(std::memory_order_acquire))
+            continue;
+
         // Publish (release) so the audio thread sees a fully-formed state.
+        // The replaced state is moved into the retirement slot: its (up to
+        // ~2.3 MB) destructor then runs here on the background thread instead
+        // of on the audio thread at its next publication pick-up.
         {
             std::lock_guard<std::mutex> lock(stateMutex);
+            retiredState = currentState;
             currentState = newState;
         }
         stateVersion.fetch_add(1, std::memory_order_release);
@@ -274,18 +309,15 @@ void FFTProcessor::designMinimumPhaseFIR(const EQEngine& eqEngine, int firLength
     {
         std::fill(coeffsOut.begin(), coeffsOut.end(), 0.0f);
         coeffsOut[0] = 1.0f;
-        latencyOut = 0;
     }
-    else
-    {
-        latencyOut = computeMaxGroupDelay(coeffsOut);
-    }
-}
 
-//==============================================================================
-int FFTProcessor::computeMaxGroupDelay(const std::vector<float>& coeffs)
-{
-    return SubEQ::computeMaxGroupDelay(coeffs);
+    // Minimum-phase PDC reports no FIR bulk delay: the cepstral design places
+    // the direct sound at tap 0, so only the overlap-add block latency applies
+    // (added by getLatencySamples). Reporting the max group delay instead
+    // over-compensated — low-frequency group-delay spikes could exceed the
+    // Linear Phase latency, making this "minimum phase" mode play EARLY
+    // against other tracks, and the value churned on every parameter edit.
+    latencyOut = 0;
 }
 
 //==============================================================================
@@ -298,6 +330,17 @@ void FFTProcessor::process(juce::AudioBuffer<float>& buffer)
     const int L = state->convFFTSize;
     if (L <= 0 || L > static_cast<int>(fftWork.size()))
         return;
+
+    // FIR length switch: the overlap accumulators hold tails laid out for the
+    // previous convFFTSize (and, beyond it, stale audio from an earlier long
+    // FIR — the buffers are sized for MaxFirLength). Flush them, otherwise
+    // minutes-old audio is revived as echoes under the new coefficients.
+    if (L != activeConvFFTSize)
+    {
+        for (auto& ob : overlapBufs)
+            std::fill(ob.begin(), ob.end(), 0.0);
+        activeConvFFTSize = L;
+    }
 
     const int channels = std::min(buffer.getNumChannels(), numChannels);
 
@@ -331,22 +374,36 @@ void FFTProcessor::process(juce::AudioBuffer<float>& buffer)
                 ifftInPlace(fftWork.data(), L);
 
                 // Output block = Y[0..M-1] + accumulated tail
+                bool poisoned = false;
                 for (int i = 0; i < ConvBlockLen; ++i)
                 {
                     double y = fftWork[i].real() + overlap[i];
                     if (std::isnan(y) || std::isinf(y))
+                    {
                         y = 0.0;
+                        poisoned = true;
+                    }
                     outBuf.push_back(y);
                 }
 
-                // Carry the tail into the next block: shift the accumulator
-                // and ADD this block's tail (a convolution spans multiple
-                // blocks, so older tails must accumulate).
-                for (int i = 0; i < L - ConvBlockLen; ++i)
-                    overlap[i] = overlap[i + ConvBlockLen]
-                                 + fftWork[ConvBlockLen + i].real();
-                for (int i = L - ConvBlockLen; i < L; ++i)
-                    overlap[i] = 0.0;
+                if (poisoned)
+                {
+                    // NaN/Inf must not recirculate through the accumulator:
+                    // flush it so one bad block does not mute the output
+                    // until the next manual reset.
+                    std::fill(overlap.begin(), overlap.end(), 0.0);
+                }
+                else
+                {
+                    // Carry the tail into the next block: shift the accumulator
+                    // and ADD this block's tail (a convolution spans multiple
+                    // blocks, so older tails must accumulate).
+                    for (int i = 0; i < L - ConvBlockLen; ++i)
+                        overlap[i] = overlap[i + ConvBlockLen]
+                                     + fftWork[ConvBlockLen + i].real();
+                    for (int i = L - ConvBlockLen; i < L; ++i)
+                        overlap[i] = 0.0;
+                }
 
                 pos = 0;
             }

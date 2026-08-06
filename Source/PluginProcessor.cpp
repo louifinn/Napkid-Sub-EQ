@@ -30,6 +30,9 @@ SubEQAudioProcessor::SubEQAudioProcessor()
     bypassParam = apvts.getRawParameterValue ("bypass");
     eqModeParam = apvts.getRawParameterValue ("eq_mode");
     firLengthParam = apvts.getRawParameterValue ("fir_length");
+    spectrumFftParam = apvts.getRawParameterValue ("spectrum_fft_size");
+    spectrumDensityParam = apvts.getRawParameterValue ("spectrum_band_density");
+    spectrumHopParam = apvts.getRawParameterValue ("spectrum_hop_size");
 
     for (int i = 0; i < SubEQ::NumNodes; ++i)
     {
@@ -39,6 +42,18 @@ SubEQAudioProcessor::SubEQAudioProcessor()
         nodeParams[i][3] = apvts.getRawParameterValue (SubEQ::getNodeParamID (i, SubEQ::ParamID::Type));
         nodeParams[i][4] = apvts.getRawParameterValue (SubEQ::getNodeParamID (i, SubEQ::ParamID::Enabled));
     }
+
+    // Deferred PDC reporting poll (message thread) — see timerCallback
+    startTimerHz (10);
+}
+
+void SubEQAudioProcessor::timerCallback()
+{
+    // The audio thread sets latencyDirty instead of calling setLatencySamples()
+    // directly: setLatencySamples -> updateHostDisplay allocates and takes the
+    // message queue lock, which must not happen on the audio thread.
+    if (latencyDirty.exchange (false))
+        setLatencySamples (reportedLatency.load());
 }
 
 SubEQAudioProcessor::~SubEQAudioProcessor()
@@ -130,6 +145,7 @@ void SubEQAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     fftProcessor.setParameterSource (&apvts);
     fftProcessor.reset();
     spectrumAnalyzer.prepare (sampleRate);
+    inputAnalyzer.prepare (sampleRate);
     currentMode.store (static_cast<int> (SubEQ::EQMode::ZeroLatency));
     reportedLatency.store (0);
     eqModeCache = 0;
@@ -198,6 +214,27 @@ void SubEQAudioProcessor::updateEQParameters()
     {
         firLengthCache = firLength;
         eqParamsChanged = true;
+    }
+
+    // Spectrum analyzer configuration changes (audio-thread safe: the
+    // analysers only write pre-allocated buffers and plain integers)
+    int spectrumFft = static_cast<int> (spectrumFftParam->load());
+    int spectrumDensity = static_cast<int> (spectrumDensityParam->load());
+    int spectrumHop = static_cast<int> (spectrumHopParam->load());
+    if (spectrumFft != spectrumFftCache
+        || spectrumDensity != spectrumDensityCache
+        || spectrumHop != spectrumHopCache)
+    {
+        spectrumFftCache = spectrumFft;
+        spectrumDensityCache = spectrumDensity;
+        spectrumHopCache = spectrumHop;
+
+        int fftOrder = spectrumFft + 12;   // 0→4096, 1→8192, 2→16384
+        int numBands = (spectrumDensity == 1) ? 121 : 61;
+        int hop = (spectrumHop == 1) ? 1024 : (spectrumHop == 2 ? 2048 : 512);
+
+        spectrumAnalyzer.configure (fftOrder, numBands, hop);
+        inputAnalyzer.configure (fftOrder, numBands, hop);
     }
 
     // Update each node
@@ -273,11 +310,12 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
 
         if (mode == SubEQ::EQMode::ZeroLatency)
         {
-            // Back to pure IIR: report zero latency immediately
+            // Back to pure IIR: report zero latency (deferred to the message
+            // thread — setLatencySamples must not run on the audio thread)
             if (reportedLatency.load() != 0)
             {
                 reportedLatency.store (0);
-                setLatencySamples (0);
+                latencyDirty.store (true, std::memory_order_release);
             }
         }
         else
@@ -295,16 +333,23 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     }
     eqParamsChanged = false;
 
-    // Pick up a freshly published FIR design and report its latency (PDC)
+    // Pick up a freshly published FIR design and report its latency (PDC).
+    // The actual setLatencySamples() call is deferred to timerCallback on the
+    // message thread (it allocates/locks inside updateHostDisplay).
     if (mode != SubEQ::EQMode::ZeroLatency)
     {
         int newLatency = fftProcessor.getLatencySamples();
         if (newLatency != reportedLatency.load())
         {
             reportedLatency.store (newLatency);
-            setLatencySamples (newLatency);
+            latencyDirty.store (true, std::memory_order_release);
         }
     }
+
+    // Input spectrum: analyze BEFORE processing (buffer still holds the raw
+    // input at this point; EQ processing overwrites it in place)
+    if (totalNumInputChannels > 0)
+        inputAnalyzer.process (buffer.getReadPointer (0), buffer.getNumSamples());
 
     // Process audio based on current mode
     if (mode == SubEQ::EQMode::ZeroLatency)
@@ -328,12 +373,9 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
             buffer.clear();
     }
 
-    // Feed audio to spectrum analyzer
+    // Feed audio to the output spectrum analyzer (post-EQ signal)
     if (totalNumInputChannels > 0)
-    {
-        auto* inputData = buffer.getReadPointer (0);
-        spectrumAnalyzer.process (inputData, buffer.getNumSamples());
-    }
+        spectrumAnalyzer.process (buffer.getReadPointer (0), buffer.getNumSamples());
 }
 
 //==============================================================================

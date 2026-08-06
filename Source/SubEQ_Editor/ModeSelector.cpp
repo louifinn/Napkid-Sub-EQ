@@ -8,6 +8,8 @@
 */
 
 #include "ModeSelector.h"
+#include "DesignSystem/DesignColours.h"
+#include "DesignSystem/DesignFonts.h"
 
 ModeSelector::ModeSelector (juce::AudioProcessorValueTreeState& apvtsRef)
     : apvts (apvtsRef)
@@ -16,12 +18,12 @@ ModeSelector::ModeSelector (juce::AudioProcessorValueTreeState& apvtsRef)
     modeBox.addItemList (choices, 1); // IDs start at 1
     modeBox.setSelectedId (1, juce::dontSendNotification);
 
-    // Style ComboBox to match theme
-    modeBox.setColour (juce::ComboBox::outlineColourId, juce::Colour (0xff000000 | SubEQLookAndFeel::ThemeColour));
-    modeBox.setColour (juce::ComboBox::textColourId, juce::Colours::white);
-    modeBox.setColour (juce::ComboBox::arrowColourId, juce::Colours::white);
-    modeBox.setColour (juce::ComboBox::focusedOutlineColourId, juce::Colour (0xff000000 | SubEQLookAndFeel::ThemeColour));
-    modeBox.setColour (juce::ComboBox::backgroundColourId, SubEQLookAndFeel::backgroundColour());
+    // Style ComboBox to match the warm ivory design system (the LookAndFeel
+    // installed on the editor draws the body; these colours drive the rest)
+    modeBox.setColour (juce::ComboBox::outlineColourId, juce::Colours::transparentBlack);
+    modeBox.setColour (juce::ComboBox::textColourId, DesignColours::textPrimary());
+    modeBox.setColour (juce::ComboBox::arrowColourId, DesignColours::textSecondary());
+    modeBox.setColour (juce::ComboBox::backgroundColourId, DesignColours::surface());
 
     addAndMakeVisible (modeBox);
 
@@ -29,17 +31,68 @@ ModeSelector::ModeSelector (juce::AudioProcessorValueTreeState& apvtsRef)
     firLengthBox.addItemList ({ "4096", "16384", "65536" }, 1); // IDs start at 1
     firLengthBox.setSelectedId (1, juce::dontSendNotification);
     firLengthBox.setTooltip ("FIR length (Linear / Minimum Phase modes). Longer FIR improves low-frequency accuracy but adds latency and CPU.");
-    firLengthBox.setColour (juce::ComboBox::outlineColourId, juce::Colour (0xff000000 | SubEQLookAndFeel::ThemeColour));
-    firLengthBox.setColour (juce::ComboBox::textColourId, juce::Colours::white);
-    firLengthBox.setColour (juce::ComboBox::arrowColourId, juce::Colours::white);
-    firLengthBox.setColour (juce::ComboBox::focusedOutlineColourId, juce::Colour (0xff000000 | SubEQLookAndFeel::ThemeColour));
-    firLengthBox.setColour (juce::ComboBox::backgroundColourId, SubEQLookAndFeel::backgroundColour());
+    firLengthBox.setColour (juce::ComboBox::outlineColourId, juce::Colours::transparentBlack);
+    firLengthBox.setColour (juce::ComboBox::textColourId, DesignColours::textPrimary());
+    firLengthBox.setColour (juce::ComboBox::arrowColourId, DesignColours::textSecondary());
+    firLengthBox.setColour (juce::ComboBox::backgroundColourId, DesignColours::surface());
     addAndMakeVisible (firLengthBox);
 
+    // Spectrum display selectors (FFT size / band density / refresh rate / hop)
+    struct SpectrumControl
+    {
+        juce::ComboBox* box;
+        juce::Label* label;
+        const char* labelText;
+        const char* tooltip;
+        juce::StringArray items;
+        const char* paramId;
+    };
+
+    const SpectrumControl controls[] =
+    {
+        { &fftSizeBox, &fftSizeLabel, "FFT Size", "Spectrum FFT size (analysis resolution)",
+          { "4096", "8192", "16384" }, "spectrum_fft_size" },
+        { &densityBox, &densityLabel, "Density", "Spectrum band density (1/6 or 1/12 octave)",
+          { "1/6 oct", "1/12 oct" }, "spectrum_band_density" },
+        { &refreshBox, &refreshLabel, "Refresh", "Spectrum display refresh rate",
+          { "15 Hz", "30 Hz", "60 Hz" }, "spectrum_refresh_rate" },
+        { &hopBox, &hopLabel, "Hop", "Spectrum analysis hop (analysis frequency)",
+          { "512", "1024", "2048" }, "spectrum_hop_size" }
+    };
+
+    for (const auto& c : controls)
+    {
+        c.box->addItemList (c.items, 1);
+        c.box->setSelectedId (1, juce::dontSendNotification);
+        c.box->setTooltip (c.tooltip);
+        c.box->setColour (juce::ComboBox::outlineColourId, juce::Colours::transparentBlack);
+        c.box->setColour (juce::ComboBox::textColourId, DesignColours::textPrimary());
+        c.box->setColour (juce::ComboBox::arrowColourId, DesignColours::textSecondary());
+        c.box->setColour (juce::ComboBox::backgroundColourId, DesignColours::surface());
+        addAndMakeVisible (c.box);
+
+        c.label->setText (c.labelText, juce::dontSendNotification);
+        c.label->setFont (DesignFonts::caption());
+        c.label->setColour (juce::Label::textColourId, DesignColours::textSecondary());
+        c.label->setJustificationType (juce::Justification::centred);
+        addAndMakeVisible (c.label);
+    }
+
+    // Captions for the processing group (spectrum captions are set in the loop above)
+    for (auto* l : { &modeLabel, &firLabel })
+    {
+        l->setFont (DesignFonts::caption());
+        l->setColour (juce::Label::textColourId, DesignColours::textSecondary());
+        l->setJustificationType (juce::Justification::centred);
+        addAndMakeVisible (l);
+    }
+    modeLabel.setText ("Mode", juce::dontSendNotification);
+    firLabel.setText ("FIR", juce::dontSendNotification);
+
     latencyLabel.setText ("Latency: 0 ms (0 samples)", juce::dontSendNotification);
-    latencyLabel.setFont (juce::Font (12.0f));
-    latencyLabel.setColour (juce::Label::textColourId, juce::Colour (0xccffffff));
-    latencyLabel.setJustificationType (juce::Justification::centredRight);
+    latencyLabel.setFont (DesignFonts::label());
+    latencyLabel.setColour (juce::Label::textColourId, DesignColours::textSecondary());
+    latencyLabel.setJustificationType (juce::Justification::centred);
     addAndMakeVisible (latencyLabel);
 
     modeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
@@ -47,6 +100,15 @@ ModeSelector::ModeSelector (juce::AudioProcessorValueTreeState& apvtsRef)
 
     firLengthAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
         apvts, "fir_length", firLengthBox);
+
+    fftSizeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
+        apvts, "spectrum_fft_size", fftSizeBox);
+    densityAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
+        apvts, "spectrum_band_density", densityBox);
+    refreshAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
+        apvts, "spectrum_refresh_rate", refreshBox);
+    hopAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
+        apvts, "spectrum_hop_size", hopBox);
 
     startTimerHz (10); // 100ms refresh
 }
@@ -59,6 +121,15 @@ ModeSelector::~ModeSelector()
 void ModeSelector::timerCallback()
 {
     refreshLatencyLabel();
+
+    // FIR length only applies to the FIR-based modes (Minimum/Linear Phase);
+    // grey the selector out while in Zero Latency mode.
+    bool firMode = false;
+    if (auto* v = apvts.getRawParameterValue ("eq_mode"))
+        firMode = v->load() > 0.5f;
+
+    if (firLengthBox.isEnabled() != firMode)
+        firLengthBox.setEnabled (firMode);
 }
 
 void ModeSelector::refreshLatencyLabel()
@@ -76,15 +147,77 @@ void ModeSelector::refreshLatencyLabel()
 
 void ModeSelector::resized()
 {
-    auto bounds = getLocalBounds().reduced (10, 10);
-    modeBox.setBounds (bounds.removeFromLeft (150));
-    bounds.removeFromLeft (10); // spacing
-    firLengthBox.setBounds (bounds.removeFromLeft (90));
-    bounds.removeFromLeft (20); // spacing
-    latencyLabel.setBounds (bounds);
+    auto bounds = getLocalBounds().reduced (10, 8);
+
+    // Column widths (design doc 2026-08-06): processing group | divider |
+    // spectrum group | elastic gap | right-anchored latency chip
+    const int modeW = 156;
+    const int firW = 80;
+    const int spectrumW = 82;
+    const int gap = 8;
+    const int groupGap = 24;
+    const int chipW = 232;
+
+    // Latency chip: right edge, vertically centred on the combo row
+    auto chipColumn = bounds.removeFromRight (chipW);
+    chipColumn.removeFromTop (14); // skip the caption row
+    latencyChipBounds = chipColumn.withSizeKeepingCentre (chipW, 22);
+    latencyLabel.setBounds (latencyChipBounds);
+
+    // Caption row mirrors the combo columns
+    auto labelRow = bounds.removeFromTop (14);
+
+    // Processing group: Mode + FIR
+    modeBox.setBounds (bounds.removeFromLeft (modeW));
+    bounds.removeFromLeft (gap);
+    firLengthBox.setBounds (bounds.removeFromLeft (firW));
+
+    modeLabel.setBounds (labelRow.removeFromLeft (modeW));
+    labelRow.removeFromLeft (gap);
+    firLabel.setBounds (labelRow.removeFromLeft (firW));
+
+    // Group separator at the midpoint of the 24px gap
+    bounds.removeFromLeft (groupGap);
+    labelRow.removeFromLeft (groupGap);
+    dividerX = firLengthBox.getRight() + groupGap / 2;
+
+    // Spectrum group: 4 selectors with captions
+    struct Col { juce::ComboBox* box; juce::Label* label; };
+    const Col cols[] =
+    {
+        { &fftSizeBox, &fftSizeLabel },
+        { &densityBox, &densityLabel },
+        { &refreshBox, &refreshLabel },
+        { &hopBox, &hopLabel }
+    };
+
+    for (const auto& c : cols)
+    {
+        c.box->setBounds (bounds.removeFromLeft (spectrumW));
+        c.label->setBounds (labelRow.removeFromLeft (spectrumW));
+        bounds.removeFromLeft (gap);
+        labelRow.removeFromLeft (gap);
+    }
 }
 
 void ModeSelector::paint (juce::Graphics& g)
 {
-    g.fillAll (SubEQLookAndFeel::backgroundColour());
+    // Flat bottom bar: no card background — the controls sit directly on the
+    // window background; only the group separator and latency chip are drawn.
+    g.fillAll (DesignColours::background());
+
+    // Group separator between processing controls and spectrum controls
+    if (dividerX > 0)
+    {
+        g.setColour (DesignColours::textSecondary().withAlpha (0.25f));
+        g.fillRect ((float) dividerX, (float) modeBox.getY(),
+                    1.0f, (float) modeBox.getHeight());
+    }
+
+    // Latency capsule chip behind the label
+    if (! latencyChipBounds.isEmpty())
+    {
+        g.setColour (DesignColours::surface().withAlpha (0.7f));
+        g.fillRoundedRectangle (latencyChipBounds.toFloat(), 11.0f);
+    }
 }

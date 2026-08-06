@@ -14,7 +14,10 @@
 #include <atomic>
 #include <JuceHeader.h>
 #include "../SubEQ_Parameters.h"
+#include "../SubEQ_Spectrum.h"
 #include "SubEQLookAndFeel.h"
+#include "DesignSystem/AnimationUtils.h"
+#include "DesignSystem/DesignConstants.h"
 
 class SubEQAudioProcessor;
 
@@ -33,6 +36,8 @@ public:
     void mouseDown(const juce::MouseEvent& event) override;
     void mouseDrag(const juce::MouseEvent& event) override;
     void mouseUp(const juce::MouseEvent& event) override;
+    void mouseMove(const juce::MouseEvent& event) override;
+    void mouseExit(const juce::MouseEvent& event) override;
     void mouseDoubleClick(const juce::MouseEvent& event) override;
     void mouseWheelMove(const juce::MouseEvent& event,
                         const juce::MouseWheelDetails& wheel) override;
@@ -60,12 +65,31 @@ private:
 
     // Node selection state
     int selectedNode = -1;
+    bool nodePressed = false;   // mouse button down on a node (minimal ring)
+
+    // Liquid-glass interaction state (drag physics + node scales)
+    struct PhysicsPos
+    {
+        float filtX = 0.0f, filtY = 0.0f;        // low-pass filtered screen position
+        float filtVelX = 0.0f, filtVelY = 0.0f;  // filtered position velocity
+        bool active = false;
+    };
+    int hoveredNode = -1;
+    bool isDraggingNode = false;
+    float dragStartScale = 1.0f;                 // node scale captured on mouseDown
+    juce::Point<float> dragStartNodeScreen;      // node screen pos at drag start
+    juce::Point<float> dragVector;               // drag direction (glass highlight offset)
+    PhysicsPos physPos[SubEQ::NumNodes];
+    AnimationUtils::AnimatedValue nodeScale[SubEQ::NumNodes];
 
     // Drag state
     bool isDragging = false;
     bool isDeleting = false;
     bool dragStartedOnNode = false;
     int draggedNode = -1;
+    bool dragGestureGain = false;            // Gain gesture begun at drag start
+    bool dragGestureQ = false;               // Q gesture begun at drag start
+    int activeMouseSource = -1;              // multi-touch isolation: owning source
     juce::Point<float> dragStartPos;
     float dragStartFreq = 0.0f;
     float dragStartGain = 0.0f;
@@ -77,18 +101,54 @@ private:
     int editingNode = -1;
     std::unique_ptr<juce::TextEditor> textEditor;
 
+    // Screen anchor for the node-type popup menu (set on mouseDown so the
+    // menu opens at the click position instead of the component centre)
+    juce::Point<int> menuAnchor;
+
     // Parameter change flag (atomic: written by APVTS listener on any thread,
     // consumed by paint on the GUI thread)
     std::atomic<bool> parametersChanged { true };
 
-    // Cached curve paths
+    // Cached curve paths (rebuilt only when parametersChanged is set —
+    // idle paints never recompute them)
     juce::Path responsePath;
+    juce::Path responseFillPath;                    // responsePath closed to the baseline
     juce::Path phasePath;
+    juce::Path nodeCurvePaths[SubEQ::NumNodes];     // per-node curves (enabled nodes)
 
-    // Spectrum data cache (must match SubEQ::SpectrumAnalyzer::NumBands)
-    static constexpr int SpectrumBands = 61;
-    float spectrumData[SpectrumBands];
-    bool spectrumDirty = true;
+    // Spectrum data cache (must match SubEQ::SpectrumAnalyzer::MaxBands)
+    static constexpr int SpectrumBands = SubEQ::SpectrumAnalyzer::MaxBands;
+    float spectrumData[SpectrumBands];       // output (post-EQ) spectrum
+    float inputSpectrumData[SpectrumBands];  // input (pre-EQ) spectrum
+    int spectrumBands = 61;                  // band count of the spectrumData snapshot
+    int inputSpectrumBands = 61;             // band count of the input snapshot
+    int currentTimerHz = 0;                  // spectrum refresh timer rate
+
+    // Node physics/scale animations run at a fixed 60 Hz on a separate timer
+    // so they never slow down when the spectrum refresh rate is lowered
+    class PhysicsTimer : public juce::Timer
+    {
+    public:
+        explicit PhysicsTimer (FrequencyResponse& ownerRef) : owner (ownerRef) {}
+        void timerCallback() override
+        {
+            owner.updateNodePhysics();
+            owner.repaint();
+            // On-demand timer: stop when nothing is animating (no idle 60 Hz
+            // repaints); restarted by ensurePhysicsTimerRunning().
+            if (!owner.needsPhysicsTimer())
+                stopTimer();
+        }
+    private:
+        FrequencyResponse& owner;
+        JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PhysicsTimer)
+    };
+    PhysicsTimer physicsTimer { *this };
+    int physicsTimerHz = 60;
+
+    // Physics timer lifecycle: runs only while something is animating
+    bool needsPhysicsTimer() const;
+    void ensurePhysicsTimerRunning();
 
     // Coordinate conversion
     juce::Rectangle<float> getResponseArea() const;
@@ -124,6 +184,14 @@ private:
     void deleteNode(int index);
     bool isNodeEnabled(int index) const;
     bool isGainSensitiveType(int nodeIndex) const;
+
+    // Liquid-glass node rendering & animation
+    juce::Point<float> getNodeScreenPos(int nodeIndex) const;
+    void updateNodeScales();
+    void drawNode(juce::Graphics& g, int index);
+    void drawNodeCurve(juce::Graphics& g, int nodeIndex, bool isSelected);
+    void updateNodePhysics();
+    static juce::String formatFreq(float freq);
 
     // Parameter access helpers
     juce::RangedAudioParameter* getNodeParam(int nodeIndex, SubEQ::ParamID param);

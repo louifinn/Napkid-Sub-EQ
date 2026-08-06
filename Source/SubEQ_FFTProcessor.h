@@ -79,7 +79,6 @@ private:
                               std::vector<float>& coeffsOut, int& latencyOut);
     void designMinimumPhaseFIR(const EQEngine& eqEngine, int firLength,
                                std::vector<float>& coeffsOut, int& latencyOut);
-    static int computeMaxGroupDelay(const std::vector<float>& coeffs);
 
     // Published FIR state (written by the background thread, read by the
     // audio thread). Immutable once published — safe to share.
@@ -89,20 +88,30 @@ private:
         std::vector<std::complex<double>> freqCoeffs;    // FFT(h) over convFFTSize (double)
         int firLength = DefaultFirLength;
         int convFFTSize = 0;
-        int groupDelay = 0;                              // FIR group delay (no block latency)
+        // FIR bulk delay used for PDC (no block latency). Linear Phase:
+        // (N-1)/2. Minimum Phase: 0 — a min-phase FIR's direct sound sits at
+        // tap 0, and reporting the max group delay over-compensated (the
+        // plugin played EARLY against other tracks, with PDC churn on edits).
+        int groupDelay = 0;
     };
 
     // Audio-thread accessor: returns the latest published state.
     std::shared_ptr<const FIRState> getPublishedState() const;
-
-    // Overlap-add step for one channel (audio thread)
-    void processBlockOLa(const FIRState& state, int channel);
 
     mutable std::mutex stateMutex;                               // guards currentState (rarely contended)
     mutable std::shared_ptr<const FIRState> currentState;        // written by bg thread under lock
     std::atomic<int> stateVersion { 0 };                         // bumped on every publish (release)
     mutable std::shared_ptr<const FIRState> localState;          // audio-thread cache
     mutable int lastSeenVersion = 0;                             // audio-thread cache
+
+    // Background-thread retirement slot: holds the previously published state
+    // so its (up to ~2.3 MB) destructor runs on the background thread, not on
+    // the audio thread when it drops its last reference.
+    std::shared_ptr<const FIRState> retiredState;
+
+    // Bumped by prepare(); a design started before the latest prepare is
+    // stale (e.g. wrong sample rate) and must not be published.
+    std::atomic<int> designEpoch { 0 };
 
     // Redesign request (audio thread -> background thread)
     std::atomic<bool> redesignRequested { false };
@@ -121,7 +130,14 @@ private:
     std::vector<int> outReadPos;                               // per channel
     std::vector<std::complex<double>> fftWork;                 // shared scratch, convFFTSize
 
+    // convFFTSize of the state currently feeding the overlap accumulators.
+    // When a newly published state changes it (FIR length switch), the stale
+    // tails must be flushed — they are laid out for the old size and would
+    // otherwise revive old audio as echoes.
+    int activeConvFFTSize = 0;
+
     std::atomic<double> sampleRate { 48000.0 };   // written by audio thread, read by bg thread
+    double preparedSampleRate = 0.0;              // audio thread: sr of the last full prepare
     int numChannels = 2;
 };
 

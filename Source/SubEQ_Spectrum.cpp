@@ -2,7 +2,8 @@
   ==============================================================================
 
     SubEQ_Spectrum.cpp
-    Real-time 1/3 octave spectrum analyzer implementation.
+    Real-time octave spectrum analyzer implementation.
+    Uses the shared radix-2 FFT (SubEQ_DSPMath.h) in double precision.
 
   ==============================================================================
 */
@@ -13,57 +14,98 @@ namespace SubEQ
 {
 
 SpectrumAnalyzer::SpectrumAnalyzer()
-    : fft(FftOrder)
 {
-    ringBuffer.resize(FftSize);
-    fftData.resize(FftSize * 2);  // Complex FFT: real + imag interleaved
-    window.resize(FftSize);
+    // Pre-allocate everything at the maximum size so reconfiguration never
+    // allocates on the audio thread
+    ringBuffer.resize(MaxFftSize, 0.0f);
+    fftData.resize(MaxFftSize);
+    window.resize(MaxFftSize, 0.0f);
+    binPower.resize(MaxFftSize / 2, 0.0);
 
-    for (int i = 0; i < NumBands; ++i)
+    for (int i = 0; i < MaxBands; ++i)
     {
         bandData[i].store(-RangeDb);
         smoothedBands[i] = -RangeDb;
     }
 
-    updateBandBounds();
+    updateBandBounds (61);
+    regenerateWindow();
 }
 
-void SpectrumAnalyzer::updateBandBounds()
+void SpectrumAnalyzer::updateBandBounds (int bands)
 {
-    // 1/6 octave bands: fc_n = MinFreq * 2^(n/6)
-    for (int i = 0; i < NumBands; ++i)
+    // Octave band centers: fc_n = MinFreq * 2^(n/octaveDiv)
+    const float octaveDiv = (bands == 121) ? 12.0f : 6.0f;
+    for (int i = 0; i < bands; ++i)
+        bandCenterFreqs[i] = MinFreq * std::pow(2.0f, static_cast<float>(i) / octaveDiv);
+}
+
+void SpectrumAnalyzer::regenerateWindow()
+{
+    // Hann window over the ACTIVE fftSize (pre-allocated buffer)
+    const int size = fftSize.load();
+    for (int i = 0; i < size; ++i)
     {
-        bandCenterFreqs[i] = MinFreq * std::pow(2.0f, static_cast<float>(i) / 6.0f);
-        bandLowerFreqs[i] = bandCenterFreqs[i] / std::pow(2.0f, 1.0f / 12.0f);
-        bandUpperFreqs[i] = bandCenterFreqs[i] * std::pow(2.0f, 1.0f / 12.0f);
+        window[i] = 0.5f - 0.5f * std::cos(juce::MathConstants<float>::twoPi * static_cast<float>(i) / static_cast<float>(size - 1));
     }
 }
 
 void SpectrumAnalyzer::prepare(double sr)
 {
     sampleRate = sr;
+    regenerateWindow();
 
-    // Create Hann window
-    for (int i = 0; i < FftSize; ++i)
-    {
-        window[i] = 0.5f - 0.5f * std::cos(juce::MathConstants<float>::twoPi * static_cast<float>(i) / static_cast<float>(FftSize - 1));
-    }
+    // Pre-build twiddle tables for every selectable FFT size on this thread
+    // (the cache is thread_local; prepareToPlay normally runs on the audio
+    // thread) so the first analysis after a size switch never allocates.
+    for (int order = 12; order <= MaxFftOrder; ++order)
+        prewarmTwiddleTable<double>(1 << order);
 
-    // Reset ring buffer
+    // Reset ring buffer and counters
     std::fill(ringBuffer.begin(), ringBuffer.end(), 0.0f);
     writeIndex = 0;
     samplesSinceLastAnalysis = 0;
 }
 
+void SpectrumAnalyzer::configure(int newFftOrder, int newNumBands, int newHopSize)
+{
+    // Clamp to supported ranges; only integers and pre-allocated buffers
+    fftOrder = juce::jlimit(12, MaxFftOrder, newFftOrder);
+    fftSize  = 1 << fftOrder.load();
+    const int bands = (newNumBands == 121) ? 121 : 61;
+    const int hop = (newHopSize == 1024) ? 1024 : (newHopSize == 2048 ? 2048 : 512);
+
+    updateBandBounds (bands);
+    regenerateWindow();
+
+    // Reset the analysis state so stale data never mixes across configs
+    std::fill(ringBuffer.begin(), ringBuffer.end(), 0.0f);
+    writeIndex = 0;
+    samplesSinceLastAnalysis = 0;
+    for (int i = 0; i < bands; ++i)
+    {
+        bandData[i].store(-RangeDb);
+        smoothedBands[i] = -RangeDb;
+    }
+
+    // Publish the new config only after all state is consistent
+    activeNumBands = bands;
+    numBands = bands;
+    hopSize = hop;
+}
+
 void SpectrumAnalyzer::process(const float* samples, int numSamples)
 {
+    const int size = fftSize.load();
+    const int hop = hopSize.load();
     for (int i = 0; i < numSamples; ++i)
     {
         ringBuffer[writeIndex] = samples[i];
-        writeIndex = (writeIndex + 1) % FftSize;
+        if (++writeIndex >= size)
+            writeIndex = 0;
         ++samplesSinceLastAnalysis;
 
-        if (samplesSinceLastAnalysis >= hopSize)
+        if (samplesSinceLastAnalysis >= hop)
         {
             samplesSinceLastAnalysis = 0;
             performAnalysis();
@@ -73,67 +115,64 @@ void SpectrumAnalyzer::process(const float* samples, int numSamples)
 
 void SpectrumAnalyzer::performAnalysis()
 {
-    // Copy ring buffer to FFT input (in correct order)
-    for (int i = 0; i < FftSize; ++i)
+    const int size = fftSize.load();
+    const int bands = activeNumBands;
+
+    // Copy ring buffer to FFT input (correct order), windowed, zero imag
+    for (int i = 0; i < size; ++i)
     {
-        int idx = (writeIndex + i) % FftSize;
-        fftData[i] = ringBuffer[idx] * window[i];
+        int idx = (writeIndex + i) % size;
+        fftData[i] = static_cast<double>(ringBuffer[idx]) * window[i];
     }
 
-    // Zero-pad the imaginary part
-    for (int i = FftSize; i < FftSize * 2; ++i)
-        fftData[i] = 0.0f;
+    // Self-contained radix-2 FFT (double), shared with the plugin core
+    fftInPlace(fftData.data(), size);
 
-    // Perform FFT
-    fft.performRealOnlyForwardTransform(fftData.data());
+    // Per-bin power (double). Calibrated so a full-scale sine reads 0 dB:
+    // the Hann window's coherent gain (0.5) quarters the bin power, and the
+    // amplitude convention (sine amplitude A reads 20*log10(A)) squares that
+    // compensation — hence 16/N^2 instead of 1/N^2.
+    const int numBins = size / 2;
+    const double binSpacing = sampleRate / static_cast<double>(size);
+    const double scaleFactor = 16.0 / (static_cast<double>(size) * static_cast<double>(size));
 
-    // Compute per-bin power
-    // JUCE's performRealOnlyForwardTransform stores the packed spectrum as
-    // [Re(0), Re(N/2), Re(1), Im(1), ...], so bin k (1..N/2-1) lives at
-    // fftData[2k], fftData[2k+1]. The Nyquist bin has no imaginary part and
-    // its real part is at fftData[1]; we never need it (fc <= 500 Hz).
-    const int numBins = FftSize / 2;
-    const float binSpacing = static_cast<float>(sampleRate / FftSize);
-    const float scaleFactor = 1.0f / (static_cast<float>(FftSize) * static_cast<float>(FftSize));
-
-    float binPower[numBins];
-    binPower[0] = 0.0f; // DC
+    binPower[0] = 0.0; // DC
     for (int k = 1; k < numBins; ++k)
     {
-        float real = fftData[k * 2];
-        float imag = fftData[k * 2 + 1];
+        const double real = fftData[k].real();
+        const double imag = fftData[k].imag();
         binPower[k] = (real * real + imag * imag) * scaleFactor;
     }
 
     // Interpolate power at each band center frequency (avoids empty low-freq bands)
-    float bandPower[NumBands];
-    for (int b = 0; b < NumBands; ++b)
+    float bandPower[MaxBands];
+    for (int b = 0; b < bands; ++b)
     {
-        float fc = bandCenterFreqs[b];
-        float binIndexF = fc / binSpacing;
+        const float fc = bandCenterFreqs[b];
+        const double binIndexF = static_cast<double>(fc) / binSpacing;
 
-        if (binIndexF <= 1.0f)
+        if (binIndexF <= 1.0)
         {
             // Below first meaningful bin: use bin 1 power
-            bandPower[b] = binPower[1];
+            bandPower[b] = static_cast<float>(binPower[1]);
         }
-        else if (binIndexF >= static_cast<float>(numBins - 1))
+        else if (binIndexF >= static_cast<double>(numBins - 1))
         {
-            // Above the last usable bin (Nyquist bin has no complex value)
-            bandPower[b] = binPower[numBins - 1];
+            // Above the last usable bin
+            bandPower[b] = static_cast<float>(binPower[numBins - 1]);
         }
         else
         {
-            int kLow = static_cast<int>(binIndexF);
-            int kHigh = kLow + 1;
-            float frac = binIndexF - static_cast<float>(kLow);
+            const int kLow = static_cast<int>(binIndexF);
+            const int kHigh = kLow + 1;
+            const double frac = binIndexF - static_cast<double>(kLow);
             // Interpolate on linear power scale (energy-preserving)
-            bandPower[b] = binPower[kLow] * (1.0f - frac) + binPower[kHigh] * frac;
+            bandPower[b] = static_cast<float>(binPower[kLow] * (1.0 - frac) + binPower[kHigh] * frac);
         }
     }
 
     // Convert to dB with smoothing
-    for (int b = 0; b < NumBands; ++b)
+    for (int b = 0; b < bands; ++b)
     {
         float db;
         if (bandPower[b] > 1.0e-12f)
@@ -154,10 +193,12 @@ void SpectrumAnalyzer::performAnalysis()
     }
 }
 
-void SpectrumAnalyzer::getSpectrum(float* outputBands) const
+int SpectrumAnalyzer::getSpectrum(float* outputBands) const
 {
-    for (int i = 0; i < NumBands; ++i)
+    const int bands = numBands.load();
+    for (int i = 0; i < bands; ++i)
         outputBands[i] = bandData[i].load();
+    return bands;
 }
 
 } // namespace SubEQ

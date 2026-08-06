@@ -34,6 +34,7 @@ inline T gainToDb(T gain)
 void EQNode::prepare(double sr)
 {
     sampleRate = sr;
+    fadeStepPerSample = 1.0 / std::max(sr * 0.015, 1.0);   // ~15 ms enable fade
     reset();
 }
 
@@ -60,8 +61,9 @@ void EQNode::update(double freqHz, double gain, double qValue, FilterType type)
     q = qValue;
     currentType = type;
 
-    // Remember the current coefficients as the smoothing start point before
-    // the updateXxx() helpers overwrite coeffs[] with the new target.
+    // Capture the previous cascade size before updateXxx() overwrites it, and
+    // remember the current coefficients as the smoothing start point.
+    const int prevNumBiquads = numBiquads;
     BiquadCoefficients prev[2] = { coeffs[0], coeffs[1] };
 
     switch (type)
@@ -83,13 +85,27 @@ void EQNode::update(double freqHz, double gain, double qValue, FilterType type)
             coeffs[i].forceStable();
     }
 
-    // Install the smoothing state: interpolate from prev[] to the new target
-    // over ~15 ms. A convex combination of stable biquad coefficients stays
-    // stable, so the transition cannot overshoot.
-    for (int i = 0; i < numBiquads; ++i)
+    // Install the smoothing state: interpolate from the start points to the
+    // new targets over ~15 ms. A convex combination of stable biquad
+    // coefficients stays stable, so the transition cannot overshoot.
+    smoothStart[0] = prev[0];
+    targetCoeffs[0] = coeffs[0];
+    extraBiquadFadeOut = false;
+
+    if (numBiquads > 1)
     {
-        smoothStart[i] = prev[i];
-        targetCoeffs[i] = coeffs[i];
+        // A newly added second biquad (e.g. Bell -> Tilt) fades in from
+        // identity (transparent) instead of from stale leftover coefficients.
+        smoothStart[1] = (prevNumBiquads > 1) ? prev[1] : BiquadCoefficients{};
+        targetCoeffs[1] = coeffs[1];
+    }
+    else if (prevNumBiquads > 1)
+    {
+        // A dropped second biquad (e.g. Tilt -> Bell) fades out to identity
+        // over the smoothing window instead of leaving the path mid-stream.
+        smoothStart[1] = prev[1];
+        targetCoeffs[1] = BiquadCoefficients{};
+        extraBiquadFadeOut = true;
     }
 
     if (smoothingEnabled)
@@ -101,13 +117,15 @@ void EQNode::update(double freqHz, double gain, double qValue, FilterType type)
         // Immediately snap back to the interpolation start so no sample is
         // ever processed with the un-interpolated target (the ramp begins at
         // the old coefficients).
-        for (int i = 0; i < numBiquads; ++i)
-            coeffs[i] = smoothStart[i];
+        coeffs[0] = smoothStart[0];
+        if (activeBiquads() > 1)
+            coeffs[1] = smoothStart[1];
     }
     else
     {
         // No smoothing: coefficients are already the exact target
         smoothing = false;
+        extraBiquadFadeOut = false;
     }
 }
 
@@ -324,7 +342,10 @@ void EQEngine::reset()
 
 void EQEngine::processChannel(const float* input, float* output, int numSamples, int channel)
 {
-    if (bypass)
+    if (numSamples <= 0)
+        return;
+
+    if (bypass || tempBufferSize <= 0)
     {
         std::memcpy(output, input, static_cast<size_t>(numSamples) * sizeof(float));
         return;
@@ -332,15 +353,28 @@ void EQEngine::processChannel(const float* input, float* output, int numSamples,
 
     const double masterGainLinear = dbToGain(masterGain);
 
+    // Process in tempBuffer-sized chunks: samplesPerBlock is a contractual
+    // upper bound, but a host that violates it must not overflow the buffer
+    // (heap corruption) — chunking costs nothing in the compliant case.
+    for (int offset = 0; offset < numSamples; offset += tempBufferSize)
+    {
+        const int chunk = std::min(tempBufferSize, numSamples - offset);
+        processChunk(input + offset, output + offset, chunk, channel, masterGainLinear);
+    }
+}
+
+void EQEngine::processChunk(const float* input, float* output, int numSamples, int channel,
+                            double masterGainLinear)
+{
     // Convert input to double precision
     for (int i = 0; i < numSamples; ++i)
         tempBuffer[i] = static_cast<double>(input[i]);
 
-    // Process through each enabled node in series
+    // Process through each active node in series (enabled or fading out)
     bool hasNaN = false;
     for (int n = 0; n < MaxNodes; ++n)
     {
-        if (!nodes[n].isEnabled())
+        if (!nodes[n].isActive())
             continue;
 
         for (int i = 0; i < numSamples; ++i)

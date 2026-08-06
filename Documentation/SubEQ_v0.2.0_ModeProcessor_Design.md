@@ -1,10 +1,10 @@
 # Napkid Sub EQ v0.2.0 — 三种全局 EQ 处理模式设计文档
 
 > **状态说明（2026-08-02）**：本文档为 v0.2.0 的设计记录，保留作为历史参考。以下设计已在后续版本中演进，与当前实现存在差异：
-> - **FIR 卷积**：原设计使用 `juce::dsp::Convolution`（v0.3.0 起因本环境 JUCE FFT API 不可用而放弃）→ 现为**自研 radix-2 FFT + overlap-add 卷积**（`SubEQ_DSPMath.h` / `SubEQ_FFTProcessor.cpp`，v0.4.0）
-> - **FIR 长度**：固定 4096 点 → **可配置 4096 / 16384 / 65536**（`fir_length` 参数，v0.4.0）
+> - **FIR 卷积**：原设计使用 `juce::dsp::Convolution`（v0.3.0 起因本环境 JUCE FFT API 不可用而放弃）→ 现为**自研 radix-2 FFT + overlap-add 卷积**（`SubEQ_DSPMath.h` / `SubEQ_FFTProcessor.cpp`，v0.3.0）
+> - **FIR 长度**：固定 4096 点 → **可配置 4096 / 16384 / 65536**（`fir_length` 参数，v0.3.0）
 > - **设计线程**：`updateFIR` 在音频线程同步执行 → **后台 `juce::Thread` 异步设计 + 发布-订阅换发**（v0.3.0）
-> - **延迟**：固定 2048 样本 → Linear Phase `(N-1)/2 + 511`、Minimum Phase 动态群延迟 + 511（v0.4.0）
+> - **延迟**：固定 2048 样本 → Linear Phase `(N-1)/2 + 511`、Minimum Phase 仅 511（因果 FIR 群延迟为 0，v0.3.0）
 > - **设计 FFT**：`juce::dsp::FFT` → 自研 double 精度 FFT（twiddle 查表优化）
 
 ## 1. 需求概述

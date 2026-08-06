@@ -33,9 +33,26 @@ private:
     juce::AudioProcessorValueTreeState& apvts;
     juce::ComboBox modeBox;
     juce::ComboBox firLengthBox;
+    juce::ComboBox fftSizeBox;      // spectrum FFT size
+    juce::ComboBox densityBox;      // spectrum band density
+    juce::ComboBox refreshBox;      // spectrum refresh rate
+    juce::ComboBox hopBox;          // spectrum analysis hop
+    juce::Label modeLabel;
+    juce::Label firLabel;
+    juce::Label fftSizeLabel;
+    juce::Label densityLabel;
+    juce::Label refreshLabel;
+    juce::Label hopLabel;
     juce::Label latencyLabel;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> modeAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> firLengthAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> fftSizeAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> densityAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> refreshAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> hopAttachment;
+
+    int dividerX = -1;                      // processing/spectrum group separator x (-1 = not laid out)
+    juce::Rectangle<int> latencyChipBounds; // capsule behind the latency text
 
     LatencyProvider latencyProvider;
     juce::String lastLatencyText;

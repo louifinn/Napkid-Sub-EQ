@@ -16,7 +16,8 @@
 #include "SubEQ_Spectrum.h"
 
 //==============================================================================
-class SubEQAudioProcessor  : public juce::AudioProcessor
+class SubEQAudioProcessor  : public juce::AudioProcessor,
+                             private juce::Timer
 {
 public:
     //==============================================================================
@@ -61,18 +62,26 @@ public:
     SubEQ::EQEngine& getEQEngine() { return eqEngine; }
     const SubEQ::EQEngine& getEQEngine() const { return eqEngine; }
 
-    // Synchronize EQ engine state from APVTS parameters (call from GUI thread)
+    // Synchronize EQ engine state from APVTS parameters (audio thread only —
+    // writes eqEngine and the non-atomic caches; never call from the GUI thread)
     void updateEQParameters();
 
     // Spectrum analyzer access
     SubEQ::SpectrumAnalyzer& getSpectrumAnalyzer() { return spectrumAnalyzer; }
     const SubEQ::SpectrumAnalyzer& getSpectrumAnalyzer() const { return spectrumAnalyzer; }
+    SubEQ::SpectrumAnalyzer& getInputSpectrumAnalyzer() { return inputAnalyzer; }
+    const SubEQ::SpectrumAnalyzer& getInputSpectrumAnalyzer() const { return inputAnalyzer; }
 
     // Current EQ mode (atomic: written by audio thread, read by GUI thread)
     SubEQ::EQMode getCurrentMode() const { return static_cast<SubEQ::EQMode> (currentMode.load()); }
     int getCurrentLatencySamples() const { return reportedLatency.load(); }
 
 private:
+    // juce::Timer (message thread, 10 Hz): deferred latency (PDC) reporting.
+    // setLatencySamples() -> updateHostDisplay() allocates and takes the
+    // message queue lock, so the audio thread only sets latencyDirty and this
+    // callback performs the actual host notification.
+    void timerCallback() override;
 
     SubEQ::EQEngine eqEngine;
     // apvts must be declared BEFORE fftProcessor: members are destroyed in
@@ -81,7 +90,8 @@ private:
     // the FIR designer thread.
     juce::AudioProcessorValueTreeState apvts;
     SubEQ::FFTProcessor fftProcessor;
-    SubEQ::SpectrumAnalyzer spectrumAnalyzer;
+    SubEQ::SpectrumAnalyzer spectrumAnalyzer;   // output (post-EQ) spectrum
+    SubEQ::SpectrumAnalyzer inputAnalyzer;      // input (pre-EQ) spectrum
 
     // Parameter cache to avoid redundant coefficient updates
     struct NodeParamCache
@@ -99,15 +109,24 @@ private:
     int eqModeCache = 0;
     int firLengthCache = 0;
 
+    // Spectrum analyzer config cache (indexes into the APVTS choice params)
+    int spectrumFftCache = 1;      // 0=4096, 1=8192, 2=16384
+    int spectrumDensityCache = 0;  // 0=1/6 oct (61), 1=1/12 oct (121)
+    int spectrumHopCache = 0;      // 0=512, 1=1024, 2=2048
+
     // Cached atomic parameter pointers (avoid per-block string lookups).
     // Index order matches ParamID: Freq, Gain, Q, Type, Enabled.
     std::atomic<float>* masterGainParam = nullptr;
     std::atomic<float>* bypassParam = nullptr;
     std::atomic<float>* eqModeParam = nullptr;
     std::atomic<float>* firLengthParam = nullptr;
+    std::atomic<float>* spectrumFftParam = nullptr;
+    std::atomic<float>* spectrumDensityParam = nullptr;
+    std::atomic<float>* spectrumHopParam = nullptr;
     std::atomic<float>* nodeParams[SubEQ::NumNodes][5] = {};
     std::atomic<int> reportedLatency { 0 };
     std::atomic<int> currentMode { static_cast<int> (SubEQ::EQMode::ZeroLatency) };
+    std::atomic<bool> latencyDirty { false };   // audio thread -> timer: report PDC
     bool modeChanged = false;
     bool eqParamsChanged = false;
 

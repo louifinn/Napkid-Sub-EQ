@@ -3,7 +3,7 @@
 
     SubEQ_Parameters.h
     AudioProcessorValueTreeState parameter definitions for Sub EQ.
-    8 EQ nodes × 5 params + master gain + bypass = 42 total parameters.
+    8 EQ nodes × 5 params + master/bypass/mode/FIR length + 4 spectrum = 48 parameters.
 
   ==============================================================================
 */
@@ -100,7 +100,11 @@ inline juce::StringArray getEQModeChoices()
 
 // Apply current APVTS parameter values to an EQEngine.
 // GUI thread uses this on its own engine copy so it never writes the
-// audio-thread engine directly (see FrequencyResponse).
+// audio-thread engine directly (see FrequencyResponse); the background FIR
+// design thread uses it on its design engine.
+// NOTE: APVTS::getRawParameterValue() returns the *denormalised* (physical)
+// value — in JUCE 7 it points at ParameterAdapter::getRawDenormalisedValue(),
+// already converted via convertFrom0to1. No further decoding is needed.
 inline void applyParametersToEngine(juce::AudioProcessorValueTreeState& apvts, EQEngine& engine)
 {
     engine.setMasterGain(static_cast<double>(apvts.getRawParameterValue("master_gain")->load()));
@@ -208,6 +212,32 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout
         "FIR Length",
         juce::StringArray { "4096", "16384", "65536" },
         0
+    ));
+
+    // Spectrum display parameters (input/output analysers, GUI read-back)
+    layout.add(std::make_unique<juce::AudioParameterChoice>(
+        "spectrum_fft_size",
+        "Spectrum FFT Size",
+        juce::StringArray { "4096", "8192", "16384" },
+        1 // default 8192
+    ));
+    layout.add(std::make_unique<juce::AudioParameterChoice>(
+        "spectrum_band_density",
+        "Spectrum Band Density",
+        juce::StringArray { "1/6 octave", "1/12 octave" },
+        0 // default 61 bands
+    ));
+    layout.add(std::make_unique<juce::AudioParameterChoice>(
+        "spectrum_refresh_rate",
+        "Spectrum Refresh Rate",
+        juce::StringArray { "15 Hz", "30 Hz", "60 Hz" },
+        1 // default 30 Hz
+    ));
+    layout.add(std::make_unique<juce::AudioParameterChoice>(
+        "spectrum_hop_size",
+        "Spectrum Analysis Hop",
+        juce::StringArray { "512", "1024", "2048" },
+        0 // default 512 samples
     ));
 
     return layout;

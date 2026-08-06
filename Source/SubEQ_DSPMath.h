@@ -24,15 +24,27 @@ namespace SubEQ
 
 namespace detail
 {
-    // Per-size, per-thread twiddle table: w[m] = exp(-2*pi*i*m/n), m in [0, n/2).
-    // Precomputed once per (thread, n) so the butterfly loop does a table
-    // lookup instead of the recurrence w *= wlen — this removes the twiddle
-    // rounding accumulation that dominates float FFT error on long transforms.
+    // Per-thread twiddle tables, one slot per FFT size: w[m] = exp(-2*pi*i*m/n),
+    // m in [0, n/2). The butterfly loop does a table lookup instead of the
+    // recurrence w *= wlen — this removes the twiddle rounding accumulation
+    // that dominates float FFT error on long transforms.
+    //
+    // Multiple sizes coexist per thread: the audio thread interleaves
+    // convolution FFTs (8192/32768/131072) with spectrum FFTs (4096/8192/
+    // 16384), and a single-slot cache would rebuild the whole table on every
+    // call whenever the two sizes differ (steady-state allocation + O(n)
+    // trigonometry on the audio thread). Slots are indexed by log2(n), so
+    // switching FIR length or spectrum size never triggers a rebuild once
+    // each size has been seen.
     template <typename T>
     struct TwiddleCache
     {
-        std::vector<std::complex<T>> w;
-        int n = 0;
+        struct Entry
+        {
+            std::vector<std::complex<T>> w;
+            int n = 0;
+        };
+        Entry slots[21];   // slot = log2(n); supports n up to 2^20
     };
 
     template <typename T>
@@ -40,20 +52,36 @@ namespace detail
     {
         static thread_local TwiddleCache<T> cache;
 
-        if (cache.n != n)
+        int slot = 0;
+        while (slot < 20 && (1 << (slot + 1)) <= n)
+            ++slot;
+
+        auto& e = cache.slots[slot];
+        if (e.n != n)
         {
-            cache.w.resize(static_cast<size_t>(n) / 2);
+            e.w.resize(static_cast<size_t>(n) / 2);
             for (int m = 0; m < n / 2; ++m)
             {
                 const double ang = -2.0 * 3.14159265358979323846 * m / n;
-                cache.w[static_cast<size_t>(m)] = { static_cast<T>(std::cos(ang)),
-                                                    static_cast<T>(std::sin(ang)) };
+                e.w[static_cast<size_t>(m)] = { static_cast<T>(std::cos(ang)),
+                                                static_cast<T>(std::sin(ang)) };
             }
-            cache.n = n;
+            e.n = n;
         }
 
-        return cache.w.data();
+        return e.w.data();
     }
+}
+
+// Builds the twiddle table for size n on the calling thread ahead of time, so
+// the first real-time FFT does not allocate. Call from prepare()-like setup
+// paths; effective only if called on the same thread that later runs the FFT
+// (the cache is thread_local), which is the common JUCE prepareToPlay case.
+// Safe to call repeatedly — subsequent calls are cheap lookups.
+template <typename T>
+inline void prewarmTwiddleTable(int n)
+{
+    detail::getTwiddles<T>(n);
 }
 
 // In-place iterative radix-2 FFT (no scaling). T = float or double, n must be

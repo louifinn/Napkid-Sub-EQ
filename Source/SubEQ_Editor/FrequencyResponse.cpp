@@ -9,8 +9,21 @@
 
 #include "FrequencyResponse.h"
 #include "../PluginProcessor.h"
+#include "DesignSystem/DesignColours.h"
+#include "DesignSystem/DesignFonts.h"
+#include "DesignSystem/LiquidGlassEffect.h"
+#include "DesignSystem/DesignLookAndFeel.h"
 
 using namespace SubEQLookAndFeel;
+
+namespace
+{
+    // Spectrum refresh rate parameter index (0/1/2) → Hz
+    int refreshRateFromIndex (int idx)
+    {
+        return idx == 0 ? 15 : (idx == 2 ? 60 : 30);
+    }
+}
 
 //==============================================================================
 // Construction / Destruction
@@ -23,7 +36,10 @@ FrequencyResponse::FrequencyResponse(SubEQAudioProcessor& proc)
 
     // Initialize spectrum data
     for (int i = 0; i < SpectrumBands; ++i)
+    {
         spectrumData[i] = -60.0f;
+        inputSpectrumData[i] = -60.0f;
+    }
 
     // Prepare the GUI-side response engine (re-prepared on sample rate changes)
     responseSampleRate = (processor.getSampleRate() > 0.0) ? processor.getSampleRate() : 48000.0;
@@ -34,8 +50,19 @@ FrequencyResponse::FrequencyResponse(SubEQAudioProcessor& proc)
     responseEngine.prepare(responseSampleRate, 512);
     SubEQ::applyParametersToEngine(apvts, responseEngine);
 
-    // Start timer for spectrum animation (~60fps)
-    startTimerHz(60);
+    // Liquid-glass node scales start at 1.0 (no animation)
+    for (int i = 0; i < SubEQ::NumNodes; ++i)
+        nodeScale[i].setValueImmediate(1.0f);
+
+    // Start timer for spectrum animation (refresh rate from the parameter)
+    int refreshIdx = 1; // default 30 Hz
+    if (auto* refreshParam = apvts.getRawParameterValue ("spectrum_refresh_rate"))
+        refreshIdx = static_cast<int> (refreshParam->load());
+    currentTimerHz = refreshRateFromIndex (refreshIdx);
+    startTimerHz (currentTimerHz);
+
+    // Node physics/scale animations stay at a fixed 60 Hz
+    physicsTimer.startTimerHz (physicsTimerHz);
 
     // Register as APVTS listener for all node parameters
     for (int i = 0; i < SubEQ::NumNodes; ++i)
@@ -84,7 +111,30 @@ void FrequencyResponse::parameterChanged(const juce::String& parameterID, float 
 
 void FrequencyResponse::timerCallback()
 {
-    spectrumDirty = true;
+    // The spectrum refresh rate is adjustable — restart the timer on change
+    int refreshIdx = 1;
+    if (auto* refreshParam = apvts.getRawParameterValue ("spectrum_refresh_rate"))
+        refreshIdx = static_cast<int> (refreshParam->load());
+    int hz = refreshRateFromIndex (refreshIdx);
+    if (hz != currentTimerHz)
+    {
+        currentTimerHz = hz;
+        startTimerHz (hz);
+    }
+
+    // Refresh the spectrum caches at the configured rate. getSpectrum returns
+    // the band count of the SAME snapshot, so a mid-copy reconfiguration on
+    // the audio thread cannot tear the frame (no getNumBands()/getSpectrum
+    // mismatch). drawSpectrum paints these caches.
+    spectrumBands = processor.getSpectrumAnalyzer().getSpectrum (spectrumData);
+    inputSpectrumBands = processor.getInputSpectrumAnalyzer().getSpectrum (inputSpectrumData);
+
+    // Sample rate changes do not fire parameterChanged: watch them here so
+    // the response curve is re-computed against the correct rate
+    const double sr = processor.getSampleRate();
+    if (sr > 0.0 && std::abs (sr - responseSampleRate) > 0.5)
+        parametersChanged = true;
+
     repaint();
 }
 
@@ -102,6 +152,10 @@ void FrequencyResponse::paint(juce::Graphics& g)
         drawPhaseCurve(g);
     drawResponseCurve(g);
     drawNodes(g);
+
+    // Liquid-glass parameter tooltip for the selected node (topmost layer)
+    if (selectedNode >= 0 && isNodeEnabled(selectedNode))
+        drawNodeLabel(g, selectedNode);
 }
 
 bool FrequencyResponse::shouldShowPhaseCurve() const
@@ -134,7 +188,13 @@ void FrequencyResponse::resized()
 
 void FrequencyResponse::drawBackground(juce::Graphics& g)
 {
-    g.fillAll(backgroundColour());
+    // Warm ivory matte background; the plot area card is drawn in drawGrid
+    g.fillAll(DesignColours::background());
+
+    // Matte surface card for the whole panel (rounded, elevation shadow)
+    auto bounds = getLocalBounds().toFloat().reduced(6.0f);
+    DesignLookAndFeel::drawMatteSurface(g, bounds, DesignConstants::cornerRadiusLarge,
+                                        false, false, false);
 }
 
 juce::Rectangle<float> FrequencyResponse::getResponseArea() const
@@ -207,99 +267,141 @@ float FrequencyResponse::yToPhase(float y) const
 void FrequencyResponse::drawGrid(juce::Graphics& g)
 {
     auto area = getResponseArea();
-    g.setColour(gridLineColour());
 
-    // Vertical frequency lines
+    // Plot area card: translucent ivory backing + rounded border
+    g.setColour(DesignColours::background().withAlpha(0.55f));
+    g.fillRoundedRectangle(area, DesignConstants::cornerRadiusMedium);
+
+    g.setFont(DesignFonts::caption());
+
+    // Vertical frequency lines (log scale, 0.5 Hz ~ 500 Hz)
     for (float freq : freqGridLabels)
     {
         float x = freqToX(freq);
+        g.setColour(DesignColours::morandiGrey().withAlpha(0.3f));
         g.drawVerticalLine(static_cast<int>(x), area.getY(), area.getBottom());
 
-        g.setColour(gridTextColour());
-        juce::String label = juce::String(freq, 2) + " Hz";
-        g.drawSingleLineText(label, static_cast<int>(x) + 4, static_cast<int>(area.getY()) + 14);
-        g.setColour(gridLineColour());
+        g.setColour(DesignColours::textSecondary().withAlpha(0.8f));
+        g.drawText(formatFreq(freq), static_cast<int>(x) - 20, static_cast<int>(area.getY()) + 2,
+                   40, 14, juce::Justification::centred, false);
     }
 
     // Horizontal gain lines
     for (float gain : gainGridLabels)
     {
         float y = gainToY(gain);
-        g.drawHorizontalLine(static_cast<int>(y), area.getX(), area.getRight());
-
         if (gain == 0.0f)
         {
-            g.setColour(zeroDbLineColour());
+            g.setColour(DesignColours::morandiGrey().withAlpha(0.5f));
             g.drawLine(area.getX(), y, area.getRight(), y, 1.5f);
-            g.setColour(gridLineColour());
+        }
+        else
+        {
+            g.setColour(DesignColours::morandiGrey().withAlpha(0.2f));
+            g.drawHorizontalLine(static_cast<int>(y), area.getX(), area.getRight());
         }
 
-        g.setColour(gridTextColour());
-        juce::String label = (gain > 0.0f ? "+" : "") + juce::String(static_cast<int>(gain)) + " dB";
-        g.drawSingleLineText(label, static_cast<int>(area.getX()) + 4, static_cast<int>(y) - 4);
-        g.setColour(gridLineColour());
+        g.setColour(DesignColours::textSecondary().withAlpha(0.5f));
+        g.drawText((gain > 0.0f ? "+" : "") + juce::String(static_cast<int>(gain)) + " dB",
+                   static_cast<int>(area.getX()) + 6, static_cast<int>(y) - 7,
+                   40, 14, juce::Justification::left, false);
     }
 
-    // Right-side phase angle labels
-    g.setColour(phaseGridTextColour());
-    const std::vector<float> phaseLabels = { 180.0f, 90.0f, 0.0f, -90.0f, -180.0f };
-    for (float deg : phaseLabels)
+    // Right-side phase angle labels (Zero Latency mode only)
+    if (shouldShowPhaseCurve())
     {
-        float y = phaseToY(deg);
-        juce::String label = juce::String(static_cast<int>(deg)) + juce::String::charToString(juce::CharPointer_UTF8("\u00B0").getAndAdvance());
-        g.drawSingleLineText(label, static_cast<int>(area.getRight()) + 4, static_cast<int>(y) + 4);
+        g.setColour(DesignColours::morandiBlue().withAlpha(0.7f));
+        static constexpr float phaseLabels[] = { 180.0f, 90.0f, 0.0f, -90.0f, -180.0f };
+        for (float deg : phaseLabels)
+        {
+            float y = phaseToY(deg);
+            juce::String label = juce::String(static_cast<int>(deg)) + juce::String::charToString(juce::CharPointer_UTF8("\u00B0").getAndAdvance());
+            g.drawSingleLineText(label, static_cast<int>(area.getRight()) + 4, static_cast<int>(y) + 4);
+        }
     }
+
+    // Border
+    g.setColour(DesignColours::shadowEdge());
+    g.drawRoundedRectangle(area, DesignConstants::cornerRadiusMedium, 1.0f);
 }
 
 void FrequencyResponse::drawSpectrum(juce::Graphics& g)
 {
-    spectrumDirty = false;
-
-    // Fetch latest spectrum data
-    processor.getSpectrumAnalyzer().getSpectrum(spectrumData);
-
     auto area = getResponseArea();
     const float bottomY = area.getBottom();
     const float height = area.getHeight();
 
-    // Collect raw band points
-    juce::Point<float> rawPoints[SpectrumBands];
-    int numRawPoints = 0;
+    // Band counts snapshotted together with the data in timerCallback
+    const int outBands = spectrumBands;
+    const int inBands = inputSpectrumBands;
 
-    for (int i = 0; i < SpectrumBands; ++i)
+    // Band centre frequencies matching the analyser's configured density
+    // (1/6 octave → 61 bands, 1/12 octave → 121 bands)
+    auto bandCentreFreq = [](int i, int numBands) -> float
     {
-        float centerFreq = 0.5f * std::pow(2.0f, static_cast<float>(i) / 6.0f);
-        if (centerFreq < 0.45f || centerFreq > 550.0f)
-            continue;
+        const float div = (numBands == 121) ? 12.0f : 6.0f;
+        return 0.5f * std::pow(2.0f, static_cast<float>(i) / div);
+    };
 
-        float x = freqToX(centerFreq);
-        float db = spectrumData[i];
+    auto drawBandLine = [&](const float* data, int numBands, juce::Colour colour)
+    {
+        juce::Point<float> rawPoints[SpectrumBands];
+        int numRawPoints = 0;
 
-        // Clamp dB to valid display range to prevent Y coordinate overflow
-        db = juce::jlimit(-120.0f, 12.0f, db);
+        for (int i = 0; i < numBands; ++i)
+        {
+            float centreFreq = bandCentreFreq(i, numBands);
+            if (centreFreq < 0.45f || centreFreq > 550.0f)
+                continue;
 
-        // Map dB to Y: -60dB at bottom, 0dB at top
-        float norm = juce::jlimit(0.0f, 1.0f, (db + 60.0f) / 60.0f);
-        float y = bottomY - height * norm;
+            float x = freqToX(centreFreq);
+            float db = data[i];
 
-        // Skip NaN/Inf points to prevent path corruption
-        if (std::isnan(y) || std::isinf(y))
-            continue;
+            // Clamp dB to valid display range to prevent Y coordinate overflow
+            db = juce::jlimit(-120.0f, 12.0f, db);
 
-        rawPoints[numRawPoints++] = { x, y };
-    }
+            // Map dB to Y: -60dB at bottom, 0dB at top
+            float norm = juce::jlimit(0.0f, 1.0f, (db + 60.0f) / 60.0f);
+            float y = bottomY - height * norm;
 
-    if (numRawPoints < 2)
-        return;
+            // Skip NaN/Inf points to prevent path corruption
+            if (std::isnan(y) || std::isinf(y))
+                continue;
 
-    // Draw spectrum as connected line segments (no fill, no spline)
-    juce::Path spectrumLine;
-    spectrumLine.startNewSubPath(rawPoints[0].x, rawPoints[0].y);
-    for (int i = 1; i < numRawPoints; ++i)
-        spectrumLine.lineTo(rawPoints[i].x, rawPoints[i].y);
+            rawPoints[numRawPoints++] = { x, y };
+        }
 
-    g.setColour(spectrumLineColour());
-    g.strokePath(spectrumLine, juce::PathStrokeType(1.5f));
+        if (numRawPoints < 2)
+            return;
+
+        // Connected line segments (no fill, no spline)
+        juce::Path spectrumLine;
+        spectrumLine.startNewSubPath(rawPoints[0].x, rawPoints[0].y);
+        for (int i = 1; i < numRawPoints; ++i)
+            spectrumLine.lineTo(rawPoints[i].x, rawPoints[i].y);
+
+        g.setColour(colour);
+        g.strokePath(spectrumLine, juce::PathStrokeType(1.5f));
+    };
+
+    // Input spectrum (warm brown) below, output spectrum (grey blue) on top
+    drawBandLine(inputSpectrumData, inBands, DesignColours::morandiBrown().withAlpha(0.35f));
+    drawBandLine(spectrumData, outBands, DesignColours::morandiBlue().withAlpha(0.35f));
+
+    // Legend (bottom-right corner of the plot area)
+    g.setFont(DesignFonts::caption());
+    float lx = area.getRight() - 80.0f;
+    float ly = area.getBottom() - 16.0f;
+
+    g.setColour(DesignColours::morandiBlue().withAlpha(0.55f));
+    g.fillRoundedRectangle(lx, ly + 2.0f, 8.0f, 8.0f, 2.0f);
+    g.setColour(DesignColours::textSecondary());
+    g.drawText("Out", static_cast<int>(lx) + 12, static_cast<int>(ly), 34, 12, juce::Justification::left, false);
+
+    g.setColour(DesignColours::morandiBrown().withAlpha(0.55f));
+    g.fillRoundedRectangle(lx + 48.0f, ly + 2.0f, 8.0f, 8.0f, 2.0f);
+    g.setColour(DesignColours::textSecondary());
+    g.drawText("In", static_cast<int>(lx) + 60, static_cast<int>(ly), 26, 12, juce::Justification::left, false);
 }
 
 void FrequencyResponse::updateResponsePaths()
@@ -364,18 +466,73 @@ void FrequencyResponse::updateResponsePaths()
             phasePath.lineTo(static_cast<float>(px), phaseY);
         }
     }
+
+    // Cache the closed fill path (was re-copied from responsePath every frame)
+    responseFillPath = responsePath;
+    responseFillPath.lineTo(area.getRight(), area.getBottom());
+    responseFillPath.lineTo(area.getX(), area.getBottom());
+    responseFillPath.closeSubPath();
+
+    // Cache per-node curves for all enabled nodes (was recomputed every frame
+    // while a node was selected — up to 8 x ~380 complex evaluations/paint)
+    for (int i = 0; i < SubEQ::NumNodes; ++i)
+    {
+        nodeCurvePaths[i].clear();
+        if (!isNodeEnabled(i))
+            continue;
+
+        bool firstNodePoint = true;
+        for (int px = static_cast<int>(area.getX()); px <= static_cast<int>(area.getRight()); px += 2)
+        {
+            float freq = xToFreq(static_cast<float>(px));
+            double w = juce::MathConstants<double>::twoPi * static_cast<double>(freq) / sampleRate;
+
+            std::complex<double> h = eqEngine.getNode(i).getResponse(w);
+            double nodeDb = 20.0 * std::log10(std::abs(h));
+            if (std::isinf(nodeDb) || std::isnan(nodeDb))
+                nodeDb = (nodeDb > 0.0) ? 60.0 : -120.0;
+            nodeDb = juce::jlimit(-120.0, 60.0, nodeDb);
+            float y = gainToY(static_cast<float>(nodeDb));
+
+            if (firstNodePoint) { nodeCurvePaths[i].startNewSubPath(static_cast<float>(px), y); firstNodePoint = false; }
+            else { nodeCurvePaths[i].lineTo(static_cast<float>(px), y); }
+        }
+    }
+
+    // Node scale/hover state depends on enable flags — refresh on parameter
+    // changes too (covers preset loads and automation, not just mouse moves)
+    updateNodeScales();
 }
 
 void FrequencyResponse::drawResponseCurve(juce::Graphics& g)
 {
-    // Draw curve line only (fill removed to avoid rendering artifacts)
-    g.setColour(responseCurveColour());
-    g.strokePath(responsePath, juce::PathStrokeType(2.0f));
+
+    // Per-node response curves (LOWER layer — below the accent total curve,
+    // so the theme-coloured total curve always draws on top of them)
+    if (selectedNode >= 0)
+    {
+        for (int i = 0; i < SubEQ::NumNodes; ++i)
+        {
+            if (!isNodeEnabled(i) || i == selectedNode)
+                continue;
+            drawNodeCurve(g, i, false);
+        }
+        if (isNodeEnabled(selectedNode))
+            drawNodeCurve(g, selectedNode, true);
+    }
+
+    // Accent glow fill under the curve (cached in updateResponsePaths)
+    g.setColour(DesignColours::accent().withAlpha(0.06f));
+    g.fillPath(responseFillPath);
+
+    // Main response curve in theme accent colour (top layer)
+    g.setColour(DesignColours::accent().withAlpha(0.5f));
+    g.strokePath(responsePath, juce::PathStrokeType(2.5f, juce::PathStrokeType::curved));
 }
 
 void FrequencyResponse::drawPhaseCurve(juce::Graphics& g)
 {
-    g.setColour(phaseCurveColour());
+    g.setColour(DesignColours::morandiBlue().withAlpha(0.6f));
     g.strokePath(phasePath, juce::PathStrokeType(1.5f));
 }
 
@@ -386,44 +543,225 @@ void FrequencyResponse::drawNodes(juce::Graphics& g)
         if (!isNodeEnabled(i))
             continue;
 
-        float freq = getNodeParamValue(i, SubEQ::ParamID::Freq);
-        float gain = getNodeParamValue(i, SubEQ::ParamID::Gain);
-        bool gainSensitive = isGainSensitiveType(i);
-
-        float x = freqToX(freq);
-        float y = gainSensitive ? gainToY(gain) : gainToY(0.0f);
-
-        bool isSelected = (i == selectedNode);
-        float radius = NodeRadius;
-
-        if (isSelected)
-        {
-            // Selected: white solid circle
-            g.setColour(nodeFillColour());
-            g.fillEllipse(x - radius, y - radius, radius * 2.0f, radius * 2.0f);
-
-            // Draw parameter label
-            drawNodeLabel(g, i);
-        }
-        else
-        {
-            // Normal: white hollow ring (same outer diameter as selected)
-            // Compensate stroke width so outer edge matches solid circle
-            float ringRadius = radius - 1.0f;
-            g.setColour(nodeStrokeColour());
-            g.drawEllipse(x - ringRadius, y - ringRadius,
-                          ringRadius * 2.0f, ringRadius * 2.0f, 2.0f);
-        }
+        drawNode(g, i);
     }
 }
 
-juce::Rectangle<float> FrequencyResponse::getNodeLabelBounds(int nodeIndex) const
+//==============================================================================
+// Liquid-Glass Node Rendering
+//==============================================================================
+
+juce::Point<float> FrequencyResponse::getNodeScreenPos(int nodeIndex) const
 {
     float freq = getNodeParamValue(nodeIndex, SubEQ::ParamID::Freq);
     float gain = getNodeParamValue(nodeIndex, SubEQ::ParamID::Gain);
     bool gainSensitive = isGainSensitiveType(nodeIndex);
     float x = freqToX(freq);
     float y = gainSensitive ? gainToY(gain) : gainToY(0.0f);
+    return { x, y };
+}
+
+void FrequencyResponse::updateNodeScales()
+{
+    auto mousePos = getMouseXYRelative().toFloat();
+    float hitRadius = NodeHitRadius;
+
+    for (int i = 0; i < SubEQ::NumNodes; ++i)
+    {
+        if (!isNodeEnabled(i))
+        {
+            // Clear stale interaction state (a node deleted mid-hover kept its
+            // magnified scale and would resurrect with it when the slot is
+            // re-enabled by a preset or automation)
+            if (nodeScale[i].getCurrent() != 1.0f || nodeScale[i].getTarget() != 1.0f)
+                nodeScale[i].setValueImmediate(1.0f);
+            physPos[i].active = false;
+            continue;
+        }
+        auto np = getNodeScreenPos(i);
+        bool inRange = np.getDistanceFrom(mousePos) < hitRadius;
+
+        // While dragging, the grabbed node keeps the size it had on mouseDown
+        // (the hover-magnified size); other nodes follow normal hover logic.
+        float targetScale;
+        if (isDraggingNode)
+            targetScale = (i == draggedNode) ? dragStartScale : 1.0f;
+        else
+            targetScale = inRange ? 2.0f : 1.0f;
+
+        if (nodeScale[i].getTarget() != targetScale)
+        {
+            nodeScale[i].setValue(targetScale,
+                                  targetScale > 1.0f ? DesignConstants::animFast
+                                                     : DesignConstants::animSlow,
+                                  targetScale > 1.0f ? AnimationUtils::easeOutBack
+                                                     : AnimationUtils::easeOutCubic);
+        }
+    }
+}
+
+void FrequencyResponse::drawNode(juce::Graphics& g, int index)
+{
+    auto exactPos = getNodeScreenPos(index);
+    bool isSelected = (index == selectedNode);
+    bool isHovered = (index == hoveredNode);
+    float scale = nodeScale[index].getCurrent();
+
+    float baseRadius = NodeRadius;
+    float r = juce::jmax(1.0f, baseRadius * scale);
+
+    // White circle: physics-filtered position (low-pass on exactPos)
+    auto& pp = physPos[index];
+    juce::Point<float> whitePos = exactPos;
+    if (pp.active)
+        whitePos = { pp.filtX, pp.filtY };
+
+    // --- Accent ring / hover states: always at exact logical position ---
+    if (isSelected)
+    {
+        // Minimal accent ring, only while pressed or dragging (matches the
+        // gain fader thumb's press/drag ring); selected idle has no ring
+        bool pressedOrDrag = nodePressed || (isDraggingNode && index == draggedNode);
+        if (pressedOrDrag)
+        {
+            float glowR = r + 3.0f;
+            g.setColour(DesignColours::accent().withAlpha(0.18f));
+            g.drawEllipse(exactPos.x - glowR, exactPos.y - glowR,
+                          glowR * 2.0f, glowR * 2.0f, 2.0f);
+        }
+    }
+    else if (isHovered)
+    {
+        // Hovered, unselected: hollow ring with subtle fill at exact position
+        g.setColour(DesignColours::whiteAlpha(30));
+        g.fillEllipse(exactPos.x - r + 2.0f, exactPos.y - r + 2.0f,
+                      r * 2.0f - 4.0f, r * 2.0f - 4.0f);
+        g.setColour(DesignColours::white());
+        g.drawEllipse(exactPos.x - r, exactPos.y - r, r * 2.0f, r * 2.0f, 2.0f);
+    }
+    else
+    {
+        // Unselected, not hovered: hollow ring with dark hairline behind it
+        g.setColour(DesignColours::shadowEdge());
+        g.drawEllipse(exactPos.x - r - 1.0f, exactPos.y - r - 1.0f,
+                      r * 2.0f + 2.0f, r * 2.0f + 2.0f, 1.0f);
+        g.setColour(DesignColours::white());
+        g.drawEllipse(exactPos.x - r, exactPos.y - r, r * 2.0f, r * 2.0f, 2.0f);
+    }
+
+    // --- Node body ---
+    if (isSelected)
+    {
+        if (isDraggingNode && index == draggedNode)
+        {
+            // Dragging: liquid-glass halo at the exact position (highlight
+            // follows the drag vector), with the white solid circle at the
+            // physics-filtered position kept visible on top.
+            // Halo radius = node radius + 4px ring, so the accent glow ring
+            // (r + 3*scale, drawn above) stays visible outside the glass.
+            LiquidGlassEffect::drawCircle(g, exactPos, r + 4.0f,
+                                          dragVector.x, dragVector.y, scale);
+            g.setColour(DesignColours::white());
+            g.fillEllipse(whitePos.x - r, whitePos.y - r, r * 2.0f, r * 2.0f);
+        }
+        else
+        {
+            // Selected idle: white solid circle at physics-filtered position
+            g.setColour(DesignColours::white());
+            g.fillEllipse(whitePos.x - r, whitePos.y - r, r * 2.0f, r * 2.0f);
+        }
+    }
+}
+
+void FrequencyResponse::drawNodeCurve(juce::Graphics& g, int nodeIndex, bool isSelected)
+{
+    // Paths are cached per node in updateResponsePaths (parameter changes only)
+    const auto& path = nodeCurvePaths[nodeIndex];
+    if (path.isEmpty())
+        return;
+
+    if (DesignColours::isDark())
+    {
+        // Dark theme: light grey stays visible on the dark grid
+        g.setColour(isSelected ? DesignColours::whiteAlpha(110)
+                               : DesignColours::whiteAlpha(80));
+        g.strokePath(path, juce::PathStrokeType(isSelected ? 1.6f : 1.0f,
+                                                 juce::PathStrokeType::curved));
+    }
+    else
+    {
+        // Light theme: WHITE per-node curves (distinct from the blue phase
+        // curve) — no dark hairline outlining (per design feedback)
+        g.setColour(isSelected ? DesignColours::white()
+                               : DesignColours::whiteAlpha(210));
+        g.strokePath(path, juce::PathStrokeType(isSelected ? 1.4f : 1.0f,
+                                                 juce::PathStrokeType::curved));
+    }
+}
+
+void FrequencyResponse::updateNodePhysics()
+{
+    // Low-pass position filter: filtPos'' + 2ζωₙ·filtPos' + ωₙ²·filtPos = ωₙ²·exactPos
+    // ωₙ = 20 rad/s (≈3.2 Hz), ζ = 0.5 — the white circle lags behind and springs back
+    constexpr float dt = 1.0f / 60.0f;
+    constexpr float wn2 = 400.0f;
+    constexpr float twoZetaWn = 20.0f;
+
+    for (int i = 0; i < SubEQ::NumNodes; ++i)
+    {
+        auto& pp = physPos[i];
+        if (!pp.active) continue;
+
+        auto exact = getNodeScreenPos(i);
+
+        float ax = wn2 * (exact.x - pp.filtX) - twoZetaWn * pp.filtVelX;
+        float ay = wn2 * (exact.y - pp.filtY) - twoZetaWn * pp.filtVelY;
+        pp.filtVelX += ax * dt;
+        pp.filtVelY += ay * dt;
+        pp.filtX += pp.filtVelX * dt;
+        pp.filtY += pp.filtVelY * dt;
+
+        // Only settle after mouse release; during drag keep tracking exactPos
+        float dist = std::sqrt((exact.x - pp.filtX) * (exact.x - pp.filtX)
+                             + (exact.y - pp.filtY) * (exact.y - pp.filtY));
+        if (!isDragging && dist < 0.3f && std::abs(pp.filtVelX) < 0.3f && std::abs(pp.filtVelY) < 0.3f)
+            pp.active = false;
+    }
+}
+
+bool FrequencyResponse::needsPhysicsTimer() const
+{
+    if (isDragging || isDraggingNode || nodePressed || hoveredNode >= 0)
+        return true;
+
+    for (int i = 0; i < SubEQ::NumNodes; ++i)
+    {
+        if (physPos[i].active || nodeScale[i].isAnimating())
+            return true;
+    }
+    return false;
+}
+
+void FrequencyResponse::ensurePhysicsTimerRunning()
+{
+    if (!physicsTimer.isTimerRunning())
+        physicsTimer.startTimerHz (physicsTimerHz);
+}
+
+juce::String FrequencyResponse::formatFreq(float freq)
+{
+    if (freq >= 100.0f)
+        return juce::String(static_cast<int>(freq));
+    if (freq >= 10.0f)
+        return juce::String(freq, 1);
+    return juce::String(freq, 2);
+}
+
+juce::Rectangle<float> FrequencyResponse::getNodeLabelBounds(int nodeIndex) const
+{
+    auto np = getNodeScreenPos(nodeIndex);
+    float x = np.x;
+    float y = np.y;
 
     float labelW = 180.0f;
     float labelH = 90.0f;
@@ -467,12 +805,23 @@ juce::Rectangle<float> FrequencyResponse::getTypeValueBounds(int nodeIndex) cons
 void FrequencyResponse::drawNodeLabel(juce::Graphics& g, int nodeIndex)
 {
     auto bounds = getNodeLabelBounds(nodeIndex);
+    const float radius = DesignConstants::cornerRadiusSmall;
 
-    // Background
-    g.setColour(labelBackgroundColour());
-    g.fillRoundedRectangle(bounds, 4.0f);
-    g.setColour(labelHighlightColour());
-    g.drawRoundedRectangle(bounds, 4.0f, 1.0f);
+    // Liquid-glass tooltip backing, made more translucent and without the
+    // inner highlight band (visual transparency per design feedback)
+    DesignLookAndFeel::drawDropShadow(g, bounds, radius,
+                                      DesignColours::shadowDiffuse().withMultipliedAlpha(0.7f));
+
+    juce::Graphics::ScopedSaveState state(g);
+    juce::Path clipPath;
+    clipPath.addRoundedRectangle(bounds, radius);
+    g.reduceClipRegion(clipPath);
+
+    g.setColour(DesignColours::background().withAlpha(0.78f));
+    g.fillRoundedRectangle(bounds, radius);
+
+    g.setColour(DesignColours::whiteAlpha(45));
+    g.drawRoundedRectangle(bounds, radius, 1.0f);
 
     float freq = getNodeParamValue(nodeIndex, SubEQ::ParamID::Freq);
     float gain = getNodeParamValue(nodeIndex, SubEQ::ParamID::Gain);
@@ -481,22 +830,34 @@ void FrequencyResponse::drawNodeLabel(juce::Graphics& g, int nodeIndex)
     auto typeChoices = SubEQ::getFilterTypeChoices();
     juce::String typeStr = (typeIdx >= 0 && typeIdx < typeChoices.size()) ? typeChoices[typeIdx] : "Bell";
 
-    g.setColour(labelTextColour());
-    g.setFont(juce::Font(13.0f));
+    g.setColour(DesignColours::textPrimary());
+    g.setFont(DesignFonts::label());
+
+    // The TextEditor sits over the edited line with a translucent (0.85 alpha)
+    // background — skip that line so the label text does not bleed through
+    const bool editingThis = (editingNode == nodeIndex);
 
     // Frequency
-    auto freqBounds = getFreqValueBounds(nodeIndex);
-    juce::String freqStr = juce::String(freq, 2) + " Hz";
-    g.drawText("F: " + freqStr, freqBounds.toNearestInt(), juce::Justification::left, false);
+    if (!(editingThis && editTarget == EditTarget::Freq))
+    {
+        auto freqBounds = getFreqValueBounds(nodeIndex);
+        g.drawText("F: " + formatFreq(freq) + " Hz", freqBounds.toNearestInt(), juce::Justification::left, false);
+    }
 
     // Gain
-    auto gainBounds = getGainValueBounds(nodeIndex);
-    juce::String gainStr = (gain >= 0.0f ? "+" : "") + juce::String(gain, 1) + " dB";
-    g.drawText("G: " + gainStr, gainBounds.toNearestInt(), juce::Justification::left, false);
+    if (!(editingThis && editTarget == EditTarget::Gain))
+    {
+        auto gainBounds = getGainValueBounds(nodeIndex);
+        juce::String gainStr = (gain >= 0.0f ? "+" : "") + juce::String(gain, 1) + " dB";
+        g.drawText("G: " + gainStr, gainBounds.toNearestInt(), juce::Justification::left, false);
+    }
 
     // Q
-    auto qBounds = getQValueBounds(nodeIndex);
-    g.drawText("Q: " + juce::String(qVal, 2), qBounds.toNearestInt(), juce::Justification::left, false);
+    if (!(editingThis && editTarget == EditTarget::Q))
+    {
+        auto qBounds = getQValueBounds(nodeIndex);
+        g.drawText("Q: " + juce::String(qVal, 2), qBounds.toNearestInt(), juce::Justification::left, false);
+    }
 
     // Type
     auto typeBounds = getTypeValueBounds(nodeIndex);
@@ -509,7 +870,15 @@ void FrequencyResponse::drawNodeLabel(juce::Graphics& g, int nodeIndex)
 
 void FrequencyResponse::mouseDown(const juce::MouseEvent& event)
 {
+    // Multi-touch isolation: only the source that started the current drag
+    // may keep driving it; other touches are ignored until release.
+    if (activeMouseSource >= 0 && event.source.getIndex() != activeMouseSource)
+        return;
+
     auto pos = event.position;
+
+    // Remember the click position so popup menus open at the cursor
+    menuAnchor = event.getScreenPosition();
 
     // Dismiss text editor when clicking outside of it
     if (textEditor != nullptr)
@@ -530,6 +899,26 @@ void FrequencyResponse::mouseDown(const juce::MouseEvent& event)
         int node = findNodeAtPosition(pos);
         if (node >= 0)
         {
+            // Deleting the dragged node mid-drag: unwind the open gestures and
+            // reset the drag state first so no gesture leaks to the host.
+            if (isDragging && draggedNode == node)
+            {
+                endNodeGesture(node, SubEQ::ParamID::Freq);
+                if (dragGestureGain)
+                    endNodeGesture(node, SubEQ::ParamID::Gain);
+                if (dragGestureQ)
+                    endNodeGesture(node, SubEQ::ParamID::Q);
+
+                isDragging = false;
+                isDraggingNode = false;
+                nodePressed = false;
+                dragVector = {};
+                dragStartedOnNode = false;
+                draggedNode = -1;
+                dragGestureGain = false;
+                dragGestureQ = false;
+                activeMouseSource = -1;
+            }
             deleteNode(node);
         }
         else
@@ -571,6 +960,7 @@ void FrequencyResponse::mouseDown(const juce::MouseEvent& event)
         if (node >= 0)
         {
             selectNode(node);
+            nodePressed = true;
             isDragging = true;
             dragStartedOnNode = true;
             draggedNode = node;
@@ -578,11 +968,31 @@ void FrequencyResponse::mouseDown(const juce::MouseEvent& event)
             dragStartFreq = getNodeParamValue(node, SubEQ::ParamID::Freq);
             dragStartGain = getNodeParamValue(node, SubEQ::ParamID::Gain);
             dragStartQ = getNodeParamValue(node, SubEQ::ParamID::Q);
+            // Record which gestures we open so mouseUp closes exactly the same
+            // set even if automation flips the filter type mid-drag.
+            dragGestureGain = isGainSensitiveType(node);
+            dragGestureQ = !dragGestureGain;
+            activeMouseSource = event.source.getIndex();
+
             beginNodeGesture(node, SubEQ::ParamID::Freq);
-            if (isGainSensitiveType(node))
+            if (dragGestureGain)
                 beginNodeGesture(node, SubEQ::ParamID::Gain);
             else
                 beginNodeGesture(node, SubEQ::ParamID::Q);
+
+            // Liquid-glass drag state: keep the hover size, start the
+            // physics filter at the exact position (no jump on click)
+            isDraggingNode = true;
+            dragStartScale = nodeScale[node].getCurrent();
+            dragStartNodeScreen = getNodeScreenPos(node);
+            dragVector = {};
+            auto exact = getNodeScreenPos(node);
+            physPos[node] = {};
+            physPos[node].filtX = exact.x;
+            physPos[node].filtY = exact.y;
+            physPos[node].active = true;
+            updateNodeScales();
+            ensurePhysicsTimerRunning();
         }
         else
         {
@@ -595,6 +1005,7 @@ void FrequencyResponse::mouseDown(const juce::MouseEvent& event)
             int newNode = findNodeAtPosition(pos);
             if (newNode >= 0)
             {
+                nodePressed = true;
                 isDragging = true;
                 dragStartedOnNode = true;
                 draggedNode = newNode;
@@ -602,8 +1013,25 @@ void FrequencyResponse::mouseDown(const juce::MouseEvent& event)
                 dragStartFreq = getNodeParamValue(newNode, SubEQ::ParamID::Freq);
                 dragStartGain = getNodeParamValue(newNode, SubEQ::ParamID::Gain);
                 dragStartQ = getNodeParamValue(newNode, SubEQ::ParamID::Q);
+                dragGestureGain = true;
+                dragGestureQ = false;
+                activeMouseSource = event.source.getIndex();
+
                 beginNodeGesture(newNode, SubEQ::ParamID::Freq);
                 beginNodeGesture(newNode, SubEQ::ParamID::Gain);
+
+                // Liquid-glass drag state (new node starts hover-magnified)
+                isDraggingNode = true;
+                dragStartScale = 2.0f;
+                dragStartNodeScreen = getNodeScreenPos(newNode);
+                dragVector = {};
+                auto exactNew = getNodeScreenPos(newNode);
+                physPos[newNode] = {};
+                physPos[newNode].filtX = exactNew.x;
+                physPos[newNode].filtY = exactNew.y;
+                physPos[newNode].active = true;
+                updateNodeScales();
+                ensurePhysicsTimerRunning();
             }
         }
     }
@@ -611,6 +1039,9 @@ void FrequencyResponse::mouseDown(const juce::MouseEvent& event)
 
 void FrequencyResponse::mouseDrag(const juce::MouseEvent& event)
 {
+    if (activeMouseSource >= 0 && event.source.getIndex() != activeMouseSource)
+        return;
+
     // Dismiss text editor on any drag
     if (textEditor != nullptr)
         finishTextEdit(false);
@@ -625,6 +1056,9 @@ void FrequencyResponse::mouseDrag(const juce::MouseEvent& event)
 
     if (!isDragging || draggedNode < 0)
         return;
+
+    // Drag vector drives the liquid-glass highlight offset
+    dragVector = event.position - dragStartPos;
 
     auto delta = event.position - dragStartPos;
 
@@ -675,12 +1109,14 @@ void FrequencyResponse::mouseDrag(const juce::MouseEvent& event)
     }
 
     parametersChanged = true;
+    ensurePhysicsTimerRunning();
     repaint();
 }
 
 void FrequencyResponse::mouseUp(const juce::MouseEvent& event)
 {
-    juce::ignoreUnused(event);
+    if (activeMouseSource >= 0 && event.source.getIndex() != activeMouseSource)
+        return;
 
     if (isDeleting)
     {
@@ -690,16 +1126,48 @@ void FrequencyResponse::mouseUp(const juce::MouseEvent& event)
 
     if (isDragging && draggedNode >= 0)
     {
+        // Close exactly the gestures opened in mouseDown (the live type may
+        // have been flipped by automation mid-drag, so use the flags).
         endNodeGesture(draggedNode, SubEQ::ParamID::Freq);
-        if (isGainSensitiveType(draggedNode))
+        if (dragGestureGain)
             endNodeGesture(draggedNode, SubEQ::ParamID::Gain);
-        else
+        if (dragGestureQ)
             endNodeGesture(draggedNode, SubEQ::ParamID::Q);
     }
 
+    // Release: the physics filter keeps running and springs back naturally
     isDragging = false;
+    isDraggingNode = false;
+    nodePressed = false;
+    dragVector = {};
     dragStartedOnNode = false;
     draggedNode = -1;
+    dragGestureGain = false;
+    dragGestureQ = false;
+    activeMouseSource = -1;
+    updateNodeScales();
+    ensurePhysicsTimerRunning();
+    repaint();
+}
+
+void FrequencyResponse::mouseMove(const juce::MouseEvent& event)
+{
+    int newHover = findNodeAtPosition(event.position);
+    if (newHover != hoveredNode)
+    {
+        hoveredNode = newHover;
+        repaint();
+    }
+    updateNodeScales();
+    ensurePhysicsTimerRunning();
+}
+
+void FrequencyResponse::mouseExit(const juce::MouseEvent&)
+{
+    hoveredNode = -1;
+    updateNodeScales();
+    ensurePhysicsTimerRunning();
+    repaint();
 }
 
 void FrequencyResponse::mouseDoubleClick(const juce::MouseEvent& event)
@@ -710,13 +1178,19 @@ void FrequencyResponse::mouseDoubleClick(const juce::MouseEvent& event)
         if (isGainSensitiveType(node))
         {
             // Gain-sensitive: reset gain to 0 and Q to 0.707
+            beginNodeGesture(node, SubEQ::ParamID::Gain);
+            beginNodeGesture(node, SubEQ::ParamID::Q);
             setNodeParamValue(node, SubEQ::ParamID::Gain, 0.0f);
             setNodeParamValue(node, SubEQ::ParamID::Q, 0.707f);
+            endNodeGesture(node, SubEQ::ParamID::Q);
+            endNodeGesture(node, SubEQ::ParamID::Gain);
         }
         else
         {
             // Non-gain-sensitive: only reset Q to 0.707
+            beginNodeGesture(node, SubEQ::ParamID::Q);
             setNodeParamValue(node, SubEQ::ParamID::Q, 0.707f);
+            endNodeGesture(node, SubEQ::ParamID::Q);
         }
         parametersChanged = true;
         repaint();
@@ -737,7 +1211,9 @@ void FrequencyResponse::mouseWheelMove(const juce::MouseEvent& event,
         float logQ = std::log10(qVal) + wheel.deltaY * 0.1f;
         float newQ = std::pow(10.0f, logQ);
         newQ = juce::jlimit(0.1f, 10.0f, newQ);
+        beginNodeGesture(node, SubEQ::ParamID::Q);
         setNodeParamValue(node, SubEQ::ParamID::Q, newQ);
+        endNodeGesture(node, SubEQ::ParamID::Q);
         parametersChanged = true;
         repaint();
     }
@@ -785,13 +1261,9 @@ int FrequencyResponse::findNodeAtPosition(juce::Point<float> pos) const
         if (!isNodeEnabled(i))
             continue;
 
-        float freq = getNodeParamValue(i, SubEQ::ParamID::Freq);
-        float gain = getNodeParamValue(i, SubEQ::ParamID::Gain);
-        float x = freqToX(freq);
-        float y = isGainSensitiveType(i) ? gainToY(gain) : gainToY(0.0f);
-
-        float dx = pos.x - x;
-        float dy = pos.y - y;
+        auto np = getNodeScreenPos(i);
+        float dx = pos.x - np.x;
+        float dy = pos.y - np.y;
         if (dx * dx + dy * dy <= NodeHitRadius * NodeHitRadius)
             return i;
     }
@@ -855,6 +1327,11 @@ void FrequencyResponse::deleteNode(int index)
     if (selectedNode == index)
         deselectNode();
 
+    // Reset the visual/physics state so a node later re-created in this slot
+    // does not inherit a stale magnified scale or spring position.
+    nodeScale[index].setValueImmediate(1.0f);
+    physPos[index].active = false;
+
     parametersChanged = true;
     repaint();
 }
@@ -915,11 +1392,11 @@ void FrequencyResponse::startTextEdit(EditTarget target, int nodeIndex)
     editingNode = nodeIndex;
 
     textEditor = std::make_unique<juce::TextEditor>();
-    textEditor->setFont(juce::Font(13.0f));
-    textEditor->setColour(juce::TextEditor::backgroundColourId, labelBackgroundColour());
-    textEditor->setColour(juce::TextEditor::textColourId, labelTextColour());
-    textEditor->setColour(juce::TextEditor::highlightColourId, labelHighlightColour());
-    textEditor->setColour(juce::TextEditor::outlineColourId, labelHighlightColour());
+    textEditor->setFont(DesignFonts::label());
+    textEditor->setColour(juce::TextEditor::backgroundColourId, DesignColours::surface().withAlpha(0.85f));
+    textEditor->setColour(juce::TextEditor::textColourId, DesignColours::textPrimary());
+    textEditor->setColour(juce::TextEditor::highlightColourId, DesignColours::accent().withAlpha(0.2f));
+    textEditor->setColour(juce::TextEditor::outlineColourId, DesignColours::accent());
     textEditor->setJustification(juce::Justification::centredLeft);
     textEditor->setSelectAllWhenFocused(true);
 
@@ -943,6 +1420,9 @@ void FrequencyResponse::startTextEdit(EditTarget target, int nodeIndex)
             break;
     }
 
+    // Numeric entry only (digits, sign, decimal point); 8 chars is plenty
+    textEditor->setInputRestrictions(8, "0123456789.-");
+
     textEditor->setText(initialText);
     textEditor->setBounds(bounds.toNearestInt());
 
@@ -961,28 +1441,34 @@ void FrequencyResponse::finishTextEdit(bool commit)
 
     if (commit)
     {
-        juce::String text = textEditor->getText();
-        float value = text.getFloatValue();
+        juce::String text = textEditor->getText().trim();
 
-        switch (editTarget)
+        // Reject empty or non-numeric leftovers ("-", ".", "-.") instead of
+        // letting getFloatValue() silently coerce them to 0.
+        if (text.isNotEmpty() && text != "-" && text != "." && text != "-.")
         {
-            case EditTarget::Freq:
-                value = juce::jlimit(0.5f, 500.0f, value);
-                setNodeParamValue(editingNode, SubEQ::ParamID::Freq, value);
-                break;
-            case EditTarget::Gain:
-                value = juce::jlimit(-24.0f, 24.0f, value);
-                setNodeParamValue(editingNode, SubEQ::ParamID::Gain, value);
-                break;
-            case EditTarget::Q:
-                value = juce::jlimit(0.1f, 10.0f, value);
-                setNodeParamValue(editingNode, SubEQ::ParamID::Q, value);
-                break;
-            default:
-                break;
-        }
+            float value = text.getFloatValue();
 
-        parametersChanged = true;
+            switch (editTarget)
+            {
+                case EditTarget::Freq:
+                    value = juce::jlimit(0.5f, 500.0f, value);
+                    setNodeParamValue(editingNode, SubEQ::ParamID::Freq, value);
+                    break;
+                case EditTarget::Gain:
+                    value = juce::jlimit(-24.0f, 24.0f, value);
+                    setNodeParamValue(editingNode, SubEQ::ParamID::Gain, value);
+                    break;
+                case EditTarget::Q:
+                    value = juce::jlimit(0.1f, 10.0f, value);
+                    setNodeParamValue(editingNode, SubEQ::ParamID::Q, value);
+                    break;
+                default:
+                    break;
+            }
+
+            parametersChanged = true;
+        }
     }
 
     textEditor.reset();
@@ -999,13 +1485,22 @@ void FrequencyResponse::startTypeMenu(int nodeIndex)
 {
     juce::PopupMenu menu;
     auto choices = SubEQ::getFilterTypeChoices();
+    int currentType = static_cast<int>(getNodeParamValue(nodeIndex, SubEQ::ParamID::Type));
 
     for (int i = 0; i < choices.size(); ++i)
     {
-        menu.addItem(i + 1, choices[i], true, false);
+        menu.addItem(i + 1, choices[i], true, i == currentType);
     }
 
-    menu.showMenuAsync(juce::PopupMenu::Options(),
+    // Use the editor's installed LookAndFeel explicitly (in VST3 the global
+    // default LookAndFeel is not replaced, so the menu must carry its own).
+    // The menu opens anchored at the click position (menuAnchor), not at the
+    // component centre.
+    menu.setLookAndFeel (&getLookAndFeel());
+    menu.showMenuAsync(juce::PopupMenu::Options()
+                           .withTargetComponent(this)
+                           .withTargetScreenArea (juce::Rectangle<int> (menuAnchor, menuAnchor).expanded (2))
+                           .withMinimumWidth (140),
         [this, nodeIndex](int result)
         {
             if (result > 0)

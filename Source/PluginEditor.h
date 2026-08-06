@@ -14,6 +14,7 @@
 #include "SubEQ_Editor/FrequencyResponse.h"
 #include "SubEQ_Editor/MasterGainSlider.h"
 #include "SubEQ_Editor/ModeSelector.h"
+#include "SubEQ_Editor/DesignSystem/DesignLookAndFeel.h"
 
 //==============================================================================
 class SubEQAudioProcessorEditor  : public juce::AudioProcessorEditor
@@ -27,6 +28,7 @@ public:
 
 private:
     SubEQAudioProcessor& audioProcessor;
+    DesignLookAndFeel designLookAndFeel;
     FrequencyResponse freqResponse;
     MasterGainSlider masterGainSlider;
     ModeSelector modeSelector;

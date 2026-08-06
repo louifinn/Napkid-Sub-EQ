@@ -8,6 +8,8 @@
 */
 
 #include "PluginEditor.h"
+#include "SubEQ_Editor/DesignSystem/DesignColours.h"
+#include "SubEQ_Editor/DesignSystem/DesignFonts.h"
 
 //==============================================================================
 SubEQAudioProcessorEditor::SubEQAudioProcessorEditor (SubEQAudioProcessor& p)
@@ -17,6 +19,21 @@ SubEQAudioProcessorEditor::SubEQAudioProcessorEditor (SubEQAudioProcessor& p)
 {
     setSize (SubEQLookAndFeel::WindowWidth, SubEQLookAndFeel::WindowHeight);
     setResizable (false, false);
+
+    // Warm ivory liquid-glass design system (installs the LookAndFeel for all
+    // standard JUCE widgets: ComboBoxes, text editors, title bar).
+    setLookAndFeel (&designLookAndFeel);
+
+   #if JucePlugin_IsStandalone
+    // Standalone-only: also replace the *default* LookAndFeel so system
+    // PopupMenus (Audio / Options) pick up the design language. On teardown
+    // we restore the JUCE built-in default (never a saved pointer — with two
+    // editors alive, the saved pointer may reference an already-destroyed
+    // editor's LookAndFeel).
+    juce::LookAndFeel::setDefaultLookAndFeel (&designLookAndFeel);
+   #endif
+
+    DesignFonts::initialise();
 
     addAndMakeVisible (freqResponse);
     addAndMakeVisible (masterGainSlider);
@@ -32,14 +49,18 @@ SubEQAudioProcessorEditor::SubEQAudioProcessorEditor (SubEQAudioProcessor& p)
 
 SubEQAudioProcessorEditor::~SubEQAudioProcessorEditor()
 {
+   #if JucePlugin_IsStandalone
+    // Restore the JUCE built-in default LookAndFeel (no dangling pointers)
+    juce::LookAndFeel::setDefaultLookAndFeel (nullptr);
+   #endif
+    setLookAndFeel (nullptr);
 }
 
 //==============================================================================
 void SubEQAudioProcessorEditor::paint (juce::Graphics& g)
 {
-    // Fill the entire editor background so the bottom panel area
-    // matches the dark grey theme even when no components cover it.
-    g.fillAll (SubEQLookAndFeel::backgroundColour());
+    // Warm ivory matte background behind the three panel cards
+    g.fillAll (DesignColours::background());
 }
 
 void SubEQAudioProcessorEditor::resized()
