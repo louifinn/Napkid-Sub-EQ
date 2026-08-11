@@ -4,3 +4,4 @@ Builds/
 Tests/*.exe
 Tests/*.obj
 Tests/*.pdb
+/.mimosa/

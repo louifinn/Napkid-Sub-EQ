@@ -1,6 +1,6 @@
 # Napkid Sub EQ
 
-面向超低频（0.5 Hz ~ 500 Hz）的 8 节点参数均衡器 VST3 音频插件（C++ / JUCE 7.x / VS2022，仅 Windows）。GPL v3。当前版本 0.3.0。
+面向超低频（0.5 Hz ~ 500 Hz）的 8 节点参数均衡器 VST3 音频插件（C++ / JUCE 7.x / VS2022，仅 Windows）。GPL v3。当前版本 0.3.1。
 
 ## Project
 
@@ -21,7 +21,7 @@
 - VST3：`Builds/VisualStudio2022/x64/Release/VST3/`
 - Standalone：`Builds/VisualStudio2022/x64/Release/Standalone Plugin/`
 
-无自动化测试框架；回归测试为独立可执行 `Tests/subeq_fft_test.cpp`（无 JUCE 依赖，26 项：FFT/twiddle 多槽缓存/overlap-add/群延迟边界）：
+无自动化测试框架；回归测试为独立可执行 `Tests/subeq_fft_test.cpp`（无 JUCE 依赖，27 项：FFT/twiddle 多槽缓存/overlap-add/群延迟边界）：
 `cl /EHsc /std:c++17 /O2 Tests/subeq_fft_test.cpp /Fe:Tests\subeq_fft_test.exe && Tests\subeq_fft_test.exe`（需 VS 开发环境）。变更验证 = 编译 + 测试 + 人工。
 
 ## Architecture

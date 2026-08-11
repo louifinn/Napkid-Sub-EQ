@@ -136,6 +136,13 @@ private:
     // otherwise revive old audio as echoes.
     int activeConvFFTSize = 0;
 
+    // stateVersion of the design the overlap/output FIFOs were last flushed
+    // for (audio thread only). A newly published design — parameter edit, FIR
+    // length or mode change — invalidates both the accumulated convolution
+    // tail and the pending output FIFO (old-filter audio), so process() drops
+    // them on the first block it sees the new version.
+    int processedVersion = 0;
+
     std::atomic<double> sampleRate { 48000.0 };   // written by audio thread, read by bg thread
     double preparedSampleRate = 0.0;              // audio thread: sr of the last full prepare
     int numChannels = 2;

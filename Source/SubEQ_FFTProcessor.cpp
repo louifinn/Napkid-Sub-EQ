@@ -39,16 +39,19 @@ void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
     juce::ignoreUnused(maxBlockSize);
     sampleRate.store(sr, std::memory_order_release);
 
-    // Any design started before this prepare is stale (it may have snapshotted
-    // a previous sample rate) and must not be published.
-    designEpoch.fetch_add(1, std::memory_order_release);
-
     // Same session parameters: keep the buffers and any published design.
     // Hosts commonly re-call prepareToPlay (transport stop/start, loop
     // points) with an unchanged setup; dropping the published design would
-    // mute the output until the background redesign completes.
+    // mute the output until the background redesign completes. The design
+    // epoch is deliberately NOT bumped here: an in-flight design was built
+    // from the same sample rate and is still valid — discarding it would
+    // silently revert the user's latest parameter edit.
     if (sr == preparedSampleRate && channels == numChannels && !fftWork.empty())
         return;
+
+    // Any design started before this prepare is stale (it may have snapshotted
+    // a previous sample rate) and must not be published.
+    designEpoch.fetch_add(1, std::memory_order_release);
 
     preparedSampleRate = sr;
     numChannels = channels;
@@ -80,6 +83,13 @@ void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
         currentState.reset();
     }
     stateVersion.fetch_add(1, std::memory_order_release);
+
+    // The published design was just dropped. If the plugin is in a FIR mode
+    // the audio thread would otherwise output silence (or stale coefficients)
+    // until the user touches a parameter again — request a redesign right
+    // away. Non-blocking and audio-thread safe; the worker ignores the
+    // request in Zero Latency mode.
+    requestRedesign();
 }
 
 void FFTProcessor::reset()
@@ -331,15 +341,24 @@ void FFTProcessor::process(juce::AudioBuffer<float>& buffer)
     if (L <= 0 || L > static_cast<int>(fftWork.size()))
         return;
 
-    // FIR length switch: the overlap accumulators hold tails laid out for the
-    // previous convFFTSize (and, beyond it, stale audio from an earlier long
-    // FIR — the buffers are sized for MaxFirLength). Flush them, otherwise
-    // minutes-old audio is revived as echoes under the new coefficients.
-    if (L != activeConvFFTSize)
+    // A newly published design (parameter edit, FIR length or mode change)
+    // invalidates everything the accumulators hold. The overlap tail and the
+    // pending output FIFO were computed with the previous coefficients — up
+    // to FIR-length-1 samples of old-filter audio (over a second for a
+    // 65536-tap FIR at 48 kHz) — and must be dropped, otherwise echoes of the
+    // previous filter contaminate the new output. The old check only flushed
+    // on a convFFTSize change, so same-length redesigns (the common knob
+    // drag) mixed stale tails with fresh output.
+    const int version = stateVersion.load(std::memory_order_acquire);
+    if (version != processedVersion || L != activeConvFFTSize)
     {
         for (auto& ob : overlapBufs)
             std::fill(ob.begin(), ob.end(), 0.0);
+        for (auto& ob : outBufs)
+            ob.clear();
+        std::fill(outReadPos.begin(), outReadPos.end(), 0);
         activeConvFFTSize = L;
+        processedVersion = version;
     }
 
     const int channels = std::min(buffer.getNumChannels(), numChannels);
