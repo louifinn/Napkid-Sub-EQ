@@ -70,7 +70,7 @@ Napkid Sub EQ 是一款专为低频信号处理设计的参量均衡器插件。
 
 - **操作系统**：Windows 10/11 (64-bit)
 - **DAW**：任何支持 VST3 的宿主
-- **编译器**：Visual Studio 2022
+- **编译器**：Visual Studio 2022 或更高（Projucer 导出目标为 VS2022）
 - **依赖**：JUCE 7.x 框架
 - **可选**：ASIO SDK（用于 standalone 版本的 ASIO 支持）
 
@@ -153,12 +153,22 @@ Sub EQ/
 │   ├── PluginProcessor.h/.cpp       # 插件处理器主体
 │   ├── PluginEditor.h/.cpp          # 插件编辑器入口
 │   ├── SubEQ_Core.h/.cpp            # 双精度 Biquad EQ 引擎
-│   ├── SubEQ_DSPMath.h              # 共享 DSP 数学（模板 FFT/IDFT、群延迟估计）
+│   ├── SubEQ_DSPMath.h              # 共享 DSP 数学（模板 FFT/IDFT、nextPow2、convolutionFftSize）
 │   ├── SubEQ_FFTProcessor.h/.cpp    # FIR 系数设计与 overlap-add 卷积（Linear / Minimum Phase）
 │   ├── SubEQ_Parameters.h           # APVTS 参数定义
 │   ├── SubEQ_Spectrum.h/.cpp        # 实时频谱分析器
+│   ├── SubEQ_Biquad.h               # 双精度 biquad 系数/状态/频响（共享纯计算，无 JUCE）
+│   ├── SubEQ_BiquadDesign.h         # RBJ 系数设计（共享纯计算，无 JUCE）
+│   ├── SubEQ_FIRDesign.h            # 线性/最小相位 FIR 设计（共享纯计算，无 JUCE）
+│   ├── SubEQ_FFTConvolver.h         # overlap-add 卷积原语（共享纯计算，无 JUCE）
+│   ├── SubEQ_SpectrumMath.h         # octave 频段/Hann/16·N⁻² 校准（共享纯计算）
+│   ├── SubEQ_SpectrumConfig.h       # 频谱 choice 下标→语义值解码（共享纯计算）
+│   ├── SubEQ_CoordinateMapper.h     # 频响图坐标映射（共享纯计算）
+│   ├── SubEQ_NodeInteraction.h      # 增益敏感类型/切换重置/对数 Q 步进（共享纯计算）
+│   ├── SubEQ_Spring.h               # 二阶弹簧积分器（共享纯计算）
+│   ├── SubEQ_FilterType.h           # FilterType 枚举 + int↔枚举映射（共享纯计算）
 │   └── SubEQ_Editor/
-│       ├── SubEQLookAndFeel.h       # 布局尺寸常量（遗留，视觉已由 DesignSystem 取代）
+│       ├── SubEQLookAndFeel.h       # 窗口/节点/网格布局常量（遗留颜色已删除）
 │       ├── FrequencyResponse.h/.cpp # 频响曲线绘制和节点交互
 │       ├── MasterGainSlider.h/.cpp  # 总增益推子
 │       ├── ModeSelector.h/.cpp      # 底部模式选择面板（v0.2.0 新增）

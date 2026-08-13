@@ -130,7 +130,9 @@ struct BiquadState {
 
 ## 5. 图形界面设计
 
-### 5.1 布局方案：FabFilter 风格
+### 5.1 布局方案：FabFilter 风格（交互），视觉已演进为液态玻璃 Light 主题
+
+> 注：下方示意图保留早期暗色方案供参考；当前视觉采用「液态玻璃」Light 主题（暖白奶色 + #FF007B + 莫兰迪色板，见 §8 颜色主题）。
 
 窗口尺寸：**900 × 620 像素**
 
@@ -204,14 +206,25 @@ Source/
 ├── SubEQ_Core.h             [新增] 双精度 Biquad + 节点管理 + 系数平滑
 ├── SubEQ_Core.cpp           [新增] 系数计算 + 信号处理
 ├── SubEQ_Parameters.h       [新增] 参数定义、APVTS 布局（48 参数）
-├── SubEQ_DSPMath.h          [新增] 共享 DSP 数学（模板 FFT/IDFT、群延迟估计）
-├── SubEQ_FFTProcessor.h/.cpp [新增] FIR 设计（后台线程）+ overlap-add 卷积
+├── SubEQ_DSPMath.h          [修改] 共享 DSP 数学（模板 FFT/IDFT、nextPow2、convolutionFftSize）
+├── SubEQ_FFTProcessor.h/.cpp [修改] FIR 设计（后台线程）+ overlap-add 卷积
 ├── SubEQ_Spectrum.h/.cpp    [新增] 实时频谱分析器 (8192点 FFT)
+├── SubEQ_Biquad.h           [新增] 双精度 biquad 系数/状态/频响（共享纯计算，无 JUCE）
+├── SubEQ_BiquadDesign.h     [新增] RBJ 系数设计（共享纯计算，无 JUCE）
+├── SubEQ_FIRDesign.h        [新增] 线性/最小相位 FIR 设计（共享纯计算，无 JUCE）
+├── SubEQ_FFTConvolver.h     [新增] overlap-add 卷积原语（共享纯计算，无 JUCE）
+├── SubEQ_SpectrumMath.h     [新增] octave 频段/Hann/16·N⁻² 校准（共享纯计算）
+├── SubEQ_SpectrumConfig.h   [新增] 频谱 choice 下标→语义值解码（共享纯计算）
+├── SubEQ_CoordinateMapper.h [新增] 频响图坐标映射（共享纯计算）
+├── SubEQ_NodeInteraction.h  [新增] 增益敏感类型/切换重置/对数 Q 步进（共享纯计算）
+├── SubEQ_Spring.h           [新增] 二阶弹簧积分器（共享纯计算）
+├── SubEQ_FilterType.h       [新增] FilterType 枚举 + int↔枚举映射（共享纯计算）
 └── SubEQ_Editor/            [新增] GUI 组件目录
-    ├── SubEQLookAndFeel.h   [新增] 自定义外观（颜色、字体）——仅头文件
+    ├── SubEQLookAndFeel.h   [修改] 窗口/节点/网格布局常量（遗留颜色已删除）
     ├── FrequencyResponse.h/.cpp     [新增] 频响曲线 + 相位曲线 + 节点绘制 + 交互
     ├── MasterGainSlider.h/.cpp      [新增] 右侧总增益垂直滑块
-    └── ModeSelector.h/.cpp          [新增] 底部模式 / FIR 长度 / 延迟面板
+    ├── ModeSelector.h/.cpp          [新增] 底部模式 / FIR 长度 / 延迟面板
+    └── DesignSystem/        [新增] 液态玻璃设计系统（颜色/字体/动画/玻璃效果/LookAndFeel）
 ```
 
 ### 6.2 Projucer 配置变更
@@ -246,16 +259,16 @@ Source/
 | 通道支持 | **仅立体声**（2进2出） |
 | Interface 类 | **移除**，完全手写 GUI |
 | 窗口尺寸 | **900 × 620 像素**，右侧 60px 总增益 Slider，底部 60px 功能面板 |
-| 颜色主题 | **深灰背景 (#2a2a2a) + 玫瑰粉频响曲线 (#FF007B) + 青色相位曲线 + 白色节点 (#ffffff)** |
+| 颜色主题 | **暖白奶色（Light 主题）+ 玫瑰粉主色 (#FF007B) + 莫兰迪色板**（液态玻璃设计系统，Dark 主题已移除） |
 | 节点外观 | **统一外径**：选中为白色实心圆，未选中为白色空心圆环（不随 Q 变化） |
 | 节点默认状态 | **全部禁用**（false），初始无活动节点 |
 | 类型切换 | **弹出下拉菜单**（8 种类型列表选择） |
 | 键盘操作 | **不需要** |
-| 实时频谱 | **1/6 倍频程**，Catmull-Rom 样条曲线绘制 |
+| 实时频谱 | **1/6 或 1/12 倍频程**（61/121 频段），可配 FFT 大小/hop/刷新率 |
 | ASIO 支持 | **已添加**，Standalone 版本可用 |
 | 处理模式 | **三种全局模式**（Zero Latency / Minimum Phase / Linear Phase）+ FIR 长度可选（4096 / 16384 / 65536） |
 
 ---
 
-*文档版本: v0.6*
-*最后更新: 2026-08-02*
+*文档版本: v0.7*
+*最后更新: 2026-08-13*
