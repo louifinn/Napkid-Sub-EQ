@@ -9,21 +9,16 @@
 
 #include "FrequencyResponse.h"
 #include "../PluginProcessor.h"
+#include "../SubEQ_SpectrumMath.h"
+#include "../SubEQ_CoordinateMapper.h"
+#include "../SubEQ_NodeInteraction.h"
+#include "../SubEQ_Spring.h"
 #include "DesignSystem/DesignColours.h"
 #include "DesignSystem/DesignFonts.h"
 #include "DesignSystem/LiquidGlassEffect.h"
 #include "DesignSystem/DesignLookAndFeel.h"
 
 using namespace SubEQLookAndFeel;
-
-namespace
-{
-    // Spectrum refresh rate parameter index (0/1/2) → Hz
-    int refreshRateFromIndex (int idx)
-    {
-        return idx == 0 ? 15 : (idx == 2 ? 60 : 30);
-    }
-}
 
 //==============================================================================
 // Construction / Destruction
@@ -58,7 +53,7 @@ FrequencyResponse::FrequencyResponse(SubEQAudioProcessor& proc)
     int refreshIdx = 1; // default 30 Hz
     if (auto* refreshParam = apvts.getRawParameterValue ("spectrum_refresh_rate"))
         refreshIdx = static_cast<int> (refreshParam->load());
-    currentTimerHz = refreshRateFromIndex (refreshIdx);
+    currentTimerHz = SubEQ::spectrumRefreshChoiceToHz (refreshIdx);
     startTimerHz (currentTimerHz);
 
     // Node physics/scale animations stay at a fixed 60 Hz
@@ -115,7 +110,7 @@ void FrequencyResponse::timerCallback()
     int refreshIdx = 1;
     if (auto* refreshParam = apvts.getRawParameterValue ("spectrum_refresh_rate"))
         refreshIdx = static_cast<int> (refreshParam->load());
-    int hz = refreshRateFromIndex (refreshIdx);
+    int hz = SubEQ::spectrumRefreshChoiceToHz (refreshIdx);
     if (hz != currentTimerHz)
     {
         currentTimerHz = hz;
@@ -223,45 +218,37 @@ juce::Rectangle<float> FrequencyResponse::getPhaseArea() const
 float FrequencyResponse::freqToX(float freq) const
 {
     auto area = getResponseArea();
-    const float logMin = std::log10(0.5f);
-    const float logMax = std::log10(500.0f);
-    const float logFreq = std::log10(juce::jlimit(0.5f, 500.0f, freq));
-    return area.getX() + area.getWidth() * (logFreq - logMin) / (logMax - logMin);
+    return SubEQ::freqToX(freq, area.getX(), area.getWidth());
 }
 
 float FrequencyResponse::xToFreq(float x) const
 {
     auto area = getResponseArea();
-    const float logMin = std::log10(0.5f);
-    const float logMax = std::log10(500.0f);
-    const float norm = juce::jlimit(0.0f, 1.0f, (x - area.getX()) / area.getWidth());
-    return std::pow(10.0f, logMin + norm * (logMax - logMin));
+    return SubEQ::xToFreq(x, area.getX(), area.getWidth());
 }
 
 float FrequencyResponse::gainToY(float gainDb) const
 {
     auto area = getResponseArea();
-    return area.getBottom() - area.getHeight() * (gainDb + 24.0f) / 48.0f;
+    return SubEQ::gainToY(gainDb, area.getBottom(), area.getHeight());
 }
 
 float FrequencyResponse::yToGain(float y) const
 {
     auto area = getResponseArea();
-    const float norm = juce::jlimit(0.0f, 1.0f, (area.getBottom() - y) / area.getHeight());
-    return norm * 48.0f - 24.0f;
+    return SubEQ::yToGain(y, area.getBottom(), area.getHeight());
 }
 
 float FrequencyResponse::phaseToY(float degrees) const
 {
     auto area = getResponseArea();
-    return area.getBottom() - area.getHeight() * (degrees + 180.0f) / 360.0f;
+    return SubEQ::phaseToY(degrees, area.getBottom(), area.getHeight());
 }
 
 float FrequencyResponse::yToPhase(float y) const
 {
     auto area = getResponseArea();
-    const float norm = juce::jlimit(0.0f, 1.0f, (area.getBottom() - y) / area.getHeight());
-    return norm * 360.0f - 180.0f;
+    return SubEQ::yToPhase(y, area.getBottom(), area.getHeight());
 }
 
 void FrequencyResponse::drawGrid(juce::Graphics& g)
@@ -339,8 +326,7 @@ void FrequencyResponse::drawSpectrum(juce::Graphics& g)
     // (1/6 octave → 61 bands, 1/12 octave → 121 bands)
     auto bandCentreFreq = [](int i, int numBands) -> float
     {
-        const float div = (numBands == 121) ? 12.0f : 6.0f;
-        return 0.5f * std::pow(2.0f, static_cast<float>(i) / div);
+        return SubEQ::octaveBandCenterFreq(SubEQ::SpectrumAnalyzer::MinFreq, i, numBands);
     };
 
     auto drawBandLine = [&](const float* data, int numBands, juce::Colour colour)
@@ -680,23 +666,11 @@ void FrequencyResponse::drawNodeCurve(juce::Graphics& g, int nodeIndex, bool isS
     if (path.isEmpty())
         return;
 
-    if (DesignColours::isDark())
-    {
-        // Dark theme: light grey stays visible on the dark grid
-        g.setColour(isSelected ? DesignColours::whiteAlpha(110)
-                               : DesignColours::whiteAlpha(80));
-        g.strokePath(path, juce::PathStrokeType(isSelected ? 1.6f : 1.0f,
-                                                 juce::PathStrokeType::curved));
-    }
-    else
-    {
-        // Light theme: WHITE per-node curves (distinct from the blue phase
-        // curve) — no dark hairline outlining (per design feedback)
-        g.setColour(isSelected ? DesignColours::white()
-                               : DesignColours::whiteAlpha(210));
-        g.strokePath(path, juce::PathStrokeType(isSelected ? 1.4f : 1.0f,
-                                                 juce::PathStrokeType::curved));
-    }
+    // Light theme: WHITE per-node curves (distinct from the blue phase curve).
+    g.setColour(isSelected ? DesignColours::white()
+                           : DesignColours::whiteAlpha(210));
+    g.strokePath(path, juce::PathStrokeType(isSelected ? 1.4f : 1.0f,
+                                             juce::PathStrokeType::curved));
 }
 
 void FrequencyResponse::updateNodePhysics()
@@ -714,12 +688,8 @@ void FrequencyResponse::updateNodePhysics()
 
         auto exact = getNodeScreenPos(i);
 
-        float ax = wn2 * (exact.x - pp.filtX) - twoZetaWn * pp.filtVelX;
-        float ay = wn2 * (exact.y - pp.filtY) - twoZetaWn * pp.filtVelY;
-        pp.filtVelX += ax * dt;
-        pp.filtVelY += ay * dt;
-        pp.filtX += pp.filtVelX * dt;
-        pp.filtY += pp.filtVelY * dt;
+        SubEQ::stepSpring(pp.filtX, pp.filtVelX, dt, exact.x, wn2, twoZetaWn);
+        SubEQ::stepSpring(pp.filtY, pp.filtVelY, dt, exact.y, wn2, twoZetaWn);
 
         // Only settle after mouse release; during drag keep tracking exactPos
         float dist = std::sqrt((exact.x - pp.filtX) * (exact.x - pp.filtX)
@@ -1081,9 +1051,7 @@ void FrequencyResponse::mouseDrag(const juce::MouseEvent& event)
         else
         {
             // Logarithmic Q mapping: equal pixel distance = equal ratio change
-            float logQ = std::log10(dragStartQ) - delta.y * 0.01f;
-            float newQ = std::pow(10.0f, logQ);
-            newQ = juce::jlimit(0.1f, 10.0f, newQ);
+            const float newQ = SubEQ::stepLogQ(dragStartQ, -delta.y * 0.01f);
             setNodeParamValue(draggedNode, SubEQ::ParamID::Q, newQ);
         }
     }
@@ -1101,9 +1069,7 @@ void FrequencyResponse::mouseDrag(const juce::MouseEvent& event)
         else
         {
             // Logarithmic Q mapping: equal pixel distance = equal ratio change
-            float logQ = std::log10(dragStartQ) - delta.y * 0.01f;
-            float newQ = std::pow(10.0f, logQ);
-            newQ = juce::jlimit(0.1f, 10.0f, newQ);
+            const float newQ = SubEQ::stepLogQ(dragStartQ, -delta.y * 0.01f);
             setNodeParamValue(draggedNode, SubEQ::ParamID::Q, newQ);
         }
     }
@@ -1208,9 +1174,7 @@ void FrequencyResponse::mouseWheelMove(const juce::MouseEvent& event,
     {
         float qVal = getNodeParamValue(node, SubEQ::ParamID::Q);
         // Logarithmic Q mapping: each wheel step = fixed ratio change (~25%)
-        float logQ = std::log10(qVal) + wheel.deltaY * 0.1f;
-        float newQ = std::pow(10.0f, logQ);
-        newQ = juce::jlimit(0.1f, 10.0f, newQ);
+        float newQ = SubEQ::stepLogQ(qVal, wheel.deltaY * 0.1f);
         beginNodeGesture(node, SubEQ::ParamID::Q);
         setNodeParamValue(node, SubEQ::ParamID::Q, newQ);
         endNodeGesture(node, SubEQ::ParamID::Q);
@@ -1343,9 +1307,8 @@ bool FrequencyResponse::isNodeEnabled(int index) const
 
 bool FrequencyResponse::isGainSensitiveType(int nodeIndex) const
 {
-    int typeIdx = static_cast<int>(getNodeParamValue(nodeIndex, SubEQ::ParamID::Type));
-    // Bell(0), LowShelf(3), HighShelf(4), Tilt(6) are gain-sensitive
-    return (typeIdx == 0 || typeIdx == 3 || typeIdx == 4 || typeIdx == 6);
+    const int typeIdx = static_cast<int>(getNodeParamValue(nodeIndex, SubEQ::ParamID::Type));
+    return SubEQ::isGainSensitiveTypeIndex(typeIdx);
 }
 
 //==============================================================================
@@ -1505,12 +1468,13 @@ void FrequencyResponse::startTypeMenu(int nodeIndex)
         {
             if (result > 0)
             {
-                bool wasGainSensitive = isGainSensitiveType(nodeIndex);
+                const int oldType = static_cast<int>(getNodeParamValue(nodeIndex, SubEQ::ParamID::Type));
+                const int newType = result - 1;
                 auto* p = getNodeParam(nodeIndex, SubEQ::ParamID::Type);
-                p->setValueNotifyingHost(p->convertTo0to1(static_cast<float>(result - 1)));
+                p->setValueNotifyingHost(p->convertTo0to1(static_cast<float>(newType)));
 
                 // If switching from gain-sensitive to non-gain-sensitive, reset gain to 0 dB
-                if (wasGainSensitive && !isGainSensitiveType(nodeIndex))
+                if (SubEQ::shouldResetGainOnTypeChange(oldType, newType))
                     setNodeParamValue(nodeIndex, SubEQ::ParamID::Gain, 0.0f);
 
                 parametersChanged = true;

@@ -11,65 +11,11 @@
 #pragma once
 
 #include <JuceHeader.h>
+#include "SubEQ_FilterType.h"
+#include "SubEQ_Biquad.h"
 
 namespace SubEQ
 {
-
-// Double-precision Biquad coefficients (shared across channels)
-struct BiquadCoefficients
-{
-    double b0 = 1.0, b1 = 0.0, b2 = 0.0;
-    double a1 = 0.0, a2 = 0.0;
-
-    // Stability check: poles of z^2 + a1*z + a2 = 0 must be inside unit circle
-    bool isStable() const noexcept
-    {
-        return std::abs(a2) < 1.0 && std::abs(a1) < 1.0 + a2;
-    }
-
-    // Force coefficients to be stable by nudging a1/a2 inward
-    void forceStable() noexcept
-    {
-        if (a2 >= 1.0)  a2 = 0.9999999999;
-        if (a2 <= -1.0) a2 = -0.9999999999;
-        double limit = 1.0 + a2;
-        if (std::abs(a1) >= limit)
-            a1 = (a1 >= 0.0 ? 0.9999999999 : -0.9999999999) * limit;
-    }
-};
-
-// Per-channel Biquad state (Transposed Direct Form II)
-// Separated from coefficients so each channel has independent memory
-struct BiquadState
-{
-    double z1 = 0.0, z2 = 0.0;
-
-    inline double process(double in, const BiquadCoefficients& c) noexcept
-    {
-        double out = c.b0 * in + z1;
-        z1 = c.b1 * in - c.a1 * out + z2;
-        z2 = c.b2 * in - c.a2 * out;
-        return out;
-    }
-
-    void reset() noexcept
-    {
-        z1 = z2 = 0.0;
-    }
-};
-
-// Filter node types
-enum class FilterType
-{
-    Bell = 0,
-    HighPass,
-    LowPass,
-    LowShelf,
-    HighShelf,
-    Notch,
-    Tilt,
-    BandPass
-};
 
 // Single EQ node with up to 2 cascaded biquads
 // Coefficients are shared across channels; states are per-channel
@@ -187,15 +133,6 @@ public:
     double getQ() const noexcept { return q; }
 
 private:
-    void updateBell();
-    void updateHighPass();
-    void updateLowPass();
-    void updateLowShelf();
-    void updateHighShelf();
-    void updateNotch();
-    void updateTilt();
-    void updateBandPass();
-
     // Biquads currently in the processing chain: numBiquads plus, while a
     // dropped second biquad (e.g. Tilt -> Bell) fades out to identity, one extra.
     int activeBiquads() const noexcept { return numBiquads + (extraBiquadFadeOut ? 1 : 0); }

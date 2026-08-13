@@ -12,6 +12,7 @@
 
 #include <JuceHeader.h>
 #include "SubEQ_Core.h"
+#include "SubEQ_SpectrumConfig.h"
 
 namespace SubEQ
 {
@@ -60,42 +61,26 @@ inline juce::StringArray getFilterTypeChoices()
     return { "Bell", "High Pass", "Low Pass", "Low Shelf", "High Shelf", "Notch", "Tilt", "Band Pass" };
 }
 
-inline FilterType intToFilterType(int value)
-{
-    switch (value)
-    {
-        case 0:  return FilterType::Bell;
-        case 1:  return FilterType::HighPass;
-        case 2:  return FilterType::LowPass;
-        case 3:  return FilterType::LowShelf;
-        case 4:  return FilterType::HighShelf;
-        case 5:  return FilterType::Notch;
-        case 6:  return FilterType::Tilt;
-        case 7:  return FilterType::BandPass;
-        default: return FilterType::Bell;
-    }
-}
-
-inline int filterTypeToInt(FilterType type)
-{
-    switch (type)
-    {
-        case FilterType::Bell:      return 0;
-        case FilterType::HighPass:  return 1;
-        case FilterType::LowPass:   return 2;
-        case FilterType::LowShelf:  return 3;
-        case FilterType::HighShelf: return 4;
-        case FilterType::Notch:     return 5;
-        case FilterType::Tilt:      return 6;
-        case FilterType::BandPass:  return 7;
-    }
-    return 0;
-}
-
 // Global EQ mode choices
 inline juce::StringArray getEQModeChoices()
 {
     return { "Zero Latency", "Minimum Phase", "Linear Phase" };
+}
+
+// Apply one node's decoded parameter values to an engine node. This is the
+// single source of truth for "APVTS values -> EQNode write sequence": the
+// audio thread composes it with a change-detection cache, while the design /
+// GUI path calls it directly (exact snapshot, no smoothing).
+inline void applyNodeValuesToEngine(EQEngine& engine, int nodeIndex,
+                                    float freq, float gain, float qVal, int type, bool enabled)
+{
+    auto& node = engine.getNode(nodeIndex);
+    node.setEnabled(enabled);
+    if (enabled)
+        node.update(static_cast<double>(freq),
+                    static_cast<double>(gain),
+                    static_cast<double>(qVal),
+                    intToFilterType(type));
 }
 
 // Apply current APVTS parameter values to an EQEngine.
@@ -112,16 +97,13 @@ inline void applyParametersToEngine(juce::AudioProcessorValueTreeState& apvts, E
 
     for (int i = 0; i < NumNodes; ++i)
     {
-        float freq   = apvts.getRawParameterValue(getNodeParamID(i, ParamID::Freq))->load();
-        float gain   = apvts.getRawParameterValue(getNodeParamID(i, ParamID::Gain))->load();
-        float qVal   = apvts.getRawParameterValue(getNodeParamID(i, ParamID::Q))->load();
-        int type     = static_cast<int>(apvts.getRawParameterValue(getNodeParamID(i, ParamID::Type))->load());
-        bool enabled = apvts.getRawParameterValue(getNodeParamID(i, ParamID::Enabled))->load() > 0.5f;
+        const float freq   = apvts.getRawParameterValue(getNodeParamID(i, ParamID::Freq))->load();
+        const float gain   = apvts.getRawParameterValue(getNodeParamID(i, ParamID::Gain))->load();
+        const float qVal   = apvts.getRawParameterValue(getNodeParamID(i, ParamID::Q))->load();
+        const int type     = static_cast<int>(apvts.getRawParameterValue(getNodeParamID(i, ParamID::Type))->load());
+        const bool enabled = apvts.getRawParameterValue(getNodeParamID(i, ParamID::Enabled))->load() > 0.5f;
 
-        auto& node = engine.getNode(i);
-        node.setEnabled(enabled);
-        if (enabled)
-            node.update(static_cast<double>(freq), static_cast<double>(gain), static_cast<double>(qVal), intToFilterType(type));
+        applyNodeValuesToEngine(engine, i, freq, gain, qVal, type, enabled);
     }
 }
 

@@ -20,6 +20,7 @@
 #include <vector>
 #include <JuceHeader.h>
 #include "SubEQ_Core.h"
+#include "SubEQ_FFTConvolver.h"
 
 namespace SubEQ
 {
@@ -39,8 +40,6 @@ public:
     // FIR group delay (~10.7 ms @ 48 kHz).
     static constexpr int ConvBlockLen = 512;
 
-    // Fixed latency of a length-N Linear Phase FIR (group delay (N-1)/2).
-    static int linearPhaseLatencyFor(int firLength) { return (firLength - 1) / 2; }
 
     FFTProcessor();
     ~FFTProcessor() override;
@@ -75,11 +74,6 @@ public:
 private:
     void run() override;
 
-    void designLinearPhaseFIR(const EQEngine& eqEngine, int firLength,
-                              std::vector<float>& coeffsOut, int& latencyOut);
-    void designMinimumPhaseFIR(const EQEngine& eqEngine, int firLength,
-                               std::vector<float>& coeffsOut, int& latencyOut);
-
     // Published FIR state (written by the background thread, read by the
     // audio thread). Immutable once published — safe to share.
     struct FIRState
@@ -95,8 +89,10 @@ private:
         int groupDelay = 0;
     };
 
-    // Audio-thread accessor: returns the latest published state.
-    std::shared_ptr<const FIRState> getPublishedState() const;
+    // Audio-thread-only accessor: returns the latest published state. Owns
+    // localState/lastSeenVersion; must never be called from the GUI/host
+    // thread — cross-thread reads go through getTailLengthSamples().
+    std::shared_ptr<const FIRState> getPublishedStateForAudioThread() const;
 
     mutable std::mutex stateMutex;                               // guards currentState (rarely contended)
     mutable std::shared_ptr<const FIRState> currentState;        // written by bg thread under lock
@@ -123,12 +119,8 @@ private:
 
     // Overlap-add state (audio thread only). The convolution FFT runs in
     // double precision (float FFT error ~0.4% relative would be audible).
-    std::vector<std::vector<std::complex<double>>> inputBlocks;  // per channel, ConvBlockLen
-    std::vector<int> inputPos;                                 // per channel
-    std::vector<std::vector<double>> overlapBufs;              // per channel, convFFTSize
-    std::vector<std::vector<double>> outBufs;                  // per channel output FIFO
-    std::vector<int> outReadPos;                               // per channel
-    std::vector<std::complex<double>> fftWork;                 // shared scratch, convFFTSize
+    std::vector<OlaChannelState> channelStates;          // per channel
+    std::vector<std::complex<double>> fftWork;           // shared scratch, convFFTSize
 
     // convFFTSize of the state currently feeding the overlap accumulators.
     // When a newly published state changes it (FIR length switch), the stale

@@ -2,6 +2,21 @@
 
 Napkid Sub EQ 的所有重要变更都将记录在此文件中。
 
+## [0.3.2] - 2026-08-12
+
+> 架构优化第一轮：把纯 DSP/几何逻辑从 JUCE 线程与 GUI 组件中抽出为无 JUCE 依赖的 seam，消除多处重复的单一事实来源，删除死代码；回归测试 27 → 88 项。
+
+### 重构
+
+- **纯 DSP 提取**：双精度 biquad 系数/状态/频响抽到 `SubEQ_Biquad.h`、RBJ 系数设计抽到 `SubEQ_BiquadDesign.h`、FIR 设计算法抽到 `SubEQ_FIRDesign.h`、overlap-add 卷积核心抽到 `SubEQ_FFTConvolver.h`（测试直击真实实现，删除了手抄镜像 `olaProcess`）；`FFTProcessor` 不再私有设计函数，音频线程访问器改为 `getPublishedStateForAudioThread`（显式线程亲和），发布锁内析构 ~2.3 MB state 移出临界区。
+- **参数/频谱单一来源**：`applyNodeValuesToEngine()` 统一「APVTS → EQNode」翻译（消除音频线程与设计/GUI 路径的重复）；`nodeParams` 下标改由 `ParamID` 派生；频谱 choice 下标→语义值映射收敛到 `SubEQ_SpectrumConfig.h` 单表；频段中心频率/Hann/校准公式收敛到 `SubEQ_SpectrumMath.h`；`FilterType` 枚举与 int↔枚举映射抽到 `SubEQ_FilterType.h`（无 JUCE）。
+- **GUI 纯逻辑提取**：坐标映射抽到 `SubEQ_CoordinateMapper.h`（freq/gain/phase 正反映射单一来源）；增益敏感类型判断与类型切换重置规则、对数 Q 步进抽到 `SubEQ_NodeInteraction.h`；节点/推子二阶弹簧积分器抽到 `SubEQ_Spring.h`。
+- **死代码删除**：`computeMaxGroupDelay` 估算器及其测试（生产侧已用解析式延迟）、`SubEQLookAndFeel.h` 遗留颜色函数、`DesignColours.h` 永不可达的 Dark 主题分支与 `setTheme/getTheme/currentTheme`。
+
+### 测试
+
+- 新增 FIR 设计（线性相位对称/幅频匹配、最小相位有限系数/零延迟/幅频匹配）、频谱数学（octave 频段/Hann/校准）、坐标映射（往返/钳位）、节点交互（8 类型敏感分类/类型切换重置/对数 Q 步进）回归。
+
 ## [0.3.1] - 2026-08-11
 
 > 后端（FIR 处理管线）全量审查-修复：prepare/epoch 生命周期、设计发布后的管线冲刷、会话切换后的自动重建。

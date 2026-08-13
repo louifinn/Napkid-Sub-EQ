@@ -9,6 +9,7 @@
 */
 
 #include "SubEQ_Spectrum.h"
+#include "SubEQ_SpectrumMath.h"
 
 namespace SubEQ
 {
@@ -34,10 +35,10 @@ SpectrumAnalyzer::SpectrumAnalyzer()
 
 void SpectrumAnalyzer::updateBandBounds (int bands)
 {
-    // Octave band centers: fc_n = MinFreq * 2^(n/octaveDiv)
-    const float octaveDiv = (bands == 121) ? 12.0f : 6.0f;
+    // Octave band centres: fc_n = MinFreq * 2^(n/octaveDiv). Single source in
+    // SubEQ_SpectrumMath.h (shared with the GUI's frequency-axis drawing).
     for (int i = 0; i < bands; ++i)
-        bandCenterFreqs[i] = MinFreq * std::pow(2.0f, static_cast<float>(i) / octaveDiv);
+        bandCenterFreqs[i] = octaveBandCenterFreq(MinFreq, i, bands);
 }
 
 void SpectrumAnalyzer::regenerateWindow()
@@ -46,7 +47,7 @@ void SpectrumAnalyzer::regenerateWindow()
     const int size = fftSize.load();
     for (int i = 0; i < size; ++i)
     {
-        window[i] = 0.5f - 0.5f * std::cos(juce::MathConstants<float>::twoPi * static_cast<float>(i) / static_cast<float>(size - 1));
+        window[i] = hannWindowValue(i, size);
     }
 }
 
@@ -134,7 +135,7 @@ void SpectrumAnalyzer::performAnalysis()
     // compensation — hence 16/N^2 instead of 1/N^2.
     const int numBins = size / 2;
     const double binSpacing = sampleRate / static_cast<double>(size);
-    const double scaleFactor = 16.0 / (static_cast<double>(size) * static_cast<double>(size));
+    const double scaleFactor = spectrumBinPowerScale(size);
 
     binPower[0] = 0.0; // DC
     for (int k = 1; k < numBins; ++k)

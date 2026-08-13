@@ -8,6 +8,7 @@
 */
 
 #include "MasterGainSlider.h"
+#include "../SubEQ_Spring.h"
 #include "DesignSystem/DesignColours.h"
 #include "DesignSystem/DesignFonts.h"
 #include "DesignSystem/DesignConstants.h"
@@ -53,9 +54,7 @@ void MasterGainSlider::timerCallback()
         constexpr float twoZetaWn = 31.416f; // 2·0.5·2π·5
 
         float targetY = getThumbCentreY();
-        float ax = wn2 * (targetY - fillPhys.y) - twoZetaWn * fillPhys.vel;
-        fillPhys.vel += ax * dt;
-        fillPhys.y += fillPhys.vel * dt;
+        SubEQ::stepSpring(fillPhys.y, fillPhys.vel, dt, targetY, wn2, twoZetaWn);
 
         float dist = std::abs(targetY - fillPhys.y);
         if (!isDragging && dist < 0.3f && std::abs(fillPhys.vel) < 0.3f)

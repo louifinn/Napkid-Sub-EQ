@@ -2,6 +2,6 @@ Builds/
 .vs/
 .reasonix/
 Tests/*.exe
-Tests/*.obj
+*.obj
 Tests/*.pdb
 /.mimosa/

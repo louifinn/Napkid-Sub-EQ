@@ -19,13 +19,11 @@ DesignLookAndFeel::DesignLookAndFeel()
 
 void DesignLookAndFeel::refreshColours()
 {
-    const bool dark = DesignColours::isDark();
     const auto bg   = DesignColours::background();
     const auto surf = DesignColours::surface();
 
     setColour(juce::ResizableWindow::backgroundColourId, bg);
-    // Buttons: brighter than the (dark) toolbar surface in both themes
-    setColour(juce::TextButton::buttonColourId, dark ? bg.brighter(0.08f) : bg);
+    setColour(juce::TextButton::buttonColourId, bg);
     setColour(juce::TextButton::buttonOnColourId, DesignColours::accent().withAlpha(0.12f));
     setColour(juce::TextButton::textColourOnId, DesignColours::accent());
     setColour(juce::TextButton::textColourOffId, DesignColours::textPrimary());

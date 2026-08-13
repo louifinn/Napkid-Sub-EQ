@@ -14,8 +14,7 @@ public:
     DesignLookAndFeel();
     ~DesignLookAndFeel() override = default;
 
-    // Re-applies all colour tokens against the current theme (call after
-    // DesignColours::setTheme so standard JUCE widgets follow the theme)
+    // Applies the current colour tokens to standard JUCE widgets.
     void refreshColours();
 
     // Override core drawing methods for matte surface + lighting

@@ -12,6 +12,7 @@
 #include "SubEQ_FFTProcessor.h"
 #include "SubEQ_DSPMath.h"
 #include "SubEQ_Parameters.h"
+#include "SubEQ_FIRDesign.h"
 
 namespace SubEQ
 {
@@ -60,13 +61,16 @@ void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
     // when a new design is published mid-stream.
     const int maxL = convolutionFftSize(MaxFirLength, ConvBlockLen);
 
-    inputBlocks.assign(numChannels, std::vector<std::complex<double>>(ConvBlockLen, { 0.0, 0.0 }));
-    inputPos.assign(numChannels, 0);
-    overlapBufs.assign(numChannels, std::vector<double>(maxL, 0.0));
-    outBufs.assign(numChannels, std::vector<double>());
-    outReadPos.assign(numChannels, 0);
-    for (auto& ob : outBufs)
-        ob.reserve(ConvBlockLen * 2);
+    channelStates.resize(numChannels);
+    for (auto& ch : channelStates)
+    {
+        ch.inputBlock.assign(ConvBlockLen, { 0.0, 0.0 });
+        ch.pos = 0;
+        ch.overlap.assign(maxL, 0.0);
+        ch.outQueue.clear();
+        ch.outQueue.reserve(ConvBlockLen * 2);
+        ch.outRead = 0;
+    }
     fftWork.assign(maxL, { 0.0, 0.0 });
     activeConvFFTSize = 0;
 
@@ -94,16 +98,14 @@ void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
 
 void FFTProcessor::reset()
 {
-    for (auto& ib : inputBlocks)
-        std::fill(ib.begin(), ib.end(), std::complex<double>(0.0, 0.0));
-    std::fill(inputPos.begin(), inputPos.end(), 0);
-
-    for (auto& ob : overlapBufs)
-        std::fill(ob.begin(), ob.end(), 0.0);
-
-    for (auto& ob : outBufs)
-        ob.clear();
-    std::fill(outReadPos.begin(), outReadPos.end(), 0);
+    for (auto& ch : channelStates)
+    {
+        std::fill(ch.inputBlock.begin(), ch.inputBlock.end(), std::complex<double>(0.0, 0.0));
+        ch.pos = 0;
+        std::fill(ch.overlap.begin(), ch.overlap.end(), 0.0);
+        ch.outQueue.clear();
+        ch.outRead = 0;
+    }
 }
 
 void FFTProcessor::setParameterSource(juce::AudioProcessorValueTreeState* source)
@@ -167,10 +169,11 @@ void FFTProcessor::run()
         auto newState = std::make_shared<FIRState>();
         newState->firLength = firLength;
 
+        auto magnitude = [&](double w) { return designEngine.getMagnitudeLinear(w); };
         if (mode == EQMode::LinearPhase)
-            designLinearPhaseFIR(designEngine, firLength, newState->coeffs, newState->groupDelay);
+            newState->coeffs = designLinearPhaseFIR(magnitude, firLength, newState->groupDelay);
         else
-            designMinimumPhaseFIR(designEngine, firLength, newState->coeffs, newState->groupDelay);
+            newState->coeffs = designMinimumPhaseFIR(magnitude, firLength, newState->groupDelay);
 
         // Pre-compute the frequency-domain filter for overlap-add convolution
         newState->convFFTSize = convolutionFftSize(firLength, ConvBlockLen);
@@ -191,17 +194,22 @@ void FFTProcessor::run()
         // The replaced state is moved into the retirement slot: its (up to
         // ~2.3 MB) destructor then runs here on the background thread instead
         // of on the audio thread at its next publication pick-up.
+        std::shared_ptr<const FIRState> previous;
         {
             std::lock_guard<std::mutex> lock(stateMutex);
+            previous = std::move(retiredState);
             retiredState = currentState;
             currentState = newState;
         }
+        // `previous` (the state retired before this publish) is destroyed here,
+        // on the background thread, outside the lock — the critical section now
+        // only swaps pointers instead of running the ~2.3 MB deallocation.
         stateVersion.fetch_add(1, std::memory_order_release);
     }
 }
 
 //==============================================================================
-std::shared_ptr<const FFTProcessor::FIRState> FFTProcessor::getPublishedState() const
+std::shared_ptr<const FFTProcessor::FIRState> FFTProcessor::getPublishedStateForAudioThread() const
 {
     // Fast path: no new publish since we last looked — zero locks.
     if (stateVersion.load(std::memory_order_acquire) != lastSeenVersion)
@@ -215,125 +223,9 @@ std::shared_ptr<const FFTProcessor::FIRState> FFTProcessor::getPublishedState() 
 }
 
 //==============================================================================
-void FFTProcessor::designLinearPhaseFIR(const EQEngine& eqEngine, int firLength,
-                                        std::vector<float>& coeffsOut, int& latencyOut)
-{
-    std::vector<std::complex<double>> spectrum(firLength);
-    const double delayPhaseFactor = -juce::MathConstants<double>::pi * (firLength - 1) / firLength;
-
-    // Step 1: magnitude response with linear phase term for strict symmetry.
-    // For even-length Type-II FIR, the Nyquist response (i = N/2) must be 0.
-    for (int i = 0; i < firLength / 2; ++i)
-    {
-        double w = juce::MathConstants<double>::pi * i / (firLength / 2);
-        double mag = eqEngine.getMagnitudeLinear(w);
-        double phase = delayPhaseFactor * i;
-        spectrum[i] = { mag * std::cos(phase), mag * std::sin(phase) };
-    }
-    spectrum[firLength / 2] = { 0.0, 0.0 }; // Type-II FIR: H(pi) = 0
-
-    // Conjugate symmetry for second half
-    for (int i = firLength / 2 + 1; i < firLength; ++i)
-    {
-        spectrum[i] = std::conj(spectrum[firLength - i]);
-    }
-
-    // Step 2: IDFT -> time-domain coefficients
-    ifftInPlace(spectrum.data(), firLength);
-
-    coeffsOut.resize(firLength);
-    float cmax = 0.0f;
-    for (int i = 0; i < firLength; ++i)
-    {
-        coeffsOut[i] = static_cast<float>(spectrum[i].real());
-        cmax = std::max(cmax, std::abs(coeffsOut[i]));
-    }
-    DBG("[SubEQ DBG] LinearPhase coeff peak=" + juce::String(cmax, 2));
-
-    latencyOut = linearPhaseLatencyFor(firLength);
-}
-
-//==============================================================================
-void FFTProcessor::designMinimumPhaseFIR(const EQEngine& eqEngine, int firLength,
-                                         std::vector<float>& coeffsOut, int& latencyOut)
-{
-    const double epsilon = 1.0e-12;
-    std::vector<std::complex<double>> spectrum(firLength);
-
-    // Step 1: log magnitude spectrum
-    for (int i = 0; i <= firLength / 2; ++i)
-    {
-        double w = juce::MathConstants<double>::pi * i / (firLength / 2);
-        double mag = eqEngine.getMagnitudeLinear(w);
-        spectrum[i] = { std::log(mag + epsilon), 0.0 };
-    }
-    for (int i = firLength / 2 + 1; i < firLength; ++i)
-    {
-        spectrum[i] = { spectrum[firLength - i].real(), 0.0 };
-    }
-
-    // Step 2: IDFT -> cepstrum
-    std::vector<std::complex<double>> cepstrum = spectrum;
-    ifftInPlace(cepstrum.data(), firLength);
-
-    // Step 3: Causalize cepstrum
-    cepstrum[0] = { cepstrum[0].real(), 0.0 };
-    for (int i = 1; i < firLength / 2; ++i)
-        cepstrum[i] = { cepstrum[i].real() * 2.0, 0.0 };
-    cepstrum[firLength / 2] = { 0.0, 0.0 };
-    for (int i = firLength / 2 + 1; i < firLength; ++i)
-        cepstrum[i] = { 0.0, 0.0 };
-
-    // Step 4: DFT -> minimum phase log spectrum
-    fftInPlace(cepstrum.data(), firLength);
-
-    // Step 5: exp() -> minimum phase complex spectrum
-    for (int i = 0; i < firLength; ++i)
-    {
-        const double re = cepstrum[i].real();
-        const double im = cepstrum[i].imag();
-        const double expRe = std::exp(re) * std::cos(im);
-        const double expIm = std::exp(re) * std::sin(im);
-        spectrum[i] = { expRe, expIm };
-    }
-
-    // Step 6: IDFT -> minimum phase FIR coefficients
-    ifftInPlace(spectrum.data(), firLength);
-
-    coeffsOut.resize(firLength);
-    bool hasInvalid = false;
-    float cmax = 0.0f;
-    for (int i = 0; i < firLength; ++i)
-    {
-        float val = static_cast<float>(spectrum[i].real());
-        if (std::isnan(val) || std::isinf(val))
-            hasInvalid = true;
-        coeffsOut[i] = val;
-        cmax = std::max(cmax, std::abs(val));
-    }
-    DBG("[SubEQ DBG] MinimumPhase coeff peak=" + juce::String(cmax, 2)
-        + " hasInvalid=" + juce::String((int)hasInvalid));
-
-    // Fallback to impulse if cepstral method produced invalid coefficients
-    if (hasInvalid)
-    {
-        std::fill(coeffsOut.begin(), coeffsOut.end(), 0.0f);
-        coeffsOut[0] = 1.0f;
-    }
-
-    // Minimum-phase PDC reports no FIR bulk delay: the cepstral design places
-    // the direct sound at tap 0, so only the overlap-add block latency applies
-    // (added by getLatencySamples). Reporting the max group delay instead
-    // over-compensated — low-frequency group-delay spikes could exceed the
-    // Linear Phase latency, making this "minimum phase" mode play EARLY
-    // against other tracks, and the value churned on every parameter edit.
-    latencyOut = 0;
-}
-
-//==============================================================================
 void FFTProcessor::process(juce::AudioBuffer<float>& buffer)
 {
-    auto state = getPublishedState();
+    auto state = getPublishedStateForAudioThread();
     if (state == nullptr || state->freqCoeffs.empty())
         return;
 
@@ -352,100 +244,31 @@ void FFTProcessor::process(juce::AudioBuffer<float>& buffer)
     const int version = stateVersion.load(std::memory_order_acquire);
     if (version != processedVersion || L != activeConvFFTSize)
     {
-        for (auto& ob : overlapBufs)
-            std::fill(ob.begin(), ob.end(), 0.0);
-        for (auto& ob : outBufs)
-            ob.clear();
-        std::fill(outReadPos.begin(), outReadPos.end(), 0);
+        for (auto& ch : channelStates)
+        {
+            std::fill(ch.overlap.begin(), ch.overlap.end(), 0.0);
+            ch.outQueue.clear();
+            ch.outRead = 0;
+        }
         activeConvFFTSize = L;
         processedVersion = version;
     }
 
-    const int channels = std::min(buffer.getNumChannels(), numChannels);
+    const int channelCount = std::min(buffer.getNumChannels(), numChannels);
+    const int numSamples = buffer.getNumSamples();
 
-    for (int ch = 0; ch < channels; ++ch)
+    for (int ch = 0; ch < channelCount; ++ch)
     {
         auto* data = buffer.getWritePointer(ch);
-        auto& inputBlock = inputBlocks[ch];
-        auto& overlap = overlapBufs[ch];
-        auto& outBuf = outBufs[ch];
-        int& pos = inputPos[ch];
-        int& outRead = outReadPos[ch];
-
-        const int numSamples = buffer.getNumSamples();
-
-        for (int n = 0; n < numSamples; ++n)
-        {
-            inputBlock[pos] = { static_cast<double> (data[n]), 0.0 };
-            ++pos;
-
-            if (pos == ConvBlockLen)
-            {
-                // ---- Overlap-add step for this input block ----
-                for (int i = 0; i < ConvBlockLen; ++i)
-                    fftWork[i] = inputBlock[i];
-                for (int i = ConvBlockLen; i < L; ++i)
-                    fftWork[i] = { 0.0, 0.0 };
-
-                fftInPlace(fftWork.data(), L);
-                for (int i = 0; i < L; ++i)
-                    fftWork[i] *= state->freqCoeffs[i];
-                ifftInPlace(fftWork.data(), L);
-
-                // Output block = Y[0..M-1] + accumulated tail
-                bool poisoned = false;
-                for (int i = 0; i < ConvBlockLen; ++i)
-                {
-                    double y = fftWork[i].real() + overlap[i];
-                    if (std::isnan(y) || std::isinf(y))
-                    {
-                        y = 0.0;
-                        poisoned = true;
-                    }
-                    outBuf.push_back(y);
-                }
-
-                if (poisoned)
-                {
-                    // NaN/Inf must not recirculate through the accumulator:
-                    // flush it so one bad block does not mute the output
-                    // until the next manual reset.
-                    std::fill(overlap.begin(), overlap.end(), 0.0);
-                }
-                else
-                {
-                    // Carry the tail into the next block: shift the accumulator
-                    // and ADD this block's tail (a convolution spans multiple
-                    // blocks, so older tails must accumulate).
-                    for (int i = 0; i < L - ConvBlockLen; ++i)
-                        overlap[i] = overlap[i + ConvBlockLen]
-                                     + fftWork[ConvBlockLen + i].real();
-                    for (int i = L - ConvBlockLen; i < L; ++i)
-                        overlap[i] = 0.0;
-                }
-
-                pos = 0;
-            }
-
-            // Drain one output sample (zero during the initial block latency)
-            if (outRead < static_cast<int>(outBuf.size()))
-                data[n] = static_cast<float>(outBuf[outRead++]);
-            else
-                data[n] = 0.0f;
-
-            if (outRead == static_cast<int>(outBuf.size()))
-            {
-                outBuf.clear();
-                outRead = 0;
-            }
-        }
+        processOlaChannel(channelStates[ch], data, data, numSamples,
+                          ConvBlockLen, L, state->freqCoeffs.data(), fftWork);
     }
 }
 
 //==============================================================================
 int FFTProcessor::getLatencySamples() const
 {
-    auto state = getPublishedState();
+    auto state = getPublishedStateForAudioThread();
     if (state == nullptr)
         return 0;
     // Overlap-add pipeline delays the output by ConvBlockLen-1 samples
@@ -455,7 +278,7 @@ int FFTProcessor::getLatencySamples() const
 
 bool FFTProcessor::isReady() const
 {
-    auto state = getPublishedState();
+    auto state = getPublishedStateForAudioThread();
     return (state != nullptr) && !state->freqCoeffs.empty();
 }
 

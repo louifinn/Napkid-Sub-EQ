@@ -9,6 +9,18 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
+namespace
+{
+    // Cache column indexes derived from SubEQ::ParamID, so the enum stays the
+    // single source of truth for parameter order (see nodeParams in
+    // PluginProcessor.h).
+    constexpr int kParamFreq    = static_cast<int> (SubEQ::ParamID::Freq);
+    constexpr int kParamGain    = static_cast<int> (SubEQ::ParamID::Gain);
+    constexpr int kParamQ       = static_cast<int> (SubEQ::ParamID::Q);
+    constexpr int kParamType    = static_cast<int> (SubEQ::ParamID::Type);
+    constexpr int kParamEnabled = static_cast<int> (SubEQ::ParamID::Enabled);
+}
+
 //==============================================================================
 SubEQAudioProcessor::SubEQAudioProcessor()
 #ifndef JucePlugin_PreferredChannelConfigurations
@@ -36,11 +48,11 @@ SubEQAudioProcessor::SubEQAudioProcessor()
 
     for (int i = 0; i < SubEQ::NumNodes; ++i)
     {
-        nodeParams[i][0] = apvts.getRawParameterValue (SubEQ::getNodeParamID (i, SubEQ::ParamID::Freq));
-        nodeParams[i][1] = apvts.getRawParameterValue (SubEQ::getNodeParamID (i, SubEQ::ParamID::Gain));
-        nodeParams[i][2] = apvts.getRawParameterValue (SubEQ::getNodeParamID (i, SubEQ::ParamID::Q));
-        nodeParams[i][3] = apvts.getRawParameterValue (SubEQ::getNodeParamID (i, SubEQ::ParamID::Type));
-        nodeParams[i][4] = apvts.getRawParameterValue (SubEQ::getNodeParamID (i, SubEQ::ParamID::Enabled));
+        nodeParams[i][kParamFreq] = apvts.getRawParameterValue (SubEQ::getNodeParamID (i, SubEQ::ParamID::Freq));
+        nodeParams[i][kParamGain] = apvts.getRawParameterValue (SubEQ::getNodeParamID (i, SubEQ::ParamID::Gain));
+        nodeParams[i][kParamQ] = apvts.getRawParameterValue (SubEQ::getNodeParamID (i, SubEQ::ParamID::Q));
+        nodeParams[i][kParamType] = apvts.getRawParameterValue (SubEQ::getNodeParamID (i, SubEQ::ParamID::Type));
+        nodeParams[i][kParamEnabled] = apvts.getRawParameterValue (SubEQ::getNodeParamID (i, SubEQ::ParamID::Enabled));
     }
 
     // Deferred PDC reporting poll (message thread) — see timerCallback
@@ -229,9 +241,9 @@ void SubEQAudioProcessor::updateEQParameters()
         spectrumDensityCache = spectrumDensity;
         spectrumHopCache = spectrumHop;
 
-        int fftOrder = spectrumFft + 12;   // 0→4096, 1→8192, 2→16384
-        int numBands = (spectrumDensity == 1) ? 121 : 61;
-        int hop = (spectrumHop == 1) ? 1024 : (spectrumHop == 2 ? 2048 : 512);
+        int fftOrder = SubEQ::spectrumFftChoiceToOrder (spectrumFft);
+        int numBands = SubEQ::spectrumDensityChoiceToBands (spectrumDensity);
+        int hop = SubEQ::spectrumHopChoiceToSamples (spectrumHop);
 
         spectrumAnalyzer.configure (fftOrder, numBands, hop);
         inputAnalyzer.configure (fftOrder, numBands, hop);
@@ -240,11 +252,11 @@ void SubEQAudioProcessor::updateEQParameters()
     // Update each node
     for (int i = 0; i < SubEQ::NumNodes; ++i)
     {
-        float freq   = nodeParams[i][0]->load();
-        float gain   = nodeParams[i][1]->load();
-        float qVal   = nodeParams[i][2]->load();
-        int type     = static_cast<int> (nodeParams[i][3]->load());
-        bool enabled = nodeParams[i][4]->load() > 0.5f;
+        float freq   = nodeParams[i][kParamFreq]->load();
+        float gain   = nodeParams[i][kParamGain]->load();
+        float qVal   = nodeParams[i][kParamQ]->load();
+        int type     = static_cast<int> (nodeParams[i][kParamType]->load());
+        bool enabled = nodeParams[i][kParamEnabled]->load() > 0.5f;
 
         auto& cache = nodeCache[i];
         // Epsilon comparison: prevents coefficient recalculation from tiny float jitter
@@ -263,16 +275,7 @@ void SubEQAudioProcessor::updateEQParameters()
             cache.type = type;
             cache.enabled = enabled;
 
-            auto& node = eqEngine.getNode (i);
-            node.setEnabled (enabled);
-
-            if (enabled)
-            {
-                node.update (static_cast<double> (freq),
-                             static_cast<double> (gain),
-                             static_cast<double> (qVal),
-                             SubEQ::intToFilterType (type));
-            }
+            SubEQ::applyNodeValuesToEngine (eqEngine, i, freq, gain, qVal, type, enabled);
 
             eqParamsChanged = true;
         }

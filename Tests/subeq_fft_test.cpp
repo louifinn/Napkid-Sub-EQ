@@ -1,12 +1,22 @@
-// Standalone regression tests for the shared DSP math in
-// Source/SubEQ_DSPMath.h (radix-2 FFT/IDFT, overlap-add convolution scheme
-// used by FFTProcessor, conservative group-delay estimator, multi-slot
-// per-size twiddle cache).
+// Standalone regression tests for the shared standalone DSP:
+//   - Source/SubEQ_DSPMath.h     (radix-2 FFT/IDFT, multi-slot twiddle cache)
+//   - Source/SubEQ_FIRDesign.h   (linear / minimum phase FIR design)
+//   - Source/SubEQ_FFTConvolver.h (the shipped overlap-add convolution core)
 // The code under test is included directly — no copy drift.
 //
 // Build (Windows, VS dev prompt):
-//   cl /EHsc /std:c++17 /O2 Tests/subeq_fft_test.cpp /Fe:Tests\subeq_fft_test.exe
+//   cl /EHsc /std:c++17 /O2 Tests/subeq_fft_test.cpp /Fo:Tests\subeq_fft_test.obj /Fe:Tests\subeq_fft_test.exe
 #include "../Source/SubEQ_DSPMath.h"
+#include "../Source/SubEQ_FIRDesign.h"
+#include "../Source/SubEQ_FFTConvolver.h"
+#include "../Source/SubEQ_SpectrumMath.h"
+#include "../Source/SubEQ_SpectrumConfig.h"
+#include "../Source/SubEQ_CoordinateMapper.h"
+#include "../Source/SubEQ_NodeInteraction.h"
+#include "../Source/SubEQ_Spring.h"
+#include "../Source/SubEQ_FilterType.h"
+#include "../Source/SubEQ_Biquad.h"
+#include "../Source/SubEQ_BiquadDesign.h"
 
 #include <complex>
 #include <vector>
@@ -58,8 +68,11 @@ static void directConv(const std::vector<double>& fir, const std::vector<double>
     }
 }
 
-// Overlap-add block convolution, mirroring FFTProcessor::process (block M=512,
-// FFT size L = nextPow2(N + M - 1), output FIFO drains one sample per input).
+// Overlap-add block convolution through the shipped primitive
+// SubEQ::processOlaChannel (block M=512, FFT size L = nextPow2(N + M - 1),
+// output FIFO drains one sample per input). This is a thin adapter around the
+// same code FFTProcessor::process runs, so the test exercises the shipped
+// convolution core instead of a hand-copied mirror.
 static void olaProcess(const std::vector<double>& fir, const std::vector<double>& input,
                        std::vector<double>& output)
 {
@@ -73,51 +86,18 @@ static void olaProcess(const std::vector<double>& fir, const std::vector<double>
         H[i] = { fir[i], 0.0 };
     fftInPlace(H.data(), L);
 
-    std::vector<double> overlap(L, 0.0);
-    std::vector<std::complex<double>> work(L);
-    std::vector<std::complex<double>> block(M);
-    int pos = 0;
-    std::vector<double> outQueue;
+    OlaChannelState st;
+    st.inputBlock.assign(M, { 0.0, 0.0 });
+    st.pos = 0;
+    st.overlap.assign(L, 0.0);
+    st.outQueue.reserve(M * 2);
+    st.outRead = 0;
 
-    for (double x : input)
-    {
-        block[pos] = { x, 0.0 };
-        ++pos;
+    std::vector<std::complex<double>> scratch(L);
 
-        if (pos == M)
-        {
-            for (int i = 0; i < M; ++i)
-                work[i] = block[i];
-            for (int i = M; i < L; ++i)
-                work[i] = { 0.0, 0.0 };
-
-            fftInPlace(work.data(), L);
-            for (int i = 0; i < L; ++i)
-                work[i] *= H[i];
-            ifftInPlace(work.data(), L);
-
-            for (int i = 0; i < M; ++i)
-                outQueue.push_back(work[i].real() + overlap[i]);
-            // Shift the accumulator and ADD this block's tail (a convolution
-            // spans multiple blocks, so older tails must accumulate).
-            for (int i = 0; i < L - M; ++i)
-                overlap[i] = overlap[i + M] + work[M + i].real();
-            for (int i = L - M; i < L; ++i)
-                overlap[i] = 0.0;
-
-            pos = 0;
-        }
-
-        if (!outQueue.empty())
-        {
-            output.push_back(outQueue.front());
-            outQueue.erase(outQueue.begin());
-        }
-        else
-        {
-            output.push_back(0.0);   // initial block latency
-        }
-    }
+    output.assign(input.size(), 0.0);
+    processOlaChannel(st, input.data(), output.data(), (int)input.size(),
+                      M, L, H.data(), scratch);
 }
 
 static int failures = 0;
@@ -249,11 +229,10 @@ int main()
         directConv(fir, input, outDirect);
 
         // Overlap-add output is delayed by M-1 samples: outOla[k] == y[k-511],
-        // valid only over complete blocks (9 blocks x 512 = 4608 samples).
+        // valid over the entire input (the final partial block still drains).
         const int M = 512;
         const int offset = M - 1;
-        const int numBlocks = (int)input.size() / M;
-        const int validEnd = numBlocks * M;
+        const int validEnd = (int)input.size();
 
         double maxErr = 0.0;
         for (int i = offset; i < validEnd; ++i)
@@ -277,8 +256,7 @@ int main()
 
         const int M = 512;
         const int offset = M - 1;
-        const int numBlocks = (int)input.size() / M;
-        const int validEnd = numBlocks * M;
+        const int validEnd = (int)input.size();
 
         double maxErr = 0.0;
         for (int i = offset; i < validEnd; ++i)
@@ -299,35 +277,15 @@ int main()
         std::vector<double> out;
         olaProcess(fir, input, out);
 
-        // Identity FIR: out[k] == input[k-511] over complete blocks
+        // Identity FIR: out[k] == input[k-511] over the entire input
         const int M = 512;
         const int offset = M - 1;
-        const int numBlocks = (int)input.size() / M;
-        const int validEnd = numBlocks * M;
+        const int validEnd = (int)input.size();
 
         double maxErr = 0.0;
         for (int i = offset; i < validEnd; ++i)
             maxErr = std::max(maxErr, std::abs(out[i] - input[i - offset]));
         check(maxErr < 1e-7, "impulse FIR = identity via overlap-add (maxErr=" + std::to_string(maxErr) + ")");
-    }
-
-    // ---- Test 7: computeMaxGroupDelay on a pure delay ----
-    {
-        const int N = 4096;
-        std::vector<float> fir(N, 0.0f);
-        const int delay = 1000;   // < N/2: unambiguous
-        fir[delay] = 1.0f;
-        int gd = computeMaxGroupDelay(fir);
-        check(gd == delay, "group delay of delta[n-1000] == 1000 (got " + std::to_string(gd) + ")");
-    }
-
-    // ---- Test 8: computeMaxGroupDelay conservative fallback ----
-    {
-        const int N = 4096;
-        std::vector<float> fir(N, 0.0f);
-        fir[3000] = 1.0f;   // > N/2: ambiguous unwrap -> conservative full length
-        int gd = computeMaxGroupDelay(fir);
-        check(gd == N - 1, "group delay of delta[n-3000] conservative == N-1 (got " + std::to_string(gd) + ")");
     }
 
     // ---- Test 9: nextPowerOfTwo / convolutionFftSize ----
@@ -396,39 +354,55 @@ int main()
         check(maxRelErr < 1e-4, "twiddle cache: float FFT matches double at N=16384 after size mixing (maxRelErr=" + std::to_string(maxRelErr) + ")");
     }
 
-    // ---- Test 11: computeMaxGroupDelay boundary cases ----
+    // ---- Test 11: linear phase FIR design ----
     {
-        // Tiny FIR: below the minimum analysable length
-        std::vector<float> tiny(2, 1.0f);
-        check(computeMaxGroupDelay(tiny) == 0, "group delay of 2-tap FIR == 0");
+        const int N = 1024;
+        int latency = -1;
+        auto target = [](double w) { return 1.0 + 0.5 * std::sin(w); };
 
-        // Gaussian-windowed symmetric FIR: perfectly linear phase with delay
-        // exactly (N-1)/2 (the response has no zeros, so no unwrap ambiguity)
-        const int N = 4096;
-        std::vector<float> gauss(N);
-        const double centre = (N - 1) / 2.0;
-        const double sigma = N / 8.0;
-        for (int i = 0; i < N; ++i)
+        auto coeffs = designLinearPhaseFIR(target, N, latency);
+        check(latency == (N - 1) / 2, "linear phase FIR latency == (N-1)/2");
+
+        bool symmetric = true;
+        for (int i = 0; i < N / 2; ++i)
+            if (std::abs(coeffs[i] - coeffs[N - 1 - i]) > 1e-5) symmetric = false;
+        check(symmetric, "linear phase FIR is symmetric");
+
+        std::vector<std::complex<double>> spec(N);
+        for (int i = 0; i < N; ++i) spec[i] = { (double)coeffs[i], 0.0 };
+        fftInPlace(spec.data(), N);
+        double maxErr = 0.0;
+        for (int i = 0; i < N / 2; ++i)   // skip Nyquist (forced 0)
         {
-            const double t = (i - centre) / sigma;
-            gauss[i] = static_cast<float>(std::exp(-0.5 * t * t));
+            const double w = kPi * i / (N / 2);
+            maxErr = std::max(maxErr, std::abs(std::abs(spec[i]) - target(w)));
         }
-        int gd = computeMaxGroupDelay(gauss);
-        check(std::abs(gd - (N - 1) / 2) <= 2,
-              "group delay of symmetric Gaussian FIR ~= (N-1)/2 (got " + std::to_string(gd) + ")");
+        check(maxErr < 1e-5, "linear phase FIR magnitude matches target (maxErr=" + std::to_string(maxErr) + ")");
+    }
 
-        // All-zero FIR: phase undefined everywhere -> conservative full length
-        std::vector<float> zero(N, 0.0f);
-        check(computeMaxGroupDelay(zero) == N - 1,
-              "group delay of all-zero FIR conservative == N-1");
+    // ---- Test 12: minimum phase FIR design ----
+    {
+        const int N = 1024;
+        int latency = -1;
+        auto target = [](double w) { return 1.0 + 0.5 * std::sin(w); };
 
-        // NaN-poisoned FIR: the estimator must never propagate NaN/inf into
-        // PDC — the result must stay inside the valid [0, N-1] range
-        std::vector<float> poison(N, 0.0f);
-        poison[10] = std::numeric_limits<float>::quiet_NaN();
-        int gdNan = computeMaxGroupDelay(poison);
-        check(gdNan >= 0 && gdNan <= N - 1,
-              "group delay of NaN FIR bounded to [0, N-1] (got " + std::to_string(gdNan) + ")");
+        auto coeffs = designMinimumPhaseFIR(target, N, latency);
+        check(latency == 0, "minimum phase FIR latency == 0");
+
+        bool finite = true;
+        for (auto c : coeffs) if (std::isnan(c) || std::isinf(c)) finite = false;
+        check(finite, "minimum phase FIR has finite coefficients");
+
+        std::vector<std::complex<double>> spec(N);
+        for (int i = 0; i < N; ++i) spec[i] = { (double)coeffs[i], 0.0 };
+        fftInPlace(spec.data(), N);
+        double maxErr = 0.0;
+        for (int i = 0; i <= N / 2; ++i)
+        {
+            const double w = kPi * i / (N / 2);
+            maxErr = std::max(maxErr, std::abs(std::abs(spec[i]) - target(w)));
+        }
+        check(maxErr < 1e-5, "minimum phase FIR magnitude matches target (maxErr=" + std::to_string(maxErr) + ")");
     }
 
     // ---- Test 12: convolutionFftSize / nextPowerOfTwo extra cases ----
@@ -440,6 +414,172 @@ int main()
         check(convolutionFftSize(512, 512) == 1024, "convFftSize(512,512) == 1024");
         check(convolutionFftSize(513, 512) == 1024, "convFftSize(513,512) == 1024");
         check(convolutionFftSize(4097, 512) == 8192, "convFftSize(4097,512) == 8192");
+    }
+
+    // ---- Test 13: spectrum math (octave bands / Hann / calibration) ----
+    {
+        check(octaveDivisorForBands(61) == 6, "octave divisor 61 bands == 6");
+        check(octaveDivisorForBands(121) == 12, "octave divisor 121 bands == 12");
+        check(std::abs(octaveBandCenterFreq(0.5f, 0, 61) - 0.5f) < 1e-6f, "octave band 0 center == 0.5 Hz");
+        check(std::abs(octaveBandCenterFreq(0.5f, 6, 61) - 1.0f) < 1e-6f, "octave band 6 (1/6 oct) == 1.0 Hz");
+        check(std::abs(octaveBandCenterFreq(0.5f, 12, 121) - 1.0f) < 1e-6f, "octave band 12 (1/12 oct) == 1.0 Hz");
+
+        const int N = 1025;   // odd: the exact centre sample lands on i=(N-1)/2
+        check(std::abs(hannWindowValue(0, N)) < 1e-6f, "hann window[0] == 0");
+        check(std::abs(hannWindowValue(N - 1, N)) < 1e-6f, "hann window[N-1] == 0");
+        check(std::abs(hannWindowValue((N - 1) / 2, N) - 1.0f) < 1e-6f, "hann window[mid] == 1");
+
+        check(std::abs(spectrumBinPowerScale(8192) - 16.0 / (8192.0 * 8192.0)) < 1e-20,
+              "spectrum bin scale == 16/N^2");
+    }
+
+    // ---- Test 14: coordinate mapper round-trips and clamping ----
+    {
+        const float left = 20.0f, width = 800.0f, bottom = 500.0f, height = 460.0f;
+
+        bool freqOk = true;
+        for (float f : { 0.5f, 1.0f, 10.0f, 100.0f, 500.0f })
+        {
+            const float x = freqToX(f, left, width);
+            const float back = xToFreq(x, left, width);
+            if (std::abs(back - f) / f > 1e-4f) freqOk = false;
+        }
+        check(freqOk, "freq<->X round-trip");
+
+        check(std::abs(xToFreq(left - 100.0f, left, width) - 0.5f) < 1e-6f, "xToFreq clamps low to 0.5 Hz");
+        check(std::abs(xToFreq(left + width + 100.0f, left, width) - 500.0f) < 1e-3f, "xToFreq clamps high to 500 Hz");
+
+        bool gainOk = true;
+        for (float g : { -24.0f, -12.0f, 0.0f, 12.0f, 24.0f })
+        {
+            const float y = gainToY(g, bottom, height);
+            const float back = yToGain(y, bottom, height);
+            if (std::abs(back - g) > 1e-3f) gainOk = false;
+        }
+        check(gainOk, "gain<->Y round-trip");
+
+        bool phaseOk = true;
+        for (float p : { -180.0f, -90.0f, 0.0f, 90.0f, 180.0f })
+        {
+            const float y = phaseToY(p, bottom, height);
+            const float back = yToPhase(y, bottom, height);
+            if (std::abs(back - p) > 1e-2f) phaseOk = false;
+        }
+        check(phaseOk, "phase<->Y round-trip");
+    }
+
+    // ---- Test 15: node interaction rules (type sensitivity / Q step) ----
+    {
+        check(isGainSensitiveTypeIndex(0), "Bell is gain-sensitive");
+        check(isGainSensitiveTypeIndex(3), "LowShelf is gain-sensitive");
+        check(isGainSensitiveTypeIndex(4), "HighShelf is gain-sensitive");
+        check(isGainSensitiveTypeIndex(6), "Tilt is gain-sensitive");
+        check(!isGainSensitiveTypeIndex(1), "HighPass is not gain-sensitive");
+        check(!isGainSensitiveTypeIndex(2), "LowPass is not gain-sensitive");
+        check(!isGainSensitiveTypeIndex(5), "Notch is not gain-sensitive");
+        check(!isGainSensitiveTypeIndex(7), "BandPass is not gain-sensitive");
+
+        check(shouldResetGainOnTypeChange(0, 1), "Bell->HighPass resets gain");
+        check(!shouldResetGainOnTypeChange(1, 0), "HighPass->Bell does not reset gain");
+        check(!shouldResetGainOnTypeChange(0, 3), "Bell->LowShelf does not reset gain");
+
+        check(std::abs(stepLogQ(1.0f, 0.30103f) - 2.0f) < 1e-3f, "stepLogQ doubles Q on +log10(2)");
+        check(std::abs(stepLogQ(100.0f, -1.0f) - 10.0f) < 1e-3f, "stepLogQ clamps high to 10");
+        check(std::abs(stepLogQ(0.1f, -1.0f) - 0.1f) < 1e-6f, "stepLogQ clamps low to 0.1");
+    }
+
+    // ---- Test 16: spring integrator converges and is deterministic ----
+    {
+        const float dt = 1.0f / 60.0f;
+        const float wn2 = 400.0f;       // omega_n = 20 rad/s
+        const float twoZetaWn = 20.0f;  // zeta = 0.5
+        const float target = 100.0f;
+
+        float pos = 0.0f, vel = 0.0f;
+        for (int i = 0; i < 600; ++i)   // 10 s is far past the settling time
+            stepSpring(pos, vel, dt, target, wn2, twoZetaWn);
+
+        check(std::abs(pos - target) < 0.01f, "spring converges to target");
+
+        // A single step toward a lower target moves position down (no NaN/overshoot explosion)
+        pos = 100.0f; vel = 0.0f;
+        stepSpring(pos, vel, dt, 0.0f, wn2, twoZetaWn);
+        check(pos < 100.0f && std::isfinite(pos), "spring moves toward lower target");
+    }
+
+    // ---- Test 17: FilterType <-> choice-index mapping ----
+    {
+        bool roundTrip = true;
+        for (int i = 0; i <= 7; ++i)
+            if (filterTypeToInt(intToFilterType(i)) != i) roundTrip = false;
+        check(roundTrip, "FilterType<->int round-trip for all 8 types");
+
+        check(intToFilterType(-1) == FilterType::Bell, "intToFilterType(-1) falls back to Bell");
+        check(intToFilterType(99) == FilterType::Bell, "intToFilterType(99) falls back to Bell");
+        check(filterTypeToInt(FilterType::BandPass) == 7, "BandPass -> index 7");
+    }
+
+    // ---- Test 18: spectrum choice-index decoders ----
+    {
+        check(spectrumFftChoiceToOrder(0) == 12, "fft choice 0 -> order 12 (4096)");
+        check(spectrumFftChoiceToOrder(1) == 13, "fft choice 1 -> order 13 (8192)");
+        check(spectrumFftChoiceToOrder(2) == 14, "fft choice 2 -> order 14 (16384)");
+        check(spectrumDensityChoiceToBands(0) == 61, "density choice 0 -> 61 bands");
+        check(spectrumDensityChoiceToBands(1) == 121, "density choice 1 -> 121 bands");
+        check(spectrumHopChoiceToSamples(0) == 512, "hop choice 0 -> 512");
+        check(spectrumHopChoiceToSamples(1) == 1024, "hop choice 1 -> 1024");
+        check(spectrumHopChoiceToSamples(2) == 2048, "hop choice 2 -> 2048");
+        check(spectrumRefreshChoiceToHz(0) == 15, "refresh choice 0 -> 15 Hz");
+        check(spectrumRefreshChoiceToHz(1) == 30, "refresh choice 1 -> 30 Hz");
+        check(spectrumRefreshChoiceToHz(2) == 60, "refresh choice 2 -> 60 Hz");
+        check(spectrumFftChoiceToOrder(99) == 13, "fft choice invalid -> order 13");
+        check(spectrumDensityChoiceToBands(99) == 61, "density choice invalid -> 61");
+        check(spectrumHopChoiceToSamples(99) == 512, "hop choice invalid -> 512");
+        check(spectrumRefreshChoiceToHz(99) == 30, "refresh choice invalid -> 30 Hz");
+    }
+
+    // ---- Test 19: biquad coefficients / state / response ----
+    {
+        BiquadCoefficients ident;   // defaults: b0=1, everything else 0
+        check(ident.isStable(), "identity biquad is stable");
+
+        const std::complex<double> one(1.0, 0.0);
+        check(std::abs(biquadResponse(ident, 0.0) - one) < 1e-12, "identity response at DC == 1");
+        check(std::abs(biquadResponse(ident, 3.14159265358979323846) - one) < 1e-12, "identity response at Nyquist == 1");
+
+        BiquadState st;
+        check(std::abs(st.process(0.5, ident) - 0.5) < 1e-12, "identity biquad passes a sample through");
+
+        BiquadCoefficients unstable;
+        unstable.a2 = 1.5;
+        check(!unstable.isStable(), "a2=1.5 is unstable");
+        unstable.forceStable();
+        check(unstable.isStable(), "forceStable corrects unstable coefficients");
+    }
+
+    // ---- Test 20: biquad coefficient design invariants ----
+    {
+        const double sr = 48000.0;
+        BiquadCoefficients coeffs[2];
+        const std::complex<double> one(1.0, 0.0);
+
+        // Bell at 0 dB gain is a unity transfer function (b0=1 and b1=a1, b2=a2).
+        int n = computeBiquadCoefficients(1000.0, 0.0, 0.707, FilterType::Bell, sr, coeffs);
+        check(n == 1, "Bell uses 1 biquad");
+        bool bellUnity = true;
+        for (double w : { 0.0, 0.5, 1.0, 2.0, 3.0 })
+            if (std::abs(biquadResponse(coeffs[0], w) - one) > 1e-6) bellUnity = false;
+        check(bellUnity, "Bell @ 0 dB is unity across frequencies");
+
+        // LowPass at a low cutoff: DC gain ~1, Nyquist gain ~0.
+        n = computeBiquadCoefficients(100.0, 0.0, 0.707, FilterType::LowPass, sr, coeffs);
+        check(n == 1, "LowPass uses 1 biquad");
+        check(std::abs(std::abs(biquadResponse(coeffs[0], 0.0)) - 1.0) < 1e-6, "LowPass DC gain ~1");
+        check(std::abs(biquadResponse(coeffs[0], 3.14159265358979323846)) < 1e-3, "LowPass Nyquist gain ~0");
+
+        // Tilt cascades two biquads.
+        n = computeBiquadCoefficients(100.0, 6.0, 0.707, FilterType::Tilt, sr, coeffs);
+        check(n == 2, "Tilt uses 2 biquads");
     }
 
     if (failures == 0)
