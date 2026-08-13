@@ -34,7 +34,7 @@ constexpr double kPi = 3.14159265358979323846;
 // with a linear phase term so the time-domain impulse is symmetric.
 // Latency = (firLength - 1) / 2.
 template <typename MagnitudeFn>
-inline std::vector<float> designLinearPhaseFIR(MagnitudeFn magnitude, int firLength, int& latencyOut)
+inline std::vector<double> designLinearPhaseFIR(MagnitudeFn magnitude, int firLength, int& latencyOut)
 {
     std::vector<std::complex<double>> spectrum(firLength);
     const double delayPhaseFactor = -kPi * (firLength - 1) / firLength;
@@ -57,9 +57,9 @@ inline std::vector<float> designLinearPhaseFIR(MagnitudeFn magnitude, int firLen
     // Step 2: IDFT -> time-domain coefficients
     ifftInPlace(spectrum.data(), firLength);
 
-    std::vector<float> coeffsOut(firLength);
+    std::vector<double> coeffsOut(firLength);   // double 抽头：与 DSP 精度约定一致
     for (int i = 0; i < firLength; ++i)
-        coeffsOut[i] = static_cast<float>(spectrum[i].real());
+        coeffsOut[i] = spectrum[i].real();
 
     latencyOut = (firLength - 1) / 2;
     return coeffsOut;
@@ -69,7 +69,7 @@ inline std::vector<float> designLinearPhaseFIR(MagnitudeFn magnitude, int firLen
 // causalised cepstrum -> exp -> minimum-phase complex spectrum -> IDFT.
 // The direct sound lands at tap 0, so no FIR bulk delay is reported.
 template <typename MagnitudeFn>
-inline std::vector<float> designMinimumPhaseFIR(MagnitudeFn magnitude, int firLength, int& latencyOut)
+inline std::vector<double> designMinimumPhaseFIR(MagnitudeFn magnitude, int firLength, int& latencyOut)
 {
     const double epsilon = 1.0e-12;
     std::vector<std::complex<double>> spectrum(firLength);
@@ -92,7 +92,7 @@ inline std::vector<float> designMinimumPhaseFIR(MagnitudeFn magnitude, int firLe
     cepstrum[0] = { cepstrum[0].real(), 0.0 };
     for (int i = 1; i < firLength / 2; ++i)
         cepstrum[i] = { cepstrum[i].real() * 2.0, 0.0 };
-    cepstrum[firLength / 2] = { 0.0, 0.0 };
+    cepstrum[firLength / 2] = { cepstrum[firLength / 2].real(), 0.0 };   // 折叠窗在 Nyquist 项取 1（保留）
     for (int i = firLength / 2 + 1; i < firLength; ++i)
         cepstrum[i] = { 0.0, 0.0 };
 
@@ -110,11 +110,11 @@ inline std::vector<float> designMinimumPhaseFIR(MagnitudeFn magnitude, int firLe
     // Step 6: IDFT -> minimum-phase FIR coefficients
     ifftInPlace(spectrum.data(), firLength);
 
-    std::vector<float> coeffsOut(firLength);
+    std::vector<double> coeffsOut(firLength);   // double 抽头：与 DSP 精度约定一致
     bool hasInvalid = false;
     for (int i = 0; i < firLength; ++i)
     {
-        const float val = static_cast<float>(spectrum[i].real());
+        const double val = spectrum[i].real();
         if (std::isnan(val) || std::isinf(val))
             hasInvalid = true;
         coeffsOut[i] = val;
@@ -123,8 +123,8 @@ inline std::vector<float> designMinimumPhaseFIR(MagnitudeFn magnitude, int firLe
     // Fallback to impulse if the cepstral method produced invalid coefficients
     if (hasInvalid)
     {
-        std::fill(coeffsOut.begin(), coeffsOut.end(), 0.0f);
-        coeffsOut[0] = 1.0f;
+        std::fill(coeffsOut.begin(), coeffsOut.end(), 0.0);
+        coeffsOut[0] = 1.0;
     }
 
     latencyOut = 0;

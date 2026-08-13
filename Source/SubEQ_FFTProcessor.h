@@ -48,6 +48,13 @@ public:
     void prepare(double sampleRate, int maxBlockSize, int numChannels);
     void reset();
 
+    // Drop the published design without destroying it here: used when
+    // (re-)entering a FIR mode, so the audio thread outputs silence until
+    // the next design is published instead of serving a stale curve.
+    // Audio-thread safe — pointer moves under the lock only; destruction
+    // happens on the background thread via the retirement ring.
+    void clearPublishedState();
+
     // Provide the parameter source used by the background thread to build the
     // design-time EQ engine snapshot (apvts must outlive this processor).
     void setParameterSource(juce::AudioProcessorValueTreeState* source);
@@ -78,7 +85,7 @@ private:
     // audio thread). Immutable once published — safe to share.
     struct FIRState
     {
-        std::vector<float> coeffs;                       // time-domain, firLength taps
+        std::vector<double> coeffs;                      // time-domain, firLength taps (double: DSP 约定)
         std::vector<std::complex<double>> freqCoeffs;    // FFT(h) over convFFTSize (double)
         int firLength = DefaultFirLength;
         int convFFTSize = 0;
@@ -100,10 +107,15 @@ private:
     mutable std::shared_ptr<const FIRState> localState;          // audio-thread cache
     mutable int lastSeenVersion = 0;                             // audio-thread cache
 
-    // Background-thread retirement slot: holds the previously published state
-    // so its (up to ~2.3 MB) destructor runs on the background thread, not on
-    // the audio thread when it drops its last reference.
-    std::shared_ptr<const FIRState> retiredState;
+    // Retirement ring (guarded by stateMutex): the audio thread hands each
+    // superseded state here instead of destroying it, and the background
+    // thread drains the slots at the top of its loop — so no large
+    // (~2.3 MB) FIRState deallocation ever runs on the audio thread. The
+    // ring is large enough that a publish burst between two background
+    // drains cannot realistically overflow it.
+    static constexpr int NumRetireSlots = 64;
+    mutable std::shared_ptr<const FIRState> pendingDestroy[NumRetireSlots];
+    mutable int pendingDestroyHead = 0;               // audio-thread append index
 
     // Bumped by prepare(); a design started before the latest prepare is
     // stale (e.g. wrong sample rate) and must not be published.
@@ -123,17 +135,24 @@ private:
     std::vector<std::complex<double>> fftWork;           // shared scratch, convFFTSize
 
     // convFFTSize of the state currently feeding the overlap accumulators.
-    // When a newly published state changes it (FIR length switch), the stale
-    // tails must be flushed — they are laid out for the old size and would
-    // otherwise revive old audio as echoes.
     int activeConvFFTSize = 0;
 
-    // stateVersion of the design the overlap/output FIFOs were last flushed
-    // for (audio thread only). A newly published design — parameter edit, FIR
-    // length or mode change — invalidates both the accumulated convolution
-    // tail and the pending output FIFO (old-filter audio), so process() drops
-    // them on the first block it sees the new version.
+    // stateVersion of the design last seen by process() (audio thread). A
+    // newly published design — parameter edit, FIR length or mode change —
+    // starts a short crossfade from the previous design instead of flushing
+    // the accumulators: the old filter's tail fades out over CrossfadeLen
+    // samples while the new filter fades in, so parameter edits no longer
+    // produce an output step.
     int processedVersion = 0;
+
+    // Crossfade state (audio thread only).
+    static constexpr int CrossfadeLen = 1024;               // ≈ 21 ms @ 48 kHz
+    std::vector<OlaChannelState> oldChannelStates;          // 旧设计的累加器/FIFO
+    std::shared_ptr<const FIRState> oldState;               // 淡化期间钉住旧设计
+    std::shared_ptr<const FIRState> processingState;        // 上一块实际使用的设计
+    int fadeConvFFTSize = 0;                                // 旧设计的 convFFTSize
+    int crossfadeRemaining = 0;                             // 剩余淡化样本数（跨声道共享）
+    juce::AudioBuffer<float> xfadeOld, xfadeNew;            // 淡化混合的整块临时缓冲
 
     std::atomic<double> sampleRate { 48000.0 };   // written by audio thread, read by bg thread
     double preparedSampleRate = 0.0;              // audio thread: sr of the last full prepare

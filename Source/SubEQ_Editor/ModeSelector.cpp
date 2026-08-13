@@ -95,20 +95,13 @@ ModeSelector::ModeSelector (juce::AudioProcessorValueTreeState& apvtsRef)
     latencyLabel.setJustificationType (juce::Justification::centred);
     addAndMakeVisible (latencyLabel);
 
-    modeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
-        apvts, "eq_mode", modeBox);
-
-    firLengthAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
-        apvts, "fir_length", firLengthBox);
-
-    fftSizeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
-        apvts, "spectrum_fft_size", fftSizeBox);
-    densityAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
-        apvts, "spectrum_band_density", densityBox);
-    refreshAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
-        apvts, "spectrum_refresh_rate", refreshBox);
-    hopAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
-        apvts, "spectrum_hop_size", hopBox);
+    // 手工 APVTS 同步（见 .h 注释）：初始同步 + 监听 + onChange 回写。
+    attachChoice ("eq_mode", modeBox);
+    attachChoice ("fir_length", firLengthBox);
+    attachChoice ("spectrum_fft_size", fftSizeBox);
+    attachChoice ("spectrum_band_density", densityBox);
+    attachChoice ("spectrum_refresh_rate", refreshBox);
+    attachChoice ("spectrum_hop_size", hopBox);
 
     startTimerHz (10); // 100ms refresh
 }
@@ -116,6 +109,55 @@ ModeSelector::ModeSelector (juce::AudioProcessorValueTreeState& apvtsRef)
 ModeSelector::~ModeSelector()
 {
     stopTimer();
+    apvts.removeParameterListener ("eq_mode", this);
+    apvts.removeParameterListener ("fir_length", this);
+    apvts.removeParameterListener ("spectrum_fft_size", this);
+    apvts.removeParameterListener ("spectrum_band_density", this);
+    apvts.removeParameterListener ("spectrum_refresh_rate", this);
+    apvts.removeParameterListener ("spectrum_hop_size", this);
+}
+
+//==============================================================================
+// 手工 APVTS 同步（替代 ComboBoxAttachment）
+//==============================================================================
+
+void ModeSelector::attachChoice (const juce::String& parameterID, juce::ComboBox& box)
+{
+    if (auto* raw = apvts.getRawParameterValue (parameterID))
+        box.setSelectedItemIndex (juce::roundToInt (raw->load()), juce::dontSendNotification);
+
+    apvts.addParameterListener (parameterID, this);
+
+    box.onChange = [this, parameterID, &box]
+    {
+        if (auto* p = apvts.getParameter (parameterID))
+            p->setValueNotifyingHost (p->convertTo0to1 (static_cast<float> (box.getSelectedItemIndex())));
+    };
+}
+
+void ModeSelector::parameterChanged (const juce::String& parameterID, float newValue)
+{
+    // 该回调可能在音频线程执行（宿主自动化同步派发 APVTS 监听器）：ComboBox
+    // 更新必须推迟到消息线程执行。
+    juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<ModeSelector> (this), parameterID, newValue]
+    {
+        if (safe == nullptr)
+            return;
+
+        if (auto* box = safe->boxForParameter (parameterID))
+            box->setSelectedItemIndex (juce::roundToInt (newValue), juce::dontSendNotification);
+    });
+}
+
+juce::ComboBox* ModeSelector::boxForParameter (const juce::String& parameterID)
+{
+    if (parameterID == "eq_mode")               return &modeBox;
+    if (parameterID == "fir_length")            return &firLengthBox;
+    if (parameterID == "spectrum_fft_size")     return &fftSizeBox;
+    if (parameterID == "spectrum_band_density") return &densityBox;
+    if (parameterID == "spectrum_refresh_rate") return &refreshBox;
+    if (parameterID == "spectrum_hop_size")     return &hopBox;
+    return nullptr;
 }
 
 void ModeSelector::timerCallback()

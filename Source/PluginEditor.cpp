@@ -39,6 +39,9 @@ SubEQAudioProcessorEditor::SubEQAudioProcessorEditor (SubEQAudioProcessor& p)
     addAndMakeVisible (masterGainSlider);
     addAndMakeVisible (modeSelector);
 
+    // 频谱分析门控：编辑器存在期间才运行（音频线程读取编辑器计数）。
+    audioProcessor.spectrumEditorOpened();
+
     modeSelector.setLatencyProvider ([this]() -> juce::String
     {
         return SubEQ::FFTProcessor::getLatencyText (
@@ -49,6 +52,8 @@ SubEQAudioProcessorEditor::SubEQAudioProcessorEditor (SubEQAudioProcessor& p)
 
 SubEQAudioProcessorEditor::~SubEQAudioProcessorEditor()
 {
+    audioProcessor.spectrumEditorClosed();
+
    #if JucePlugin_IsStandalone
     // Restore the JUCE built-in default LookAndFeel (no dangling pointers)
     juce::LookAndFeel::setDefaultLookAndFeel (nullptr);

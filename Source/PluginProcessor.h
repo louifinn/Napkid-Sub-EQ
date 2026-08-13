@@ -76,6 +76,12 @@ public:
     SubEQ::EQMode getCurrentMode() const { return static_cast<SubEQ::EQMode> (currentMode.load()); }
     int getCurrentLatencySamples() const { return reportedLatency.load(); }
 
+    // 频谱分析门控（GUI 线程计数、音频线程读取）：至少一个编辑器存在时才
+    // 运行分析，避免无 GUI 时持续消耗音频线程 CPU；引用计数保证多编辑器
+    // 并存时不会因其中一个关闭而误停分析。
+    void spectrumEditorOpened() noexcept { spectrumEditorCount.fetch_add (1); }
+    void spectrumEditorClosed() noexcept { spectrumEditorCount.fetch_sub (1); }
+
 private:
     // juce::Timer (message thread, 10 Hz): deferred latency (PDC) reporting.
     // setLatencySamples() -> updateHostDisplay() allocates and takes the
@@ -126,6 +132,7 @@ private:
     std::atomic<float>* nodeParams[SubEQ::NumNodes][5] = {};
     std::atomic<int> reportedLatency { 0 };
     std::atomic<int> currentMode { static_cast<int> (SubEQ::EQMode::ZeroLatency) };
+    std::atomic<int> spectrumEditorCount { 0 };   // 存活的编辑器数
     std::atomic<bool> latencyDirty { false };   // audio thread -> timer: report PDC
     bool modeChanged = false;
     bool eqParamsChanged = false;

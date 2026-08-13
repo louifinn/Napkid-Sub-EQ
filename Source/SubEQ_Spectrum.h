@@ -48,10 +48,11 @@ public:
     // Push audio samples (called from audio thread)
     void process(const float* samples, int numSamples);
 
-    // Copy spectrum data to output buffer (called from GUI thread).
-    // Returns the band count of THIS snapshot — read atomically together with
-    // the data so a mid-copy reconfiguration cannot tear the frame (no
-    // "new band count + old data" mismatches).
+    // Copy spectrum data to output buffer (called from GUI thread). Band
+    // count and data are read element-wise through atomics (no data race /
+    // UB), but they are separate atomics: a reconfiguration landing exactly
+    // inside the copy window can produce one frame of mixed old/new data
+    // (self-heals on the next refresh).
     int getSpectrum(float* outputBands) const;
 
 private:

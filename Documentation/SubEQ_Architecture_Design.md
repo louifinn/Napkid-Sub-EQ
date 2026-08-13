@@ -55,7 +55,7 @@ NormalizedRange(0.5f, 500.0f, 0.0f, 0.5f) // skew=0.5 实现近似对数刻度
 | 倾斜 | Tilt | 2（级联） | 整体频响倾斜 |
 | 带通 | BandPass | 1 | 只保留特定频段 |
 
-> **Tilt 实现**: LowShelf(A) + HighShelf(1/A) 两个 Biquad 级联，等效于整体频响绕中心频率倾斜。
+> **Tilt 实现**: LowShelf(gain/2) + HighShelf(−gain/2) 两个 Biquad 级联，等效于整体频响绕中心频率倾斜。
 
 ### 3.2 双精度 Biquad 实现
 
@@ -267,6 +267,8 @@ Source/
 | 实时频谱 | **1/6 或 1/12 倍频程**（61/121 频段），可配 FFT 大小/hop/刷新率 |
 | ASIO 支持 | **已添加**，Standalone 版本可用 |
 | 处理模式 | **三种全局模式**（Zero Latency / Minimum Phase / Linear Phase）+ FIR 长度可选（4096 / 16384 / 65536） |
+
+> **FIR 实现注记**：三种 FIR 长度均为偶数（Type-II 对称），Nyquist 处固有零点；线性相位群延迟 (N-1)/2 含 0.5 样本按整数截断（不可闻）。新设计发布时新旧滤波器经 1024 样本交叉淡化，参数编辑不再冲刷卷积尾（无输出阶跃）；最小相位 FIR 由倒谱法设计（保留 Nyquist 折叠项），双精度抽头。
 
 ---
 

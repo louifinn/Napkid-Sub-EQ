@@ -1,11 +1,19 @@
-// Standalone regression tests for the shared standalone DSP:
-//   - Source/SubEQ_DSPMath.h     (radix-2 FFT/IDFT, multi-slot twiddle cache)
-//   - Source/SubEQ_FIRDesign.h   (linear / minimum phase FIR design)
-//   - Source/SubEQ_FFTConvolver.h (the shipped overlap-add convolution core)
-// The code under test is included directly — no copy drift.
+// Standalone regression tests for the shared standalone DSP (11 header-only
+// modules, included directly — no copy drift):
+//   - Source/SubEQ_DSPMath.h          (radix-2 FFT/IDFT, multi-slot twiddle cache)
+//   - Source/SubEQ_FIRDesign.h        (linear / minimum phase FIR design)
+//   - Source/SubEQ_FFTConvolver.h     (the shipped overlap-add convolution core)
+//   - Source/SubEQ_Biquad.h           (double-precision biquad coeffs/state/response)
+//   - Source/SubEQ_BiquadDesign.h     (RBJ coefficient design)
+//   - Source/SubEQ_SpectrumMath.h     (octave bands / Hann / bin calibration)
+//   - Source/SubEQ_SpectrumConfig.h   (spectrum choice-index decoders)
+//   - Source/SubEQ_CoordinateMapper.h (response-plot coordinate mapping)
+//   - Source/SubEQ_NodeInteraction.h  (gain sensitivity / type-switch / Q rules)
+//   - Source/SubEQ_Spring.h           (underdamped spring integrator)
+//   - Source/SubEQ_FilterType.h       (FilterType enum <-> int mapping)
 //
-// Build (Windows, VS dev prompt):
-//   cl /EHsc /std:c++17 /O2 Tests/subeq_fft_test.cpp /Fo:Tests\subeq_fft_test.obj /Fe:Tests\subeq_fft_test.exe
+// Build (Windows, VS dev prompt; /utf-8 for the non-ASCII comments):
+//   cl /EHsc /std:c++17 /O2 /utf-8 Tests/subeq_fft_test.cpp /Fo:Tests\subeq_fft_test.obj /Fe:Tests\subeq_fft_test.exe
 #include "../Source/SubEQ_DSPMath.h"
 #include "../Source/SubEQ_FIRDesign.h"
 #include "../Source/SubEQ_FFTConvolver.h"
@@ -178,7 +186,7 @@ int main()
         check(maxRelErr < 1e-4, "float FFT matches double FFT N=8192 (maxRelErr=" + std::to_string(maxRelErr) + ")");
     }
 
-    // ---- Test 3b: small-N specialization paths (len=2 / len=4 stages) ----
+    // ---- Test 3: small-N specialization paths (len=2 / len=4 stages) ----
     {
         std::mt19937 rng(31);
         std::uniform_real_distribution<double> dist(-1.0, 1.0);
@@ -199,7 +207,7 @@ int main()
         }
     }
 
-    // ---- Test 3: FFT vs direct DFT at N=64 ----
+    // ---- Test 4: FFT vs direct DFT at N=64 ----
     {
         std::mt19937 rng(7);
         std::uniform_real_distribution<double> dist(-1.0, 1.0);
@@ -214,7 +222,7 @@ int main()
         check(maxErr < 1e-9, "FFT vs direct DFT N=64 (maxErr=" + std::to_string(maxErr) + ")");
     }
 
-    // ---- Test 4: overlap-add convolution == direct convolution (N=4096) ----
+    // ---- Test 5: overlap-add convolution == direct convolution (N=4096) ----
     {
         std::mt19937 rng(123);
         std::uniform_real_distribution<double> dist(-1.0, 1.0);
@@ -240,7 +248,40 @@ int main()
         check(maxErr < 1e-6, "overlap-add == direct convolution N=4096 (maxErr=" + std::to_string(maxErr) + ")");
     }
 
-    // ---- Test 5: overlap-add with long FIR (N=16384) ----
+    // ---- Test 5b: NaN/Inf poisoning flushes the accumulator (containment) ----
+    {
+        const int M = 512, L = 1024;
+        OlaChannelState st;
+        st.inputBlock.assign(M, { 0.0, 0.0 });
+        st.pos = 0;
+        st.overlap.assign(L, 0.0);
+        st.outQueue.reserve(M * 2);
+        st.outRead = 0;
+
+        std::vector<std::complex<double>> h(L, { 0.0, 0.0 });
+        h[0] = { 1.0, 0.0 };   // identity filter
+        std::vector<std::complex<double>> scratch(L);
+        std::vector<double> in(M * 4, 1.0), out(M * 4, 0.0);
+
+        // 预跑一整块建立非零卷积尾
+        processOlaChannel(st, in.data(), out.data(), M, M, L, h.data(), scratch);
+
+        // 注入 NaN：毒化分支应把该块输出置零并冲刷累加器
+        in[0] = std::numeric_limits<double>::quiet_NaN();
+        processOlaChannel(st, in.data(), out.data(), M, M, L, h.data(), scratch);
+        bool finite = true;
+        for (double v : out) if (std::isnan(v) || std::isinf(v)) finite = false;
+        check(finite, "NaN-poisoned overlap-add output stays finite");
+
+        // 后续正常输入不再被污染
+        std::fill(in.begin(), in.end(), 1.0);
+        processOlaChannel(st, in.data(), out.data(), M, M, L, h.data(), scratch);
+        bool finite2 = true;
+        for (double v : out) if (std::isnan(v) || std::isinf(v)) finite2 = false;
+        check(finite2, "overlap-add recovers after NaN poisoning");
+    }
+
+    // ---- Test 6: overlap-add with long FIR (N=16384) ----
     {
         std::mt19937 rng(5);
         std::uniform_real_distribution<double> dist(-1.0, 1.0);
@@ -264,7 +305,7 @@ int main()
         check(maxErr < 1e-6, "overlap-add == direct convolution N=16384 (maxErr=" + std::to_string(maxErr) + ")");
     }
 
-    // ---- Test 6: impulse FIR reproduces input after block latency ----
+    // ---- Test 7: impulse FIR reproduces input after block latency ----
     {
         std::mt19937 rng(99);
         std::uniform_real_distribution<double> dist(-1.0, 1.0);
@@ -288,7 +329,7 @@ int main()
         check(maxErr < 1e-7, "impulse FIR = identity via overlap-add (maxErr=" + std::to_string(maxErr) + ")");
     }
 
-    // ---- Test 9: nextPowerOfTwo / convolutionFftSize ----
+    // ---- Test 8: nextPowerOfTwo / convolutionFftSize ----
     {
         check(nextPowerOfTwo(4096) == 4096, "nextPow2(4096) == 4096");
         check(convolutionFftSize(4096, 512) == 8192, "convFftSize(4096,512) == 8192");
@@ -296,7 +337,7 @@ int main()
         check(convolutionFftSize(16384, 512) == 32768, "convFftSize(16384,512) == 32768");
     }
 
-    // ---- Test 10: multi-slot twiddle cache — alternating sizes stay correct ----
+    // ---- Test 9: multi-slot twiddle cache — alternating sizes stay correct ----
     {
         std::mt19937 rng(77);
         std::uniform_real_distribution<double> dist(-1.0, 1.0);
@@ -354,7 +395,7 @@ int main()
         check(maxRelErr < 1e-4, "twiddle cache: float FFT matches double at N=16384 after size mixing (maxRelErr=" + std::to_string(maxRelErr) + ")");
     }
 
-    // ---- Test 11: linear phase FIR design ----
+    // ---- Test 10: linear phase FIR design ----
     {
         const int N = 1024;
         int latency = -1;
@@ -380,7 +421,7 @@ int main()
         check(maxErr < 1e-5, "linear phase FIR magnitude matches target (maxErr=" + std::to_string(maxErr) + ")");
     }
 
-    // ---- Test 12: minimum phase FIR design ----
+    // ---- Test 11: minimum phase FIR design ----
     {
         const int N = 1024;
         int latency = -1;
@@ -403,6 +444,24 @@ int main()
             maxErr = std::max(maxErr, std::abs(std::abs(spec[i]) - target(w)));
         }
         check(maxErr < 1e-5, "minimum phase FIR magnitude matches target (maxErr=" + std::to_string(maxErr) + ")");
+
+        // 回归保护倒谱因果化的 Nyquist 折叠项（c[N/2] 必须保留而非置零）：
+        // 用 Nyquist 处增益明显非 1 的目标验证 Nyquist 幅频仍贴合目标。
+        auto targetNy = [](double w) { return 0.5 + 1.5 * (w / kPi); };
+        auto coeffsNy = designMinimumPhaseFIR(targetNy, N, latency);
+        std::vector<std::complex<double>> specNy(N);
+        for (int i = 0; i < N; ++i) specNy[i] = { (double)coeffsNy[i], 0.0 };
+        fftInPlace(specNy.data(), N);
+        double nyqErr = std::abs(std::abs(specNy[N / 2]) - targetNy(kPi));
+        check(nyqErr < 1e-5, "minimum phase FIR matches Nyquist-stressed target at Nyquist (err=" + std::to_string(nyqErr) + ")");
+
+        // 幅值回调返回 NaN 时（倒谱法失效）应回退为冲激，而不是输出 NaN 系数。
+        auto badTarget = [](double) { return std::numeric_limits<double>::quiet_NaN(); };
+        auto fallback = designMinimumPhaseFIR(badTarget, 256, latency);
+        bool isImpulse = std::abs(fallback[0] - 1.0) < 1e-12;
+        for (int i = 1; i < 256; ++i)
+            if (std::abs(fallback[i]) > 1e-12) isImpulse = false;
+        check(isImpulse, "minimum phase FIR falls back to impulse for invalid magnitude");
     }
 
     // ---- Test 12: convolutionFftSize / nextPowerOfTwo extra cases ----
@@ -555,6 +614,16 @@ int main()
         check(!unstable.isStable(), "a2=1.5 is unstable");
         unstable.forceStable();
         check(unstable.isStable(), "forceStable corrects unstable coefficients");
+
+        // forceStable 其余分支：a2 <= -1 与 |a1| >= 1 + a2
+        BiquadCoefficients c2;
+        c2.a1 = 0.0; c2.a2 = -1.5;
+        c2.forceStable();
+        check(c2.isStable() && c2.a2 > -1.0, "forceStable corrects a2 <= -1.0");
+        BiquadCoefficients c3;
+        c3.a1 = 2.5; c3.a2 = 0.5;
+        c3.forceStable();
+        check(c3.isStable(), "forceStable corrects |a1| >= 1 + a2");
     }
 
     // ---- Test 20: biquad coefficient design invariants ----
@@ -580,6 +649,20 @@ int main()
         // Tilt cascades two biquads.
         n = computeBiquadCoefficients(100.0, 6.0, 0.707, FilterType::Tilt, sr, coeffs);
         check(n == 2, "Tilt uses 2 biquads");
+
+        // BandPass 非增益敏感（与 SubEQ_NodeInteraction.h 的分类一致）：gain
+        // 参数不得缩放通带峰值——0 dB 与 +12 dB 应得到完全相同的系数。
+        BiquadCoefficients bp0[2], bp12[2];
+        computeBiquadCoefficients(200.0, 0.0, 1.0, FilterType::BandPass, sr, bp0);
+        computeBiquadCoefficients(200.0, 12.0, 1.0, FilterType::BandPass, sr, bp12);
+        bool bpGainInsensitive = std::abs(bp0[0].b0 - bp12[0].b0) < 1e-15
+                              && std::abs(bp0[0].b1 - bp12[0].b1) < 1e-15
+                              && std::abs(bp0[0].b2 - bp12[0].b2) < 1e-15;
+        check(bpGainInsensitive, "BandPass ignores gain parameter");
+
+        // 标准 RBJ 带通中心增益 = 0 dB。
+        const double wc = kTwoPi * 200.0 / sr;
+        check(std::abs(std::abs(biquadResponse(bp0[0], wc)) - 1.0) < 1e-9, "BandPass center gain == 0 dB");
     }
 
     if (failures == 0)

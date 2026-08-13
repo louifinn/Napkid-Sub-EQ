@@ -38,7 +38,14 @@ MasterGainSlider::~MasterGainSlider()
 void MasterGainSlider::parameterChanged(const juce::String& parameterID, float newValue)
 {
     juce::ignoreUnused(parameterID, newValue);
-    repaint();
+    // 该回调可能在音频线程执行（宿主自动化同步派发 APVTS 监听器）：repaint
+    // 必须推迟到消息线程（Component 方法非线程安全），并用 SafePointer 防止
+    // 组件先于回调销毁。
+    juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<MasterGainSlider> (this)]
+    {
+        if (safe != nullptr)
+            safe->repaint();
+    });
 }
 
 void MasterGainSlider::timerCallback()

@@ -23,8 +23,18 @@ namespace SubEQ
 
 void EQNode::prepare(double sr)
 {
+    const bool rateChanged = (sr != sampleRate);
     sampleRate = sr;
     fadeStepPerSample = 1.0 / std::max(sr * 0.015, 1.0);   // ~15 ms enable fade
+
+    // 采样率变化时按新采样率重算系数：prepare 本身只更新成员采样率，而音频
+    // 路径的 updateEQParameters() 依赖参数缓存比对，参数未变时不会重算——旧
+    // 系数会继续以错误的采样率服役，使全部 EQ 频点偏移（如 48k→44.1k 时
+    // 100 Hz Bell 实际落在 ≈91.9 Hz）。这里在 prepare 内直接重算，与 FIR 路径
+    // （FFTProcessor::prepare 在采样率变化时触发重设计）保持等价语义。
+    if (rateChanged)
+        update (freq, gainDb, q, currentType);
+
     reset();
 }
 

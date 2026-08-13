@@ -150,7 +150,9 @@ void SubEQAudioProcessor::changeProgramName (int index, const juce::String& newN
 //==============================================================================
 void SubEQAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
-    setLatencySamples (0);  // IIR biquads: zero processing latency
+    // PDC 不再在音频线程直接调用 setLatencySamples()（音频线程禁止）：延迟上报
+    // 统一由 processBlock 置脏标记、timerCallback 在消息线程执行；同会话重入
+    // prepare（transport stop/start）时已发布设计与延迟上报均被保留，无需动作。
     eqEngine.prepare (sampleRate, samplesPerBlock);
     eqEngine.reset();
     fftProcessor.prepare (sampleRate, samplesPerBlock, getTotalNumInputChannels());
@@ -158,9 +160,10 @@ void SubEQAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     fftProcessor.reset();
     spectrumAnalyzer.prepare (sampleRate);
     inputAnalyzer.prepare (sampleRate);
-    currentMode.store (static_cast<int> (SubEQ::EQMode::ZeroLatency));
-    reportedLatency.store (0);
-    eqModeCache = 0;
+    // 不强制 currentMode/eqModeCache 归零：同会话重复 prepare 时 eq_mode
+    // 参数未变，若清空缓存，updateEQParameters 会误报“模式变化”，触发一次
+    // 多余的 FIR 重设计并在发布时冲刷卷积尾（播放中出现输出跳变）。仅当
+    // 参数真正变化时才由 updateEQParameters 置 modeChanged。
     modeChanged = false;
     eqParamsChanged = false;
     updateEQParameters();
@@ -323,9 +326,11 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         }
         else
         {
-            // Request an asynchronous FIR redesign. Latency is reported below
-            // (after the design is published) so that PDC always matches the
-            // coefficients actually in use — no premature compensation.
+            // 进入 FIR 模式：丢弃先前发布的（可能已过期的）设计，使输出在
+            // 新设计发布前保持静音（与下方“未发布前输出静音”的契约一致），
+            // 而不是短暂沿用旧曲线。延迟在上报处随发布更新，PDC 始终匹配
+            // 实际生效的系数。
+            fftProcessor.clearPublishedState();
             fftProcessor.requestRedesign();
         }
     }
@@ -350,8 +355,9 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     }
 
     // Input spectrum: analyze BEFORE processing (buffer still holds the raw
-    // input at this point; EQ processing overwrites it in place)
-    if (totalNumInputChannels > 0)
+    // input at this point; EQ processing overwrites it in place). 频谱分析
+    // 仅在编辑器存在时运行（spectrumEditorCount 由编辑器构造/析构维护）。
+    if (spectrumEditorCount.load() > 0 && totalNumInputChannels > 0)
         inputAnalyzer.process (buffer.getReadPointer (0), buffer.getNumSamples());
 
     // Process audio based on current mode
@@ -377,7 +383,7 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     }
 
     // Feed audio to the output spectrum analyzer (post-EQ signal)
-    if (totalNumInputChannels > 0)
+    if (spectrumEditorCount.load() > 0 && totalNumInputChannels > 0)
         spectrumAnalyzer.process (buffer.getReadPointer (0), buffer.getNumSamples());
 }
 

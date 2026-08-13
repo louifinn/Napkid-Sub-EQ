@@ -2,6 +2,38 @@
 
 Napkid Sub EQ 的所有重要变更都将记录在此文件中。
 
+## [0.3.3] - 2026-08-14
+
+> 代码审查修复轮：采样率切换后 IIR 系数错位、三处音频线程 GUI/PDC 越界调用、同会话重复 prepare 的冗余 FIR 重设计，以及若干语义/文档修正。
+
+### 修复
+
+- **采样率变化后 IIR 系数不重算（EQ 频点整体错位）**：`EQNode::prepare` 现在在采样率变化时按新采样率重算系数——此前只更新成员采样率，音频路径 `updateEQParameters()` 依赖参数缓存比对，参数未变时不会重算，导致 48k→44.1k 等场景下 EQ 频点整体偏移（如 100 Hz Bell 实际落在 ≈91.9 Hz），且与 GUI 曲线（独立引擎自行侦测采样率）不一致。语义与 FIR 路径（`FFTProcessor::prepare` 触发重设计）对齐。
+- **`prepareToPlay` 不再在音频线程调用 `setLatencySamples()`**：与项目既有的 deferred-PDC 规则一致（processBlock 置脏标记、10 Hz Timer 在消息线程上报）；同会话重入 prepare 时已发布设计与延迟上报均保留。
+- **同会话重复 prepare 不再触发冗余 FIR 重设计**：`prepareToPlay` 不再强制 `eqModeCache`/`currentMode` 归零——此前每次 transport stop/start 都会误报“模式变化”，触发一次相同系数的重设计并在发布时冲刷卷积尾，播放中出现输出跳变。
+- **进入 FIR 模式时丢弃过期设计**：新增 `FFTProcessor::clearPublishedState()`——FIR→ZeroLatency→改参数→切回 FIR 时不再短暂沿用旧曲线，改为静音直至新设计发布（与 processBlock“未发布前输出静音”契约一致）。
+- **APVTS 监听回调不再在音频线程直接 `repaint()`**：宿主自动化时 APVTS 监听器在音频线程同步回调，`FrequencyResponse`/`MasterGainSlider` 的 `repaint()` 改为 `MessageManager::callAsync` + `SafePointer`；`ModeSelector` 的 6 个 `ComboBoxAttachment` 改为手工监听 + callAsync 同步（附件同样会在音频线程直接改 ComboBox）。
+- **FIRState 释放全部移到后台线程**：退役槽改为 64 槽环形队列（音频线程移交、后台线程排空），消除“连续两次发布之间音频线程拾取旧状态时在音频线程析构 ~2.3 MB 状态”的窗口。
+- **BandPass 不再施加 gain 缩放**：与“BandPass 非增益敏感”的分类及 GUI（手柄钉 0 dB、拖拽改 Q、切入时重置增益）一致，消除 preset/自动化写入 gain 时的“隐形增益”。
+- **最小相位 FIR 倒谱因果化保留 Nyquist 折叠项**（c[N/2] 由置零改为保留）：与教科书同态重构一致（实测影响 ≤1e-5 dB 量级，属正确性对齐）。
+- **悬停不再维持 60 Hz 空转重绘**：`needsPhysicsTimer()` 移除 `hoveredNode` 子句（悬停变化由 mouseMove/mouseExit 即时重绘，缩放动画由 `isAnimating()` 覆盖）。
+
+### 优化（Informational 项跟进）
+
+- **FIR 交叉淡化**：新设计发布不再冲刷卷积尾——旧设计尾音与新设计在 1024 样本（≈21 ms @48 kHz）内线性交叉淡化，参数编辑/模式切换不再产生输出阶跃；淡化结束的旧设计经退役环在后台线程析构。FIR 长度变化（convFFTSize 改变）同样走淡化（旧累加器超界区域先清零）。
+- **频谱分析门控**：编辑器存在时才运行频谱分析（`spectrumEditorCount` 原子计数由编辑器构造/析构维护，多编辑器并存安全），无 GUI 时不再消耗音频线程 CPU。
+- **尾长上报**：`getTailLengthSamples()` 未发布设计时按最大 FIR 长度（65536 + 512）保守回退，不再低估 16384/65536 选择下的卷积尾。
+- **FIR 抽头改 double**：`designLinearPhaseFIR`/`designMinimumPhaseFIR` 返回 `std::vector<double>`，与“所有 DSP 用 double”约定对齐（消除一次 float 量化）。
+- **文档**：架构文档 Tilt 公式更正为 gain/2 + −gain/2，补记 Type-II 偶数 FIR 的 Nyquist 零点/半样本群延迟截断与交叉淡化语义；README“最低采样率”标注为软性规格。
+
+### 工程
+
+- `.jucer` Debug/Release 配置加 `/utf-8`（消除 C4819 编码警告，与 `run_tests.bat` 一致）；版本号 0.3.2 → 0.3.3。
+- `JuceLibraryCode/JucePluginDefines.h` 版本同步 0.3.3。
+- `getSpectrum` 快照注释改为准确描述（逐元素原子、极端情况可撕裂一帧）。
+- 测试文件头注释补齐全部 11 个被测模块、编号连续化；新增 BandPass 忽略增益（2 项）、Nyquist 强调目标（1 项）、NaN/Inf 毒化遏制（2 项）、最小相位 NaN 回退冲激（1 项）、forceStable 剩余分支（2 项）回归，88 → 96 项。
+- `Source/Fonts/Avenir.ttf` 内嵌字体随 GPL v3 项目分发：使用授权已获确认（2026-08-14）。
+
 ## [0.3.2] - 2026-08-12
 
 > 架构优化第一轮：把纯 DSP/几何逻辑从 JUCE 线程与 GUI 组件中抽出为无 JUCE 依赖的 seam，消除多处重复的单一事实来源，删除死代码；回归测试 27 → 88 项。

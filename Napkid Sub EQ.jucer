@@ -3,7 +3,7 @@
 <JUCERPROJECT id="YD8LOD" name="Napkid Sub EQ" projectType="audioplug" useAppConfig="0"
               addUsingNamespaceToJuceHeader="0" jucerFormatVersion="1" pluginFormats="buildStandalone,buildVST3"
               pluginVST3Category="EQ" companyName="Napkid Audio" companyEmail="3225607112@qq.com"
-              version="0.3.2" pluginCode="Nseq" pluginManufacturer="Napkid Audio">
+              version="0.3.3" pluginCode="Nseq" pluginManufacturer="Napkid Audio">
   <MAINGROUP id="lnXInZ" name="Napkid Sub EQ">
     <GROUP id="{730EE156-EB98-7118-C7AB-A3A3DB8657E7}" name="Source">
       <FILE id="zHF3zP" name="PluginProcessor.cpp" compile="1" resource="0"
@@ -92,8 +92,8 @@
   <EXPORTFORMATS>
     <VS2022 targetFolder="Builds/VisualStudio2022">
       <CONFIGURATIONS>
-        <CONFIGURATION isDebug="1" name="Debug" targetName="Napkid Sub EQ" extraCompilerFlags="/I&quot;D:/Program Files/JUCE/modules/juce_audio_devices/native/asio&quot;"/>
-        <CONFIGURATION isDebug="0" name="Release" targetName="Napkid Sub EQ" extraCompilerFlags="/I&quot;D:/Program Files/JUCE/modules/juce_audio_devices/native/asio&quot;"/>
+        <CONFIGURATION isDebug="1" name="Debug" targetName="Napkid Sub EQ" extraCompilerFlags="/utf-8 /I&quot;D:/Program Files/JUCE/modules/juce_audio_devices/native/asio&quot;"/>
+        <CONFIGURATION isDebug="0" name="Release" targetName="Napkid Sub EQ" extraCompilerFlags="/utf-8 /I&quot;D:/Program Files/JUCE/modules/juce_audio_devices/native/asio&quot;"/>
       </CONFIGURATIONS>
       <MODULEPATHS>
         <MODULEPATH id="juce_analytics" path="D:/Program Files/JUCE/modules"/>

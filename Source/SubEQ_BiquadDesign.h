@@ -163,11 +163,12 @@ inline int computeBiquadCoefficients(double freqHz, double gainDb, double qValue
             const double cosw0 = std::cos(w0);
             const double sinw0 = std::sin(w0);
             const double alpha = sinw0 / (2.0 * qValue);
-            const double gainLinear = dbToGain(gainDb);
+            // BandPass 非增益敏感（与 SubEQ_NodeInteraction.h 的分类及 GUI 一致）：
+            // 标准 RBJ 带通，中心 0 dB——gain 参数不得静默缩放通带峰值。
             const double a0 = 1.0 + alpha;
-            out[0].b0 = gainLinear * alpha / a0;
+            out[0].b0 = alpha / a0;
             out[0].b1 = 0.0;
-            out[0].b2 = -gainLinear * alpha / a0;
+            out[0].b2 = -alpha / a0;
             out[0].a1 = (-2.0 * cosw0) / a0;
             out[0].a2 = (1.0 - alpha) / a0;
             return 1;

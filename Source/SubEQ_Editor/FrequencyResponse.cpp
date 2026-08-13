@@ -99,9 +99,15 @@ void FrequencyResponse::parameterChanged(const juce::String& parameterID, float 
     // GUI thread. Only set the flag here — the GUI-side engine copy
     // (responseEngine) is refreshed from APVTS inside updateResponsePaths(),
     // which always runs on the GUI thread, so responseEngine is never
-    // touched concurrently.
+    // touched concurrently. repaint() 同样必须落在消息线程：Component 方法
+    // 对其他线程不安全，因此经 callAsync 移交（SafePointer 防止编辑器先于
+    // 回调销毁）。
     parametersChanged.store(true);
-    repaint();
+    juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<FrequencyResponse> (this)]
+    {
+        if (safe != nullptr)
+            safe->repaint();
+    });
 }
 
 void FrequencyResponse::timerCallback()
@@ -701,7 +707,10 @@ void FrequencyResponse::updateNodePhysics()
 
 bool FrequencyResponse::needsPhysicsTimer() const
 {
-    if (isDragging || isDraggingNode || nodePressed || hoveredNode >= 0)
+    // 悬停本身不得维持 60 Hz 定时器：悬停状态变化由 mouseMove/mouseExit 即时
+    // repaint，缩放动画由下方 nodeScale[i].isAnimating() 覆盖——旧的 hoveredNode
+    // 子句会让定时器在光标静置节点时永久空转全量重绘。
+    if (isDragging || isDraggingNode || nodePressed)
         return true;
 
     for (int i = 0; i < SubEQ::NumNodes; ++i)

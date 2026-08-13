@@ -37,7 +37,6 @@ FFTProcessor::~FFTProcessor()
 //==============================================================================
 void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
 {
-    juce::ignoreUnused(maxBlockSize);
     sampleRate.store(sr, std::memory_order_release);
 
     // Same session parameters: keep the buffers and any published design.
@@ -71,6 +70,24 @@ void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
         ch.outQueue.reserve(ConvBlockLen * 2);
         ch.outRead = 0;
     }
+
+    // 交叉淡化用的旧设计累加器：与 channelStates 同构预分配，拷贝赋值时
+    // 容量足够、不会在音频线程分配。
+    oldChannelStates.resize(numChannels);
+    for (auto& ch : oldChannelStates)
+    {
+        ch.inputBlock.assign(ConvBlockLen, { 0.0, 0.0 });
+        ch.pos = 0;
+        ch.overlap.assign(maxL, 0.0);
+        ch.outQueue.clear();
+        ch.outQueue.reserve(ConvBlockLen * 2);
+        ch.outRead = 0;
+    }
+    xfadeOld.setSize(numChannels, std::max(1, maxBlockSize));
+    xfadeNew.setSize(numChannels, std::max(1, maxBlockSize));
+    crossfadeRemaining = 0;
+    processingState = nullptr;
+
     fftWork.assign(maxL, { 0.0, 0.0 });
     activeConvFFTSize = 0;
 
@@ -85,6 +102,11 @@ void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
     {
         std::lock_guard<std::mutex> lock(stateMutex);
         currentState.reset();
+        if (oldState != nullptr)
+        {
+            pendingDestroy[pendingDestroyHead] = std::move (oldState);
+            pendingDestroyHead = (pendingDestroyHead + 1) % NumRetireSlots;
+        }
     }
     stateVersion.fetch_add(1, std::memory_order_release);
 
@@ -106,6 +128,42 @@ void FFTProcessor::reset()
         ch.outQueue.clear();
         ch.outRead = 0;
     }
+    for (auto& ch : oldChannelStates)
+    {
+        std::fill(ch.inputBlock.begin(), ch.inputBlock.end(), std::complex<double>(0.0, 0.0));
+        ch.pos = 0;
+        std::fill(ch.overlap.begin(), ch.overlap.end(), 0.0);
+        ch.outQueue.clear();
+        ch.outRead = 0;
+    }
+    crossfadeRemaining = 0;
+    processingState = nullptr;
+    if (oldState != nullptr)
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        pendingDestroy[pendingDestroyHead] = std::move (oldState);
+        pendingDestroyHead = (pendingDestroyHead + 1) % NumRetireSlots;
+    }
+}
+
+void FFTProcessor::clearPublishedState()
+{
+    crossfadeRemaining = 0;
+    processingState = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        if (currentState != nullptr)
+        {
+            pendingDestroy[pendingDestroyHead] = std::move (currentState);
+            pendingDestroyHead = (pendingDestroyHead + 1) % NumRetireSlots;
+        }
+        if (oldState != nullptr)
+        {
+            pendingDestroy[pendingDestroyHead] = std::move (oldState);
+            pendingDestroyHead = (pendingDestroyHead + 1) % NumRetireSlots;
+        }
+    }
+    stateVersion.fetch_add(1, std::memory_order_release);
 }
 
 void FFTProcessor::setParameterSource(juce::AudioProcessorValueTreeState* source)
@@ -128,6 +186,14 @@ void FFTProcessor::run()
 {
     while (!threadShouldExit())
     {
+        // 排空退役环：音频线程移交的过期状态（或 clearPublishedState 丢弃
+        // 的设计）在此析构——音频线程永不执行大块 FIRState 的释放。
+        {
+            std::lock_guard<std::mutex> lock (stateMutex);
+            for (auto& slot : pendingDestroy)
+                slot.reset();
+        }
+
         redesignEvent.wait(50);
 
         if (!redesignRequested.exchange(false, std::memory_order_acquire))
@@ -179,7 +245,7 @@ void FFTProcessor::run()
         newState->convFFTSize = convolutionFftSize(firLength, ConvBlockLen);
         std::vector<std::complex<double>> spec(newState->convFFTSize);
         for (int i = 0; i < firLength; ++i)
-            spec[i] = { static_cast<double> (newState->coeffs[i]), 0.0 };
+            spec[i] = { newState->coeffs[i], 0.0 };
         for (int i = firLength; i < newState->convFFTSize; ++i)
             spec[i] = { 0.0, 0.0 };
         fftInPlace(spec.data(), newState->convFFTSize);
@@ -191,19 +257,13 @@ void FFTProcessor::run()
             continue;
 
         // Publish (release) so the audio thread sees a fully-formed state.
-        // The replaced state is moved into the retirement slot: its (up to
-        // ~2.3 MB) destructor then runs here on the background thread instead
-        // of on the audio thread at its next publication pick-up.
-        std::shared_ptr<const FIRState> previous;
+        // 被替换的状态要么在此处（后台线程，无其他引用）析构，要么由音频
+        // 线程在下次采纳新版本时移交退役环、随后由本线程析构——两种路径
+        // 都保证 ~2.3 MB 的释放发生在后台线程。
         {
             std::lock_guard<std::mutex> lock(stateMutex);
-            previous = std::move(retiredState);
-            retiredState = currentState;
             currentState = newState;
         }
-        // `previous` (the state retired before this publish) is destroyed here,
-        // on the background thread, outside the lock — the critical section now
-        // only swaps pointers instead of running the ~2.3 MB deallocation.
         stateVersion.fetch_add(1, std::memory_order_release);
     }
 }
@@ -215,6 +275,12 @@ std::shared_ptr<const FFTProcessor::FIRState> FFTProcessor::getPublishedStateFor
     if (stateVersion.load(std::memory_order_acquire) != lastSeenVersion)
     {
         std::lock_guard<std::mutex> lock(stateMutex);
+        // 被替换的状态移交退役环，而不是在音频线程析构（~2.3 MB 释放）。
+        if (localState != nullptr)
+        {
+            pendingDestroy[pendingDestroyHead] = std::move (localState);
+            pendingDestroyHead = (pendingDestroyHead + 1) % NumRetireSlots;
+        }
         localState = currentState;
         lastSeenVersion = stateVersion.load(std::memory_order_relaxed);
     }
@@ -233,22 +299,31 @@ void FFTProcessor::process(juce::AudioBuffer<float>& buffer)
     if (L <= 0 || L > static_cast<int>(fftWork.size()))
         return;
 
-    // A newly published design (parameter edit, FIR length or mode change)
-    // invalidates everything the accumulators hold. The overlap tail and the
-    // pending output FIFO were computed with the previous coefficients — up
-    // to FIR-length-1 samples of old-filter audio (over a second for a
-    // 65536-tap FIR at 48 kHz) — and must be dropped, otherwise echoes of the
-    // previous filter contaminate the new output. The old check only flushed
-    // on a convFFTSize change, so same-length redesigns (the common knob
-    // drag) mixed stale tails with fresh output.
+    // 新发布的设计不再冲刷卷积尾（冲刷会在每次参数编辑时产生输出阶跃），
+    // 而是让旧设计尾音与新设计在 CrossfadeLen 样本内交叉淡化：旧滤波器的
+    // 尾音（最长 FIR 长度样本）在淡出窗口内被快速衰减，既不污染新输出，
+    // 也没有可闻的不连续。
     const int version = stateVersion.load(std::memory_order_acquire);
     if (version != processedVersion || L != activeConvFFTSize)
     {
-        for (auto& ch : channelStates)
+        if (processedVersion != 0 && crossfadeRemaining <= 0)
         {
-            std::fill(ch.overlap.begin(), ch.overlap.end(), 0.0);
-            ch.outQueue.clear();
-            ch.outRead = 0;
+            const int oldL = activeConvFFTSize;
+            for (int ch = 0; ch < numChannels; ++ch)
+            {
+                oldChannelStates[ch] = channelStates[ch];
+                // FIR 长度变化时，旧累加器在 [oldL, newL) 区域的数据在新
+                // 尺寸下会被读取——先清零，避免陈旧的未初始化数据混入。
+                if (L > oldL)
+                {
+                    const int zeroEnd = std::min(L, static_cast<int>(oldChannelStates[ch].overlap.size()));
+                    std::fill(oldChannelStates[ch].overlap.begin() + oldL,
+                              oldChannelStates[ch].overlap.begin() + zeroEnd, 0.0);
+                }
+            }
+            oldState = processingState;   // 上一块实际使用的设计
+            fadeConvFFTSize = oldL;
+            crossfadeRemaining = CrossfadeLen;
         }
         activeConvFFTSize = L;
         processedVersion = version;
@@ -256,13 +331,76 @@ void FFTProcessor::process(juce::AudioBuffer<float>& buffer)
 
     const int channelCount = std::min(buffer.getNumChannels(), numChannels);
     const int numSamples = buffer.getNumSamples();
+    const bool hasOld = (oldState != nullptr) && !oldState->freqCoeffs.empty();
 
-    for (int ch = 0; ch < channelCount; ++ch)
+    if (crossfadeRemaining > 0 && numSamples <= xfadeNew.getNumSamples())
     {
-        auto* data = buffer.getWritePointer(ch);
-        processOlaChannel(channelStates[ch], data, data, numSamples,
-                          ConvBlockLen, L, state->freqCoeffs.data(), fftWork);
+        // 双卷积 + 线性斜坡混合：旧侧从当前累加器无缝续接，新侧从 0 权重
+        // 渐入；权重按样本递增，淡化结束后的输出纯为新设计。
+        const int startRemaining = crossfadeRemaining;
+        const float invLen = 1.0f / static_cast<float>(CrossfadeLen + 1);
+        for (int ch = 0; ch < channelCount; ++ch)
+        {
+            auto* data = buffer.getWritePointer(ch);
+            if (hasOld)
+            {
+                processOlaChannel(oldChannelStates[ch],
+                                  xfadeOld.getWritePointer(ch), xfadeOld.getWritePointer(ch),
+                                  numSamples, ConvBlockLen, fadeConvFFTSize,
+                                  oldState->freqCoeffs.data(), fftWork);
+            }
+            processOlaChannel(channelStates[ch],
+                              xfadeNew.getWritePointer(ch), xfadeNew.getWritePointer(ch),
+                              numSamples, ConvBlockLen, L,
+                              state->freqCoeffs.data(), fftWork);
+
+            const float* oldData = hasOld ? xfadeOld.getReadPointer(ch) : nullptr;
+            const float* newData = xfadeNew.getReadPointer(ch);
+            for (int n = 0; n < numSamples; ++n)
+            {
+                const int remaining = startRemaining - n;
+                if (remaining <= 0)
+                {
+                    data[n] = newData[n];
+                    continue;
+                }
+                const float w = static_cast<float>(CrossfadeLen - remaining + 1) * invLen;
+                data[n] = w * newData[n] + (hasOld ? (1.0f - w) * oldData[n] : 0.0f);
+            }
+        }
+
+        crossfadeRemaining = std::max(0, startRemaining - numSamples);
+        if (crossfadeRemaining == 0 && oldState != nullptr)
+        {
+            // 淡化结束：旧设计移交退役环（后台线程析构，音频线程不释放）。
+            std::lock_guard<std::mutex> lock(stateMutex);
+            pendingDestroy[pendingDestroyHead] = std::move (oldState);
+            pendingDestroyHead = (pendingDestroyHead + 1) % NumRetireSlots;
+        }
     }
+    else
+    {
+        if (crossfadeRemaining > 0)
+        {
+            // 临时缓冲不足（宿主块尺寸超预期）或旧设计不可用：直接收尾淡化，
+            // 避免状态悬挂。
+            crossfadeRemaining = 0;
+            if (oldState != nullptr)
+            {
+                std::lock_guard<std::mutex> lock(stateMutex);
+                pendingDestroy[pendingDestroyHead] = std::move (oldState);
+                pendingDestroyHead = (pendingDestroyHead + 1) % NumRetireSlots;
+            }
+        }
+        for (int ch = 0; ch < channelCount; ++ch)
+        {
+            auto* data = buffer.getWritePointer(ch);
+            processOlaChannel(channelStates[ch], data, data, numSamples,
+                              ConvBlockLen, L, state->freqCoeffs.data(), fftWork);
+        }
+    }
+
+    processingState = state;   // 记录本块实际使用的设计，供下次淡化起点
 }
 
 //==============================================================================
@@ -287,8 +425,10 @@ int FFTProcessor::getTailLengthSamples() const
     // Lock-guarded direct read — may be called from the host/GUI thread, so it
     // must not touch the audio-thread localState cache.
     std::lock_guard<std::mutex> lock(stateMutex);
+    // 未发布时按最大 FIR 长度回退（保守上界）：用户可能选择了 16384/65536
+    // 而默认值 4096 会低估宿主应等待的卷积尾。
     if (currentState == nullptr)
-        return DefaultFirLength + ConvBlockLen;
+        return MaxFirLength + ConvBlockLen;
     return currentState->firLength + ConvBlockLen;
 }
 
