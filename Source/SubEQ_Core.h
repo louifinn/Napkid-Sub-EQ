@@ -192,8 +192,14 @@ public:
     void setMasterGain(double gainDb) noexcept { masterGain = gainDb; }
     double getMasterGain() const noexcept { return masterGain; }
 
-    // Bypass
-    void setBypass(bool shouldBypass) noexcept { bypass = shouldBypass; }
+    // Bypass only retargets the dry/wet crossfade (~15 ms); the node chain
+    // keeps processing while bypassed (warm bypass), so un-bypassing fades in
+    // live filter output instead of a stale-state transient (F-008).
+    void setBypass(bool shouldBypass) noexcept
+    {
+        bypass = shouldBypass;
+        bypassFadeTarget = shouldBypass ? 0.0 : 1.0;
+    }
     bool isBypassed() const noexcept { return bypass; }
 
     // Enable/disable coefficient smoothing on all nodes
@@ -205,13 +211,23 @@ public:
             nodes[i].setSmoothingEnabled(shouldSmooth);
     }
 
-    // Advance coefficient interpolation on all nodes by numSamples.
-    // Called once per audio block (audio thread) so every channel shares the
-    // same interpolation state.
+    // Advance coefficient interpolation on all nodes by numSamples, plus the
+    // bypass dry/wet fade. Called once per audio block (audio thread) so every
+    // channel shares the same interpolation state.
     void advanceSmoothing(int numSamples) noexcept
     {
         for (int i = 0; i < MaxNodes; ++i)
             nodes[i].advanceSmoothing(numSamples);
+
+        // 旁路湿/干淡化推进（~15 ms，块粒度；F-008）：bypass 切换不再瞬时
+        // 直通。旁路期间节点链保持处理（热旁路），解除旁路时无陈旧状态瞬态。
+        if (bypassFadeGain != bypassFadeTarget)
+        {
+            const double fstep = bypassFadeStepPerSample * static_cast<double>(numSamples);
+            bypassFadeGain = (bypassFadeTarget > bypassFadeGain)
+                           ? std::min (bypassFadeTarget, bypassFadeGain + fstep)
+                           : std::max (bypassFadeTarget, bypassFadeGain - fstep);
+        }
     }
 
     // Get overall frequency response in dB at normalized frequency w
@@ -228,6 +244,12 @@ private:
     double masterGain = 0.0;
     bool bypass = false;
     double sampleRate = 48000.0;
+
+    // 旁路湿/干淡化状态（音频线程独占）：1 = 全湿输出，0 = 直通。
+    // 默认全湿（未旁路）。
+    double bypassFadeGain = 1.0;
+    double bypassFadeTarget = 1.0;
+    double bypassFadeStepPerSample = 1.0 / (48000.0 * 0.015);
 
     juce::HeapBlock<double> tempBuffer;
     int tempBufferSize = 0;

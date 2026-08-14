@@ -22,6 +22,12 @@ void LiquidGlassEffect::drawRoundedRect(juce::Graphics& g, juce::Rectangle<float
                                          float cornerRadius, float highlightOffsetX,
                                          float highlightOffsetY, float scale)
 {
+    // 防御（F-019）：空/零尺寸、非正圆角与零缩放直接返回——渐变半径或
+    // 缩放为 0 时起止点重合，存在 JUCE 内部退化风险；公共静态助手不得
+    // 假定调用方传入合法尺寸。
+    if (bounds.isEmpty() || cornerRadius <= 0.0f || scale <= 0.0f)
+        return;
+
     juce::Graphics::ScopedSaveState state(g);
 
     {

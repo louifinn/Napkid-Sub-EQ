@@ -31,13 +31,30 @@ FFTProcessor::~FFTProcessor()
     // 50 ms and a single design (longest FIR) completes in well under a
     // second, so 5 s leaves ample margin against scheduler stalls.
     if (!stopThread (5000))
+    {
         jassertfalse;   // worker did not exit in time — would be a lifetime bug
+        // Release 兜底（F-005）：继续阻塞等待线程退出。相比 std::terminate
+        // 拖垮宿主，宁可延长退出时间，也绝不让 run() 在 this 销毁后继续
+        // 访问成员（use-after-free）。
+        while (isThreadRunning())
+            wait (50);
+    }
 }
 
 //==============================================================================
 void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
 {
     sampleRate.store(sr, std::memory_order_release);
+
+    // 块尺寸增大时仅重分配交叉淡化临时缓冲（F-003）：卷积状态与已发布
+    // 设计全部保留。process() 的淡化分支要求 numSamples <= xfadeNew 容量，
+    // 容量不足会被静默跳过淡化——参数编辑的输出阶跃随之回归。
+    const int xfadeSamples = std::max(1, maxBlockSize);
+    if (xfadeNew.getNumSamples() < xfadeSamples)
+    {
+        xfadeOld.setSize(std::max(1, numChannels), xfadeSamples);
+        xfadeNew.setSize(std::max(1, numChannels), xfadeSamples);
+    }
 
     // Same session parameters: keep the buffers and any published design.
     // Hosts commonly re-call prepareToPlay (transport stop/start, loop
@@ -90,6 +107,8 @@ void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
 
     fftWork.assign(maxL, { 0.0, 0.0 });
     activeConvFFTSize = 0;
+    pendingState = nullptr;
+    twiddlePrewarmedSize = 0;
 
     // Pre-build the twiddle tables for every selectable convolution size on
     // this thread, so the first real-time FFT does not allocate (the cache
@@ -98,10 +117,15 @@ void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
         prewarmTwiddleTable<double>(convolutionFftSize(FirLengthChoices[i], ConvBlockLen));
 
     // Drop any previously published design: the engine will be redesigned
-    // once the mode/parameters demand it.
+    // once the mode/parameters demand it. 全部移交退役环（仅指针搬移），
+    // ~2.3 MB 的 FIRState 析构由后台线程在锁外执行（F-002）。
     {
         std::lock_guard<std::mutex> lock(stateMutex);
-        currentState.reset();
+        if (currentState != nullptr)
+        {
+            pendingDestroy[pendingDestroyHead] = std::move (currentState);
+            pendingDestroyHead = (pendingDestroyHead + 1) % NumRetireSlots;
+        }
         if (oldState != nullptr)
         {
             pendingDestroy[pendingDestroyHead] = std::move (oldState);
@@ -138,31 +162,17 @@ void FFTProcessor::reset()
     }
     crossfadeRemaining = 0;
     processingState = nullptr;
-    if (oldState != nullptr)
-    {
-        std::lock_guard<std::mutex> lock(stateMutex);
-        pendingDestroy[pendingDestroyHead] = std::move (oldState);
-        pendingDestroyHead = (pendingDestroyHead + 1) % NumRetireSlots;
-    }
+    pendingState = nullptr;
+    retireState (oldState);
 }
 
 void FFTProcessor::clearPublishedState()
 {
     crossfadeRemaining = 0;
     processingState = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(stateMutex);
-        if (currentState != nullptr)
-        {
-            pendingDestroy[pendingDestroyHead] = std::move (currentState);
-            pendingDestroyHead = (pendingDestroyHead + 1) % NumRetireSlots;
-        }
-        if (oldState != nullptr)
-        {
-            pendingDestroy[pendingDestroyHead] = std::move (oldState);
-            pendingDestroyHead = (pendingDestroyHead + 1) % NumRetireSlots;
-        }
-    }
+    pendingState = nullptr;
+    retireState (currentState);
+    retireState (oldState);
     stateVersion.fetch_add(1, std::memory_order_release);
 }
 
@@ -186,12 +196,14 @@ void FFTProcessor::run()
 {
     while (!threadShouldExit())
     {
-        // 排空退役环：音频线程移交的过期状态（或 clearPublishedState 丢弃
-        // 的设计）在此析构——音频线程永不执行大块 FIRState 的释放。
+        // 排空退役环：先把槽位移出临界区再析构（F-002）——~2.3 MB 的
+        // FIRState 释放不占用 stateMutex，音频线程的过渡期锁点不会被
+        // 放大为"等待后台线程完成大块释放"。
+        std::shared_ptr<const FIRState> toFree[NumRetireSlots];
         {
             std::lock_guard<std::mutex> lock (stateMutex);
-            for (auto& slot : pendingDestroy)
-                slot.reset();
+            for (int i = 0; i < NumRetireSlots; ++i)
+                toFree[i] = std::move (pendingDestroy[i]);
         }
 
         redesignEvent.wait(50);
@@ -252,19 +264,48 @@ void FFTProcessor::run()
 
         newState->freqCoeffs = spec;   // double precision frequency response
 
-        // A prepare() during the design invalidated it — drop the result.
-        if (epoch != designEpoch.load(std::memory_order_acquire))
-            continue;
-
         // Publish (release) so the audio thread sees a fully-formed state.
-        // 被替换的状态要么在此处（后台线程，无其他引用）析构，要么由音频
-        // 线程在下次采纳新版本时移交退役环、随后由本线程析构——两种路径
-        // 都保证 ~2.3 MB 的释放发生在后台线程。
+        // epoch 复检与发布必须在同一临界区内（F-001）：prepare() 先 bump
+        // epoch、再在锁内清空 currentState——若校验在锁外、发布在锁内，
+        // 采样率切换可在二者之间交错，把按旧采样率设计的系数写回。
+        // 被替换的状态移出临界区析构（若为最后引用），大块释放不占用
+        // 锁（F-002）。
+        std::shared_ptr<const FIRState> replaced;
         {
             std::lock_guard<std::mutex> lock(stateMutex);
+            if (epoch != designEpoch.load(std::memory_order_acquire))
+                continue;   // 过期设计：丢弃（newState 在锁外析构）
+
+            replaced = std::move (currentState);
             currentState = newState;
         }
         stateVersion.fetch_add(1, std::memory_order_release);
+    }
+}
+
+//==============================================================================
+void FFTProcessor::retireState(std::shared_ptr<const FIRState>& stateToRetire)
+{
+    if (stateToRetire == nullptr)
+        return;
+
+    // 只做指针搬移：FIRState 的析构由后台线程在锁外执行（F-002）。
+    std::lock_guard<std::mutex> lock(stateMutex);
+    pendingDestroy[pendingDestroyHead] = std::move (stateToRetire);
+    pendingDestroyHead = (pendingDestroyHead + 1) % NumRetireSlots;
+}
+
+void FFTProcessor::flushConvolvers()
+{
+    // 冲刷新侧卷积累加器与输出队列：旧设计的频率域尾部立即终止，输出
+    // 从下一块起纯为新设计（延迟不同的设计切换路径，见 process()）。
+    for (auto& ch : channelStates)
+    {
+        std::fill(ch.inputBlock.begin(), ch.inputBlock.end(), std::complex<double>(0.0, 0.0));
+        ch.pos = 0;
+        std::fill(ch.overlap.begin(), ch.overlap.end(), 0.0);
+        ch.outQueue.clear();
+        ch.outRead = 0;
     }
 }
 
@@ -295,35 +336,84 @@ void FFTProcessor::process(juce::AudioBuffer<float>& buffer)
     if (state == nullptr || state->freqCoeffs.empty())
         return;
 
+    const int version = stateVersion.load(std::memory_order_acquire);
+
+    // ---- 发布-订阅接管（F-004）：淡化期间发布的新设计先挂起 ----
+    bool deferred = false;   // 本块挂起新设计、继续推进当前淡化
+    if (crossfadeRemaining > 0 && version != processedVersion)
+    {
+        // 延迟不同的设计（FIR 长度/模式变化）必须立即收尾淡化并冲刷切换：
+        // PDC 在发布当块已经翻转，继续淡化会让旧延迟尾音按新延迟补偿
+        // （可闻前回声）。同延迟设计挂起，等淡化收尾后再切换——新侧保持
+        // 原设计，不会在混合权重下中途跳变。
+        if (processingState != nullptr && state->groupDelay != processingState->groupDelay)
+        {
+            crossfadeRemaining = 0;
+            retireState (oldState);
+            flushConvolvers();
+        }
+        else if (processingState != nullptr)
+        {
+            pendingState = state;
+            state = processingState;
+            deferred = true;   // 跳过下方版本切换分支：processedVersion 保持淡化新侧版本
+        }
+    }
+    else if (crossfadeRemaining <= 0 && pendingState != nullptr)
+    {
+        // 淡化已收尾：采纳挂起的最新设计（下方版本切换分支开启新淡化/冲刷）
+        state = pendingState;
+        pendingState = nullptr;
+    }
+
     const int L = state->convFFTSize;
     if (L <= 0 || L > static_cast<int>(fftWork.size()))
         return;
 
-    // 新发布的设计不再冲刷卷积尾（冲刷会在每次参数编辑时产生输出阶跃），
-    // 而是让旧设计尾音与新设计在 CrossfadeLen 样本内交叉淡化：旧滤波器的
-    // 尾音（最长 FIR 长度样本）在淡出窗口内被快速衰减，既不污染新输出，
-    // 也没有可闻的不连续。
-    const int version = stateVersion.load(std::memory_order_acquire);
-    if (version != processedVersion || L != activeConvFFTSize)
+    // 音频线程惰性预热 twiddle（F-010）：宿主可能在非音频线程调用
+    // prepareToPlay，thread_local 缓存在本线程未命中；命中后为廉价查找。
+    if (L != twiddlePrewarmedSize)
     {
-        if (processedVersion != 0 && crossfadeRemaining <= 0)
+        prewarmTwiddleTable<double>(L);
+        twiddlePrewarmedSize = L;
+    }
+
+    // 新发布设计的切换策略（F-006）：同延迟设计走 CrossfadeLen 样本交叉
+    // 淡化（两侧管线延迟一致，混合无时间错位，参数编辑无输出阶跃）；延迟
+    // 不同的设计（FIR 长度/模式变化）冲刷累加器立即切换——旧设计尾音若
+    // 按新延迟补偿会变成可闻前回声，宁可瞬时切换也要保证 PDC 与实际输出
+    // 始终一致。
+    if (!deferred && (version != processedVersion || L != activeConvFFTSize))
+    {
+        const std::shared_ptr<const FIRState> prev = processingState;
+
+        if (prev != nullptr && crossfadeRemaining <= 0)
         {
-            const int oldL = activeConvFFTSize;
-            for (int ch = 0; ch < numChannels; ++ch)
+            if (prev->groupDelay == state->groupDelay)
             {
-                oldChannelStates[ch] = channelStates[ch];
-                // FIR 长度变化时，旧累加器在 [oldL, newL) 区域的数据在新
-                // 尺寸下会被读取——先清零，避免陈旧的未初始化数据混入。
-                if (L > oldL)
+                // 同延迟交叉淡化（参数编辑、最小相位换 FIR 长度等）
+                const int oldL = activeConvFFTSize;
+                for (int ch = 0; ch < numChannels; ++ch)
                 {
-                    const int zeroEnd = std::min(L, static_cast<int>(oldChannelStates[ch].overlap.size()));
-                    std::fill(oldChannelStates[ch].overlap.begin() + oldL,
-                              oldChannelStates[ch].overlap.begin() + zeroEnd, 0.0);
+                    oldChannelStates[ch] = channelStates[ch];
+                    // FIR 长度变化时，旧累加器在 [oldL, newL) 区域的数据在新
+                    // 尺寸下会被读取——先清零，避免陈旧的未初始化数据混入。
+                    if (L > oldL)
+                    {
+                        const int zeroEnd = std::min(L, static_cast<int>(oldChannelStates[ch].overlap.size()));
+                        std::fill(oldChannelStates[ch].overlap.begin() + oldL,
+                                  oldChannelStates[ch].overlap.begin() + zeroEnd, 0.0);
+                    }
                 }
+                oldState = prev;   // 上一块实际使用的设计
+                fadeConvFFTSize = oldL;
+                crossfadeRemaining = CrossfadeLen;
             }
-            oldState = processingState;   // 上一块实际使用的设计
-            fadeConvFFTSize = oldL;
-            crossfadeRemaining = CrossfadeLen;
+            else
+            {
+                // 延迟不同：冲刷新侧累加器，立即切换到新设计。
+                flushConvolvers();
+            }
         }
         activeConvFFTSize = L;
         processedVersion = version;
@@ -370,27 +460,18 @@ void FFTProcessor::process(juce::AudioBuffer<float>& buffer)
         }
 
         crossfadeRemaining = std::max(0, startRemaining - numSamples);
-        if (crossfadeRemaining == 0 && oldState != nullptr)
-        {
-            // 淡化结束：旧设计移交退役环（后台线程析构，音频线程不释放）。
-            std::lock_guard<std::mutex> lock(stateMutex);
-            pendingDestroy[pendingDestroyHead] = std::move (oldState);
-            pendingDestroyHead = (pendingDestroyHead + 1) % NumRetireSlots;
-        }
+        if (crossfadeRemaining == 0)
+            retireState (oldState);   // 淡化结束：旧设计移交退役环（锁内仅指针搬移）
     }
     else
     {
         if (crossfadeRemaining > 0)
         {
             // 临时缓冲不足（宿主块尺寸超预期）或旧设计不可用：直接收尾淡化，
-            // 避免状态悬挂。
+            // 避免状态悬挂。（F-003 已使块尺寸变化提前重分配缓冲，此分支
+            // 仅剩超常规宿主行为时的兜底。）
             crossfadeRemaining = 0;
-            if (oldState != nullptr)
-            {
-                std::lock_guard<std::mutex> lock(stateMutex);
-                pendingDestroy[pendingDestroyHead] = std::move (oldState);
-                pendingDestroyHead = (pendingDestroyHead + 1) % NumRetireSlots;
-            }
+            retireState (oldState);
         }
         for (int ch = 0; ch < channelCount; ++ch)
         {
@@ -411,6 +492,11 @@ int FFTProcessor::getLatencySamples() const
         return 0;
     // Overlap-add pipeline delays the output by ConvBlockLen-1 samples
     // (the first output sample appears after the first complete block).
+    //
+    // PDC 与实际输出的一致性（F-006）：延迟不同的设计发布后立即冲刷切换
+    // （无交叉淡化），因此 PDC 翻转的当块起输出即按新延迟补偿；同延迟
+    // 设计走 1024 样本交叉淡化且延迟数值不变——两条路径下上报的延迟都
+    // 匹配实际输出的管线延迟。
     return state->groupDelay + (ConvBlockLen - 1);
 }
 

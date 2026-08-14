@@ -209,18 +209,6 @@ juce::Rectangle<float> FrequencyResponse::getResponseArea() const
                                    static_cast<float>(getHeight()) - marginTop - marginBottom);
 }
 
-juce::Rectangle<float> FrequencyResponse::getGainArea() const
-{
-    return getResponseArea();
-}
-
-juce::Rectangle<float> FrequencyResponse::getPhaseArea() const
-{
-    auto area = getResponseArea();
-    // Phase labels drawn to the right of the response area
-    return juce::Rectangle<float>(area.getRight(), area.getY(), 50.0f, area.getHeight());
-}
-
 float FrequencyResponse::freqToX(float freq) const
 {
     auto area = getResponseArea();
@@ -249,12 +237,6 @@ float FrequencyResponse::phaseToY(float degrees) const
 {
     auto area = getResponseArea();
     return SubEQ::phaseToY(degrees, area.getBottom(), area.getHeight());
-}
-
-float FrequencyResponse::yToPhase(float y) const
-{
-    auto area = getResponseArea();
-    return SubEQ::yToPhase(y, area.getBottom(), area.getHeight());
 }
 
 void FrequencyResponse::drawGrid(juce::Graphics& g)
@@ -321,8 +303,6 @@ void FrequencyResponse::drawGrid(juce::Graphics& g)
 void FrequencyResponse::drawSpectrum(juce::Graphics& g)
 {
     auto area = getResponseArea();
-    const float bottomY = area.getBottom();
-    const float height = area.getHeight();
 
     // Band counts snapshotted together with the data in timerCallback
     const int outBands = spectrumBands;
@@ -352,9 +332,11 @@ void FrequencyResponse::drawSpectrum(juce::Graphics& g)
             // Clamp dB to valid display range to prevent Y coordinate overflow
             db = juce::jlimit(-120.0f, 12.0f, db);
 
-            // Map dB to Y: -60dB at bottom, 0dB at top
-            float norm = juce::jlimit(0.0f, 1.0f, (db + 60.0f) / 60.0f);
-            float y = bottomY - height * norm;
+            // 与 EQ 网格同轴映射（±24 dB，gainToY；F-014）：频谱与频响
+            // 曲线/刻度在纵轴对齐。低于 -24 dB 的谱值钉在绘图区底边
+            // （不再把 -60..0 dB 独立压缩到整个绘图区高度）。
+            db = juce::jlimit(-24.0f, 24.0f, db);
+            float y = gainToY(db);
 
             // Skip NaN/Inf points to prevent path corruption
             if (std::isnan(y) || std::isinf(y))
@@ -683,9 +665,10 @@ void FrequencyResponse::updateNodePhysics()
 {
     // Low-pass position filter: filtPos'' + 2ζωₙ·filtPos' + ωₙ²·filtPos = ωₙ²·exactPos
     // ωₙ = 20 rad/s (≈3.2 Hz), ζ = 0.5 — the white circle lags behind and springs back
+    // （常量收敛到 DesignConstants 单一事实来源，F-018）
     constexpr float dt = 1.0f / 60.0f;
-    constexpr float wn2 = 400.0f;
-    constexpr float twoZetaWn = 20.0f;
+    constexpr float wn2 = DesignConstants::nodeSpringWn2;
+    constexpr float twoZetaWn = DesignConstants::nodeSpringTwoZetaWn;
 
     for (int i = 0; i < SubEQ::NumNodes; ++i)
     {
@@ -892,7 +875,6 @@ void FrequencyResponse::mouseDown(const juce::MouseEvent& event)
                 isDraggingNode = false;
                 nodePressed = false;
                 dragVector = {};
-                dragStartedOnNode = false;
                 draggedNode = -1;
                 dragGestureGain = false;
                 dragGestureQ = false;
@@ -941,7 +923,6 @@ void FrequencyResponse::mouseDown(const juce::MouseEvent& event)
             selectNode(node);
             nodePressed = true;
             isDragging = true;
-            dragStartedOnNode = true;
             draggedNode = node;
             dragStartPos = pos;
             dragStartFreq = getNodeParamValue(node, SubEQ::ParamID::Freq);
@@ -963,7 +944,6 @@ void FrequencyResponse::mouseDown(const juce::MouseEvent& event)
             // physics filter at the exact position (no jump on click)
             isDraggingNode = true;
             dragStartScale = nodeScale[node].getCurrent();
-            dragStartNodeScreen = getNodeScreenPos(node);
             dragVector = {};
             auto exact = getNodeScreenPos(node);
             physPos[node] = {};
@@ -986,7 +966,6 @@ void FrequencyResponse::mouseDown(const juce::MouseEvent& event)
             {
                 nodePressed = true;
                 isDragging = true;
-                dragStartedOnNode = true;
                 draggedNode = newNode;
                 dragStartPos = pos;
                 dragStartFreq = getNodeParamValue(newNode, SubEQ::ParamID::Freq);
@@ -1002,7 +981,6 @@ void FrequencyResponse::mouseDown(const juce::MouseEvent& event)
                 // Liquid-glass drag state (new node starts hover-magnified)
                 isDraggingNode = true;
                 dragStartScale = 2.0f;
-                dragStartNodeScreen = getNodeScreenPos(newNode);
                 dragVector = {};
                 auto exactNew = getNodeScreenPos(newNode);
                 physPos[newNode] = {};
@@ -1115,7 +1093,6 @@ void FrequencyResponse::mouseUp(const juce::MouseEvent& event)
     isDraggingNode = false;
     nodePressed = false;
     dragVector = {};
-    dragStartedOnNode = false;
     draggedNode = -1;
     dragGestureGain = false;
     dragGestureQ = false;
@@ -1182,7 +1159,8 @@ void FrequencyResponse::mouseWheelMove(const juce::MouseEvent& event,
     if (node >= 0)
     {
         float qVal = getNodeParamValue(node, SubEQ::ParamID::Q);
-        // Logarithmic Q mapping: each wheel step = fixed ratio change (~25%)
+        // 对数 Q 映射：Windows 滚轮 deltaY ≈ ±0.234/格（JUCE amount/256）
+        // ×0.1 → 每格 ≈ +5.5%（F-013：原注释 ~25% 与实现不符）
         float newQ = SubEQ::stepLogQ(qVal, wheel.deltaY * 0.1f);
         beginNodeGesture(node, SubEQ::ParamID::Q);
         setNodeParamValue(node, SubEQ::ParamID::Q, newQ);
@@ -1279,11 +1257,16 @@ void FrequencyResponse::createNodeAt(float freq, float gain)
     freqParam->endChangeGesture();
     enabledParam->endChangeGesture();
 
-    // Reset Q and Type to defaults for new node
+    // Reset Q and Type to defaults for new node——与拖拽/滚轮一致包裹手势，
+    // 宿主自动化记录才能归组（F-015）
     auto* qParam = apvts.getParameter(SubEQ::getNodeParamID(slot, SubEQ::ParamID::Q));
     auto* typeParam = apvts.getParameter(SubEQ::getNodeParamID(slot, SubEQ::ParamID::Type));
+    qParam->beginChangeGesture();
+    typeParam->beginChangeGesture();
     qParam->setValueNotifyingHost(qParam->convertTo0to1(0.707f));
     typeParam->setValueNotifyingHost(typeParam->convertTo0to1(0.0f));
+    typeParam->endChangeGesture();
+    qParam->endChangeGesture();
 
     selectNode(slot);
     parametersChanged = true;
@@ -1480,11 +1463,21 @@ void FrequencyResponse::startTypeMenu(int nodeIndex)
                 const int oldType = static_cast<int>(getNodeParamValue(nodeIndex, SubEQ::ParamID::Type));
                 const int newType = result - 1;
                 auto* p = getNodeParam(nodeIndex, SubEQ::ParamID::Type);
+
+                // 类型切换与可能的增益重置包裹在同一个手势里（F-015），
+                // 宿主自动化/undo 才能归组为一次编辑
+                p->beginChangeGesture();
                 p->setValueNotifyingHost(p->convertTo0to1(static_cast<float>(newType)));
 
                 // If switching from gain-sensitive to non-gain-sensitive, reset gain to 0 dB
                 if (SubEQ::shouldResetGainOnTypeChange(oldType, newType))
+                {
+                    auto* gainP = getNodeParam(nodeIndex, SubEQ::ParamID::Gain);
+                    gainP->beginChangeGesture();
                     setNodeParamValue(nodeIndex, SubEQ::ParamID::Gain, 0.0f);
+                    gainP->endChangeGesture();
+                }
+                p->endChangeGesture();
 
                 parametersChanged = true;
                 repaint();

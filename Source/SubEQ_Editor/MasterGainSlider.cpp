@@ -55,10 +55,11 @@ void MasterGainSlider::timerCallback()
     // Fill-bar inertia: spring the filtered edge toward the exact thumb centre
     if (fillPhys.active)
     {
-        // filt'' + 2ζωₙ·filt' + ωₙ²·filt = ωₙ²·exact (ωₙ = 5 Hz, ζ = 0.5)
+        // filt'' + 2ζωₙ·filt' + ωₙ²·filt = ωₙ²·exact（ωₙ = 5 Hz，ζ = 0.5；
+        // 常量收敛到 DesignConstants 单一事实来源，F-018）
         constexpr float dt = 1.0f / 60.0f;
-        constexpr float wn2 = 986.96f;      // (2π·5)²
-        constexpr float twoZetaWn = 31.416f; // 2·0.5·2π·5
+        constexpr float wn2 = DesignConstants::faderFillSpringWn2;       // (2π·5)²
+        constexpr float twoZetaWn = DesignConstants::faderFillSpringTwoZetaWn; // 2·0.5·2π·5
 
         float targetY = getThumbCentreY();
         SubEQ::stepSpring(fillPhys.y, fillPhys.vel, dt, targetY, wn2, twoZetaWn);
@@ -357,10 +358,12 @@ void MasterGainSlider::mouseDrag(const juce::MouseEvent& event)
     float range = getTravelBottom() - getTravelTop();
     float newValue = dragStartValue + deltaY / range * 48.0f;
 
-    // 0dB stall detent while dragging — record the RAW value first so a
-    // crossing step keeps its sign information for the next event
-    dragLastValue = newValue;
+    // 0dB 失速吸附（F-012）：吸附前先用上一事件的 RAW 值做跨零符号比较，
+    // 再记录本事件 RAW 值供下一事件使用——若先覆盖 dragLastValue，跨零
+    // 分支 dragLastValue * value 恒 ≥ 0（永假），失速吸附只剩绝对吸附。
+    const float raw = newValue;
     snapToZeroDetent(newValue);
+    dragLastValue = raw;
     setValue(newValue);
 
     // The thumb tracks exactly; the fill edge follows via the spring in
@@ -426,7 +429,8 @@ void MasterGainSlider::mouseWheelMove(const juce::MouseEvent& event,
 {
     float oldFillY = getThumbCentreY();
     float value = getCurrentValue();
-    // Wheel deltaY is typically ±0.05..0.15 per notch → ~±1 dB per notch
+    // Windows 滚轮 deltaY ≈ ±0.234/格（JUCE 源码 amount/256，amount=±60）
+    // → ×10 后实际约 ±2.3 dB/格（F-013：原注释 ±1 dB 与实现不符）
     value += wheel.deltaY * 10.0f;
 
     // Wrap each wheel step in a gesture so hosts record automation correctly

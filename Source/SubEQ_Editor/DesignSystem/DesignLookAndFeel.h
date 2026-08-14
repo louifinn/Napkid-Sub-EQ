@@ -27,13 +27,9 @@ public:
                           bool shouldDrawButtonAsHighlighted,
                           bool shouldDrawButtonAsDown) override;
 
-    void drawRotarySlider(juce::Graphics& g, int x, int y, int width, int height,
-                          float sliderPosProportional, float rotaryStartAngle,
-                          float rotaryEndAngle, juce::Slider&) override;
-
-    void drawLinearSlider(juce::Graphics& g, int x, int y, int width, int height,
-                          float sliderPos, float minSliderPos, float maxSliderPos,
-                          const juce::Slider::SliderStyle style, juce::Slider&) override;
+    // 注意（F-017）：无 drawRotarySlider/drawLinearSlider 重载——全仓没有
+    // 任何 juce::Slider 实例（主增益为自定义 Component、EQ 节点自绘），
+    // 两个重载原为永不可达的死代码，已删除。
 
     void drawComboBox(juce::Graphics& g, int width, int height, bool isButtonDown,
                       int buttonX, int buttonY, int buttonW, int buttonH,

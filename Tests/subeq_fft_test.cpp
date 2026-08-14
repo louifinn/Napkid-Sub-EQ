@@ -34,6 +34,7 @@
 #include <cstdlib>
 #include <limits>
 #include <random>
+#include <string>   // std::string / std::to_string（F-022：自包含性）
 
 using namespace SubEQ;
 
@@ -259,7 +260,10 @@ int main()
         st.outRead = 0;
 
         std::vector<std::complex<double>> h(L, { 0.0, 0.0 });
-        h[0] = { 1.0, 0.0 };   // identity filter
+        // 注意（F-024）：此处的 h 是未经 FFT 的频域系数（[1,0,0,...]），
+        // 实际为 DC-only 滤波器（每块输出 = 块直流分量/L），并非恒等
+        // 滤波器——恒等路径由 Test 7 覆盖。其作用是快速建立非零卷积尾。
+        h[0] = { 1.0, 0.0 };
         std::vector<std::complex<double>> scratch(L);
         std::vector<double> in(M * 4, 1.0), out(M * 4, 0.0);
 
@@ -663,6 +667,44 @@ int main()
         // 标准 RBJ 带通中心增益 = 0 dB。
         const double wc = kTwoPi * 200.0 / sr;
         check(std::abs(std::abs(biquadResponse(bp0[0], wc)) - 1.0) < 1e-9, "BandPass center gain == 0 dB");
+
+        // 非法 FilterType：default 分支写单位系数并返回 1（F-023），
+        // 调用方不会读到陈旧系数。
+        BiquadCoefficients bad[2];
+        bad[0].b0 = 99.0; bad[0].b1 = 77.0; bad[0].a1 = -0.5;
+        const int nb = computeBiquadCoefficients(100.0, 3.0, 0.7,
+                                                 static_cast<FilterType>(99), sr, bad);
+        const bool identOut = (nb == 1)
+                           && std::abs(bad[0].b0 - 1.0) < 1e-15
+                           && std::abs(bad[0].b1) < 1e-15
+                           && std::abs(bad[0].b2) < 1e-15
+                           && std::abs(bad[0].a1) < 1e-15
+                           && std::abs(bad[0].a2) < 1e-15;
+        check(identOut, "invalid FilterType returns identity biquad (default branch)");
+    }
+
+    // ---- Test 21: biquad cascade fade plan (Tilt <-> Bell state machine, F-007) ----
+    {
+        // Bell -> Tilt：第二 biquad 自 identity 淡入
+        auto a = computeBiquadFadePlan(1, 2, false);
+        check(!a.fadeOutExtra && !a.startFromCurrent, "Bell->Tilt fades 2nd biquad in from identity");
+
+        // Tilt -> Bell：第二 biquad 向 identity 淡出
+        auto b = computeBiquadFadePlan(2, 1, false);
+        check(b.fadeOutExtra && b.startFromCurrent, "Tilt->Bell fades 2nd biquad out to identity");
+
+        // Tilt->Bell 淡出窗口内再次 update()（numBiquads==1, prev==1）：
+        // 必须继续从当前半淡出系数淡出，而不是瞬间丢弃其贡献（F-007）
+        auto c = computeBiquadFadePlan(1, 1, true);
+        check(c.fadeOutExtra && c.startFromCurrent, "mid-fade-out re-update keeps fading from current coeffs");
+
+        // 淡出窗口内切回 Tilt：从当前半淡出系数继续淡入
+        auto d = computeBiquadFadePlan(1, 2, true);
+        check(!d.fadeOutExtra && d.startFromCurrent, "Bell->Tilt during fade-out continues from current coeffs");
+
+        // 单 biquad 常态：无额外淡化状态
+        auto e = computeBiquadFadePlan(1, 1, false);
+        check(!e.fadeOutExtra && !e.startFromCurrent, "single-biquad steady state has no extra fade");
     }
 
     if (failures == 0)

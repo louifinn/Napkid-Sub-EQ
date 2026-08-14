@@ -9,6 +9,7 @@
 
 #include "ModeSelector.h"
 #include "DesignSystem/DesignColours.h"
+#include "DesignSystem/DesignConstants.h"
 #include "DesignSystem/DesignFonts.h"
 
 ModeSelector::ModeSelector (juce::AudioProcessorValueTreeState& apvtsRef)
@@ -193,21 +194,22 @@ void ModeSelector::resized()
 
     // Column widths (design doc 2026-08-06): processing group | divider |
     // spectrum group | elastic gap | right-anchored latency chip
-    const int modeW = 156;
-    const int firW = 80;
-    const int spectrumW = 82;
-    const int gap = 8;
-    const int groupGap = 24;
-    const int chipW = 232;
+    // 数值收敛到 DesignConstants 单一事实来源（F-018）
+    const int modeW = DesignConstants::modeColumnWidth;
+    const int firW = DesignConstants::firColumnWidth;
+    const int spectrumW = DesignConstants::spectrumColumnWidth;
+    const int gap = DesignConstants::columnGap;
+    const int groupGap = DesignConstants::groupGap;
+    const int chipW = DesignConstants::latencyChipWidth;
 
     // Latency chip: right edge, vertically centred on the combo row
     auto chipColumn = bounds.removeFromRight (chipW);
-    chipColumn.removeFromTop (14); // skip the caption row
-    latencyChipBounds = chipColumn.withSizeKeepingCentre (chipW, 22);
+    chipColumn.removeFromTop (DesignConstants::captionRowHeight); // skip the caption row
+    latencyChipBounds = chipColumn.withSizeKeepingCentre (chipW, DesignConstants::latencyChipHeight);
     latencyLabel.setBounds (latencyChipBounds);
 
     // Caption row mirrors the combo columns
-    auto labelRow = bounds.removeFromTop (14);
+    auto labelRow = bounds.removeFromTop (DesignConstants::captionRowHeight);
 
     // Processing group: Mode + FIR
     modeBox.setBounds (bounds.removeFromLeft (modeW));

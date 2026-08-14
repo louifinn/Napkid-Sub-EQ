@@ -26,6 +26,37 @@ constexpr double kTwoPi = 6.2831853071795864769;
 inline double dbToGain(double db) noexcept { return std::pow(10.0, db * 0.05); }
 inline double gainToDb(double gain) noexcept { return 20.0 * std::log10(gain); }
 
+// 级联规模变化时第二 biquad 的淡化计划（EQNode 与 Tests 共用的纯状态机）：
+//   fadeOutExtra     — 第二 biquad 应向 identity 淡出（继续占用处理链）
+//   startFromCurrent — smoothStart[1] 取当前系数；否则自 identity 淡入
+// 规则（F-007）：
+//   · 新增第二 biquad（Bell→Tilt）：自 identity 淡入；若正处于淡出窗口内
+//     切回（当前系数为半淡出值），自当前系数继续淡入。
+//   · 撤下第二 biquad（Tilt→Bell）：向 identity 淡出；淡出窗口内再次
+//     update（numBiquads==1 且 prev==1）时继续淡出而非瞬间丢弃其贡献。
+struct BiquadFadePlan
+{
+    bool fadeOutExtra = false;
+    bool startFromCurrent = false;
+};
+
+inline BiquadFadePlan computeBiquadFadePlan(int prevNumBiquads, int numBiquads,
+                                            bool wasFadingOutExtra) noexcept
+{
+    BiquadFadePlan plan;
+    if (numBiquads > 1)
+    {
+        plan.fadeOutExtra = false;
+        plan.startFromCurrent = (prevNumBiquads > 1) || wasFadingOutExtra;
+    }
+    else if (prevNumBiquads > 1 || wasFadingOutExtra)
+    {
+        plan.fadeOutExtra = true;
+        plan.startFromCurrent = true;
+    }
+    return plan;
+}
+
 // Compute biquad coefficients for one EQ node from its parameters. Writes up to
 // two biquads into `out` and returns the biquad count (1, or 2 for Tilt).
 inline int computeBiquadCoefficients(double freqHz, double gainDb, double qValue,
@@ -173,8 +204,13 @@ inline int computeBiquadCoefficients(double freqHz, double gainDb, double qValue
             out[0].a2 = (1.0 - alpha) / a0;
             return 1;
         }
+        default:
+            // 非法枚举值（共享头文件防御性兜底，F-023）：写单位系数并
+            // 返回 1，避免调用方读到陈旧系数。生产路径经 intToFilterType
+            // 回落 Bell，此分支不可达。
+            out[0] = BiquadCoefficients{};
+            return 1;
     }
-    return 1;
 }
 
 } // namespace SubEQ

@@ -2,6 +2,46 @@
 
 Napkid Sub EQ 的所有重要变更都将记录在此文件中。
 
+## [0.3.4] - 2026-08-14
+
+> 第 1 轮全量代码审查（docs/review/findings.md）修复轮：P1 × 1、P2 × 23 全部处理完毕。
+
+### 修复
+
+- **F-001（P1）epoch 校验与发布之间的 TOCTOU 竞态**：epoch 复检移入发布临界区内，与 `prepare()` 的"先 bump epoch、同锁清空 currentState"构成同锁序列化——采样率切换时按旧采样率设计的系数不可能再写回。
+- **F-002 大块释放移出临界区**：后台线程排空退役环改为"锁内移出、锁外析构"；发布处旧 `currentState` 同样移出临界区析构；`prepare`/`clearPublishedState` 只做指针搬移——音频线程过渡期锁点不再可能被 ~2.3 MB 释放放大。
+- **F-003 块尺寸增大不再静默关闭交叉淡化**：`prepare()` 对增大的 `maxBlockSize` 提前重分配 `xfadeOld/xfadeNew`（不动设计/epoch），`process()` 的淡化分支不再因缓冲不足跳过淡化（输出阶跃回归）。
+- **F-004 淡化期间再次发布不产生新侧跳变**：同延迟的新设计先挂起（`pendingState`），当前淡化收尾后再开启新淡化；延迟不同的设计立即收尾淡化并冲刷切换。
+- **F-005 Release 下 stopThread 失败兜底**：`stopThread(5000)` 失败后继续阻塞等待线程退出（`while (isThreadRunning()) wait(50)`），消除析构返回后 `run()` 访问 `this` 的 UAF 窗口。
+- **F-006 PDC 与输出一致性**：仅 `groupDelay` 相同（两侧管线延迟一致）时交叉淡化；延迟不同的设计（FIR 长度/模式变化）冲刷累加器立即切换——PDC 翻转当块起补偿即与实际输出一致。**权衡说明**：延迟变化的切换恢复为瞬时切换（旧延迟尾音按新延迟补偿会变成可闻前回声），可能伴随轻微切换阶跃，同延迟的参数编辑仍保持无阶跃淡化。
+- **F-007 Tilt→单 biquad 淡出窗口内再次 update 丢贡献**：级联淡化计划抽为纯函数 `computeBiquadFadePlan()`（`SubEQ_BiquadDesign.h`，插件与 Tests 共用）；淡出窗口内再次 `update()` 时第二 biquad 从当前半淡出系数继续向 identity 淡出。
+- **F-008 主 bypass 无淡化**：bypass 改为 ~15 ms 湿/干交叉淡化（块粒度推进），旁路期间节点链保持处理（热旁路）——解除旁路时无陈旧状态瞬态，切换无咔哒。
+- **F-009 prepareToPlay 线程契约**：`updateEQParameters()` 注释改为"audio thread 或宿主已停止处理的 prepare 上下文"；`getEQEngine()` 注明非线程安全且全仓无调用方。
+- **F-010 twiddle 预热线程亲和兜底**：`FFTProcessor::process` 与 `SpectrumAnalyzer::process` 对实际尺寸做惰性预热（幂等、命中即 O(log n) 查找），宿主在非音频线程调用 `prepareToPlay` 时音频线程首次 FFT 也不会分配。
+- **F-011 Hann 窗重生成尖峰**：三档窗表（4096/8192/16384）在构造时（消息线程）一次性生成，`configure()` 仅切换指针——音频线程不再执行 O(N) 三角函数。
+- **F-012 0dB 失速吸附死分支**：`mouseDrag` 先用上一事件 RAW 值做跨零符号比较、再记录本事件 RAW 值——"跨零失速"第二分支恢复生效。
+- **F-013 滚轮步进注释失实**：按 JUCE 实测 `deltaY ≈ ±0.234/格` 更正注释（主增益 ≈±2.3 dB/格、Q ≈+5.5%/格），乘数保持不变。
+- **F-014 频谱纵轴与网格对齐**：频谱改与 EQ 网格同轴（`gainToY`，±24 dB 钳位）——0 dB 谱峰不再显示在 +24 dB 网格线上；低于 -24 dB 的谱值钉在底边。
+- **F-015 自动化手势缺口**：`createNodeAt` 的 Q/Type 默认值写入与类型菜单切换（含增益重置）补 `begin/endChangeGesture`。
+- **F-016~F-017 死代码删除**：`FrequencyResponse` 的 `dragStartNodeScreen`/`dragStartedOnNode`/`getGainArea`/`getPhaseArea`/`yToPhase`；`DesignLookAndFeel` 永不可达的 `drawRotarySlider`/`drawLinearSlider` 重载与 `juce::Slider` 颜色设置（全仓无 Slider 实例）。
+- **F-018 设计 token 收敛**：删除全部未引用 token 与未引用颜色（阴影/字号/旋钮/开关/深色面板等）；弹簧常量（节点低通、推子填充边）、字号、底部面板布局数值收敛到 `DesignConstants` 单一事实来源；`drawDropShadow` 注明 cornerRadius 被精灵方案忽略的原因。
+- **F-019 玻璃绘制防御**：`LiquidGlassEffect::drawRoundedRect` 入口对空/零尺寸、非正圆角与零缩放直接返回。
+- **F-020 静态缓存同步**：`DesignFonts` 改用函数局部 magic static（线程安全一次初始化）；tinted sprite 缓存注释明确"仅限 GUI 线程"。
+- **F-021 构建警告清零**：`drawHorizontalLine`/`drawImage` 显式转换（`static_cast<float>`/`roundToInt`），必需未用参数 `juce::ignoreUnused`——Release 构建零警告。
+- **F-022 头文件自包含**：`SubEQ_DSPMath.h` 补 `<utility>`、`AnimationUtils.h` 补 `<functional>`、Tests 补 `<string>`。
+- **F-023 biquad 设计防御**：`computeBiquadCoefficients` 补 default 分支写单位系数，非法枚举值不再返回陈旧系数。
+
+### 测试
+
+- **F-024 回归补强**：F-007 级联淡化计划抽纯函数后新增 5 项回归（Test 21），F-023 新增 1 项回归——**96 → 102 项，全部通过**。Test 5b 注释更正（`h[0]=1` 是未经 FFT 的 DC-only 滤波器，非恒等滤波器；恒等路径由 Test 7 覆盖）。
+- **测试边界说明**：v0.3.3 三项头条修复（`EQNode::prepare` 采样率重算、PDC 延迟上报、同会话重复 prepare 不重设计）位于 JUCE 依赖文件中，独立测试不可覆盖；本轮 F-001/F-003/F-006 属发布-订阅时序与延迟权衡，同样依赖 JUCE 线程环境，验证方式为代码审查 + Release 构建 + 人工试听。
+
+### 工程
+
+- 版本号 0.3.3 → 0.3.4（`.jucer` version、`JucePluginDefines.h` 三项版本宏、`JucePlugin_ARADocumentArchiveID` 一并同步）。
+- `docs/review/findings.md` 全部条目状态更新为"已修复"，并附处理记录表。
+- `AGENTS.md` 同步：版本号、测试项数（96 → 102）、DesignSystem 描述（无 Slider 重载、token 语义）。
+
 ## [0.3.3] - 2026-08-14
 
 > 代码审查修复轮：采样率切换后 IIR 系数错位、三处音频线程 GUI/PDC 越界调用、同会话重复 prepare 的冗余 FIR 重设计，以及若干语义/文档修正。

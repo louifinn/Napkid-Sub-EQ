@@ -17,6 +17,7 @@
 
 #include <complex>
 #include <cmath>
+#include <utility>   // std::swap（F-022：自包含性）
 #include <vector>
 
 namespace SubEQ

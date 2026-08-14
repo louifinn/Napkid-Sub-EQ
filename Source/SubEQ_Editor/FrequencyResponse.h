@@ -77,7 +77,6 @@ private:
     int hoveredNode = -1;
     bool isDraggingNode = false;
     float dragStartScale = 1.0f;                 // node scale captured on mouseDown
-    juce::Point<float> dragStartNodeScreen;      // node screen pos at drag start
     juce::Point<float> dragVector;               // drag direction (glass highlight offset)
     PhysicsPos physPos[SubEQ::NumNodes];
     AnimationUtils::AnimatedValue nodeScale[SubEQ::NumNodes];
@@ -85,7 +84,6 @@ private:
     // Drag state
     bool isDragging = false;
     bool isDeleting = false;
-    bool dragStartedOnNode = false;
     int draggedNode = -1;
     bool dragGestureGain = false;            // Gain gesture begun at drag start
     bool dragGestureQ = false;               // Q gesture begun at drag start
@@ -152,14 +150,11 @@ private:
 
     // Coordinate conversion
     juce::Rectangle<float> getResponseArea() const;
-    juce::Rectangle<float> getGainArea() const;
-    juce::Rectangle<float> getPhaseArea() const;
     float freqToX(float freq) const;
     float xToFreq(float x) const;
     float gainToY(float gainDb) const;
     float yToGain(float y) const;
     float phaseToY(float degrees) const;
-    float yToPhase(float y) const;
 
     // Drawing
     void updateResponsePaths();

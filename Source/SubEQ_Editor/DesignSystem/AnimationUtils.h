@@ -6,6 +6,7 @@
 */
 
 #pragma once
+#include <functional>   // std::function（F-022：自包含性）
 #include <JuceHeader.h>
 
 namespace AnimationUtils

@@ -20,8 +20,13 @@ SpectrumAnalyzer::SpectrumAnalyzer()
     // allocates on the audio thread
     ringBuffer.resize(MaxFftSize, 0.0f);
     fftData.resize(MaxFftSize);
-    window.resize(MaxFftSize, 0.0f);
     binPower.resize(MaxFftSize / 2, 0.0);
+
+    // 三档 Hann 窗一次性生成（F-011）：构造运行于消息线程，O(N) 三角
+    // 函数不落音频线程；configure() 之后仅切换 activeWindow 指针。
+    for (int order = 12; order <= MaxFftOrder; ++order)
+        for (int i = 0; i < (1 << order); ++i)
+            cachedWindows[order - 12][i] = hannWindowValue(i, 1 << order);
 
     for (int i = 0; i < MaxBands; ++i)
     {
@@ -30,7 +35,6 @@ SpectrumAnalyzer::SpectrumAnalyzer()
     }
 
     updateBandBounds (61);
-    regenerateWindow();
 }
 
 void SpectrumAnalyzer::updateBandBounds (int bands)
@@ -41,24 +45,15 @@ void SpectrumAnalyzer::updateBandBounds (int bands)
         bandCenterFreqs[i] = octaveBandCenterFreq(MinFreq, i, bands);
 }
 
-void SpectrumAnalyzer::regenerateWindow()
-{
-    // Hann window over the ACTIVE fftSize (pre-allocated buffer)
-    const int size = fftSize.load();
-    for (int i = 0; i < size; ++i)
-    {
-        window[i] = hannWindowValue(i, size);
-    }
-}
-
 void SpectrumAnalyzer::prepare(double sr)
 {
     sampleRate = sr;
-    regenerateWindow();
 
     // Pre-build twiddle tables for every selectable FFT size on this thread
     // (the cache is thread_local; prepareToPlay normally runs on the audio
     // thread) so the first analysis after a size switch never allocates.
+    // 兜底（F-010）：宿主若在非音频线程调用 prepareToPlay，process() 内
+    // 的惰性预热会在音频线程补上。
     for (int order = 12; order <= MaxFftOrder; ++order)
         prewarmTwiddleTable<double>(1 << order);
 
@@ -77,7 +72,7 @@ void SpectrumAnalyzer::configure(int newFftOrder, int newNumBands, int newHopSiz
     const int hop = (newHopSize == 1024) ? 1024 : (newHopSize == 2048 ? 2048 : 512);
 
     updateBandBounds (bands);
-    regenerateWindow();
+    activeWindow = cachedWindows[fftOrder.load() - 12];   // 仅切换窗表指针（F-011）
 
     // Reset the analysis state so stale data never mixes across configs
     std::fill(ringBuffer.begin(), ringBuffer.end(), 0.0f);
@@ -99,6 +94,16 @@ void SpectrumAnalyzer::process(const float* samples, int numSamples)
 {
     const int size = fftSize.load();
     const int hop = hopSize.load();
+
+    // 音频线程惰性预热（F-010）：prepareToPlay 可能运行于其他线程，
+    // thread_local twiddle 缓存未命中；命中后为 O(log n) 查找。
+    const int order = fftOrder.load();
+    if (order != twiddlePrewarmedOrder)
+    {
+        prewarmTwiddleTable<double>(size);
+        twiddlePrewarmedOrder = order;
+    }
+
     for (int i = 0; i < numSamples; ++i)
     {
         ringBuffer[writeIndex] = samples[i];
@@ -120,10 +125,11 @@ void SpectrumAnalyzer::performAnalysis()
     const int bands = activeNumBands;
 
     // Copy ring buffer to FFT input (correct order), windowed, zero imag
+    // （窗表取自缓存指针，无逐点三角函数）
     for (int i = 0; i < size; ++i)
     {
         int idx = (writeIndex + i) % size;
-        fftData[i] = static_cast<double>(ringBuffer[idx]) * window[i];
+        fftData[i] = static_cast<double>(ringBuffer[idx]) * activeWindow[i];
     }
 
     // Self-contained radix-2 FFT (double), shared with the plugin core

@@ -16,13 +16,9 @@ namespace DesignColours
     inline juce::Colour background()      { return juce::Colour(0xFFF5F0E8); }
     inline juce::Colour surface()         { return juce::Colour(0xFFEDE8DF); }
     inline juce::Colour surfaceDark()     { return juce::Colour(0xFFE8E3DA); }
-    inline juce::Colour panelBackground() { return juce::Colour(0xFF3D3832); }
 
     // Accent
     inline juce::Colour accent()          { return juce::Colour(0xFFFF007B); }
-    inline juce::Colour accentSoft()      { return juce::Colour(0xFFFF5BA3); }
-    inline juce::Colour accentGlow()      { return juce::Colour(0x28FF007B); } // 16% alpha
-    inline juce::Colour accentHover()     { return juce::Colour(0xFFFF80C0); }
 
     // Morandi accents
     inline juce::Colour morandiBlue()     { return juce::Colour(0xFFB8C4CE); }
@@ -32,7 +28,6 @@ namespace DesignColours
     // Text
     inline juce::Colour textPrimary()     { return juce::Colour(0xFF3D3832); }
     inline juce::Colour textSecondary()   { return juce::Colour(0xFF8A837A); }
-    inline juce::Colour textOnDark()      { return juce::Colour(0xFFF5F0E8); }
     inline juce::Colour textDisabled()    { return juce::Colour(0xFFB5AEA4); }
 
     // Light / Shadow

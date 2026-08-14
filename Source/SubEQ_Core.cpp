@@ -64,6 +64,7 @@ void EQNode::update(double freqHz, double gain, double qValue, FilterType type)
     // Capture the previous cascade size before updateXxx() overwrites it, and
     // remember the current coefficients as the smoothing start point.
     const int prevNumBiquads = numBiquads;
+    const bool wasFadingOutExtra = extraBiquadFadeOut;   // 第二 biquad 淡出进行中
     BiquadCoefficients prev[2] = { coeffs[0], coeffs[1] };
 
     numBiquads = computeBiquadCoefficients(freqHz, gainDb, q, type, sampleRate, coeffs);
@@ -77,24 +78,27 @@ void EQNode::update(double freqHz, double gain, double qValue, FilterType type)
     // Install the smoothing state: interpolate from the start points to the
     // new targets over ~15 ms. A convex combination of stable biquad
     // coefficients stays stable, so the transition cannot overshoot.
+    //
+    // 第二 biquad 的淡化计划（纯状态机，与 Tests 共用，F-007）：
+    //  - Tilt→Bell：向 identity 淡出；淡出窗口内再次 update() 时从当前
+    //    半淡出系数继续淡出，而不是瞬间丢弃其滤波贡献。
+    //  - Bell→Tilt：无历史时自 identity 淡入；淡出窗口内切回则自当前
+    //    系数继续淡入。
+    const BiquadFadePlan plan = computeBiquadFadePlan(prevNumBiquads, numBiquads, wasFadingOutExtra);
+    extraBiquadFadeOut = plan.fadeOutExtra;
+
     smoothStart[0] = prev[0];
     targetCoeffs[0] = coeffs[0];
-    extraBiquadFadeOut = false;
 
     if (numBiquads > 1)
     {
-        // A newly added second biquad (e.g. Bell -> Tilt) fades in from
-        // identity (transparent) instead of from stale leftover coefficients.
-        smoothStart[1] = (prevNumBiquads > 1) ? prev[1] : BiquadCoefficients{};
+        smoothStart[1] = plan.startFromCurrent ? prev[1] : BiquadCoefficients{};
         targetCoeffs[1] = coeffs[1];
     }
-    else if (prevNumBiquads > 1)
+    else if (extraBiquadFadeOut)
     {
-        // A dropped second biquad (e.g. Tilt -> Bell) fades out to identity
-        // over the smoothing window instead of leaving the path mid-stream.
         smoothStart[1] = prev[1];
         targetCoeffs[1] = BiquadCoefficients{};
-        extraBiquadFadeOut = true;
     }
 
     if (smoothingEnabled)
@@ -137,6 +141,7 @@ std::complex<double> EQNode::getResponse(double w) const noexcept
 void EQEngine::prepare(double sr, int maxBlockSize)
 {
     sampleRate = sr;
+    bypassFadeStepPerSample = 1.0 / std::max(sr * 0.015, 1.0);   // ~15 ms bypass fade
 
     if (tempBufferSize < maxBlockSize)
     {
@@ -159,8 +164,11 @@ void EQEngine::processChannel(const float* input, float* output, int numSamples,
     if (numSamples <= 0)
         return;
 
-    if (bypass || tempBufferSize <= 0)
+    if (tempBufferSize <= 0)
     {
+        // 未 prepare（宿主异常路径）：直通兜底。
+        // 注意 bypass 不再走瞬时直通——旁路/解除经 ~15 ms 湿/干交叉淡化
+        // （F-008），切换过程中节点链保持处理（热旁路）。
         std::memcpy(output, input, static_cast<size_t>(numSamples) * sizeof(float));
         return;
     }
@@ -208,11 +216,14 @@ void EQEngine::processChunk(const float* input, float* output, int numSamples, i
         }
     }
 
-    // Apply master gain and convert back to float (full dynamic range;
-    // no hard clipping here — the host/output stage handles headroom)
+    // Apply master gain + bypass dry/wet mix, convert back to float (full
+    // dynamic range; no hard clipping here — the host/output stage handles
+    // headroom). 旁路期间 bypassFadeGain 向 0 渐降，输出平滑回到直通。
+    const double dryGain = 1.0 - bypassFadeGain;
     for (int i = 0; i < numSamples; ++i)
     {
-        output[i] = static_cast<float>(tempBuffer[i] * masterGainLinear);
+        const double wet = tempBuffer[i] * masterGainLinear;
+        output[i] = static_cast<float>(input[i] * dryGain + wet * bypassFadeGain);
     }
 }
 

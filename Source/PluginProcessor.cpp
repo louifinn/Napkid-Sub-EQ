@@ -344,6 +344,9 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     // Pick up a freshly published FIR design and report its latency (PDC).
     // The actual setLatencySamples() call is deferred to timerCallback on the
     // message thread (it allocates/locks inside updateHostDisplay).
+    // 与音频路径的一致性（F-006）：延迟不同的设计发布后立即冲刷切换
+    // （无交叉淡化），延迟相同的设计走 1024 样本交叉淡化且延迟不变——
+    // 两条路径下上报的延迟都匹配实际输出的管线延迟。
     if (mode != SubEQ::EQMode::ZeroLatency)
     {
         int newLatency = fftProcessor.getLatencySamples();

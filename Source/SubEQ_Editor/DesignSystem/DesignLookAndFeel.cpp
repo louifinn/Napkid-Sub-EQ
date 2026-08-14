@@ -40,10 +40,8 @@ void DesignLookAndFeel::refreshColours()
     setColour(juce::TextEditor::highlightColourId, DesignColours::accent().withAlpha(0.2f));
     setColour(juce::TextEditor::outlineColourId, juce::Colours::transparentBlack);
     setColour(juce::TextEditor::focusedOutlineColourId, DesignColours::accent());
-    setColour(juce::Slider::thumbColourId, DesignColours::accent());
-    setColour(juce::Slider::trackColourId, DesignColours::trackBackground());
-    setColour(juce::Slider::rotarySliderFillColourId, DesignColours::accent().withAlpha(0.3f));
-    setColour(juce::Slider::rotarySliderOutlineColourId, DesignColours::trackBackground());
+    // 无 juce::Slider 实例（主增益为自定义 Component），Slider 颜色设置已
+    // 随死代码滑杆重载一并删除（F-017）
     setColour(juce::ToggleButton::tickColourId, DesignColours::accent());
     setColour(juce::ToggleButton::tickDisabledColourId, DesignColours::textDisabled());
     setColour(juce::ListBox::backgroundColourId, surf.withAlpha(0.5f));
@@ -135,98 +133,6 @@ void DesignLookAndFeel::drawToggleButton(juce::Graphics& g, juce::ToggleButton& 
         g.setColour(isOn ? DesignColours::accent() : DesignColours::textPrimary());
         g.setFont(DesignFonts::label());
         g.drawText(button.getButtonText(), bounds, juce::Justification::centred, false);
-    }
-}
-
-void DesignLookAndFeel::drawRotarySlider(juce::Graphics& g, int x, int y, int width, int height,
-                                          float sliderPosProportional, float rotaryStartAngle,
-                                          float rotaryEndAngle, juce::Slider& slider)
-{
-    auto bounds = juce::Rectangle<int>(x, y, width, height).toFloat().reduced(4.0f);
-    float radius = juce::jmax(4.0f, juce::jmin(bounds.getWidth(), bounds.getHeight()) * 0.5f);
-    auto centre = bounds.getCentre();
-    bool isMouseOver = slider.isMouseOverOrDragging();
-    bool isMouseDown = slider.isMouseButtonDown();
-
-    // Outer ring background
-    g.setColour(DesignColours::trackBackground());
-    g.fillEllipse(centre.x - radius, centre.y - radius, radius * 2.0f, radius * 2.0f);
-
-    // Value arc
-    float angle = rotaryStartAngle + sliderPosProportional * (rotaryEndAngle - rotaryStartAngle);
-    juce::Path valueArc;
-    valueArc.addCentredArc(centre.x, centre.y, radius - 4.0f, radius - 4.0f,
-                           0.0f, rotaryStartAngle, angle, true);
-    g.setColour(DesignColours::accent().withAlpha(0.35f));
-    g.strokePath(valueArc, juce::PathStrokeType(4.0f, juce::PathStrokeType::curved));
-
-    // Knob body
-    float knobRadius = radius - 12.0f;
-    auto knobBounds = juce::Rectangle<float>(centre.x - knobRadius, centre.y - knobRadius,
-                                             knobRadius * 2.0f, knobRadius * 2.0f);
-
-    drawMatteSurface(g, knobBounds, knobRadius,
-                     isMouseDown, isMouseOver, false);
-
-    // Pointer
-    float pointerLen = knobRadius * 0.6f;
-    float px = centre.x + std::cos(angle) * pointerLen;
-    float py = centre.y + std::sin(angle) * pointerLen;
-
-    g.setColour(DesignColours::textPrimary());
-    g.fillEllipse(px - 3.0f, py - 3.0f, 6.0f, 6.0f);
-
-    // Value label
-    if (slider.getTextBoxWidth() > 0)
-    {
-        g.setColour(DesignColours::textSecondary());
-        g.setFont(DesignFonts::caption());
-        g.drawText(slider.getTextFromValue(slider.getValue()),
-                   bounds.removeFromBottom(16), juce::Justification::centred, false);
-    }
-}
-
-void DesignLookAndFeel::drawLinearSlider(juce::Graphics& g, int x, int y, int width, int height,
-                                          float sliderPos, float minSliderPos, float maxSliderPos,
-                                          const juce::Slider::SliderStyle style, juce::Slider& slider)
-{
-    auto bounds = juce::Rectangle<int>(x, y, width, height).toFloat();
-    bool isVertical = (style == juce::Slider::LinearVertical ||
-                       style == juce::Slider::LinearBarVertical);
-
-    if (isVertical)
-    {
-        // Track
-        float trackX = bounds.getCentreX() - DesignConstants::faderTrackWidth * 0.5f;
-        auto trackBounds = juce::Rectangle<float>(trackX, bounds.getY() + 8.0f,
-                                                   DesignConstants::faderTrackWidth,
-                                                   bounds.getHeight() - 16.0f);
-        g.setColour(DesignColours::trackBackground().withAlpha(0.7f));
-        g.fillRoundedRectangle(trackBounds, DesignConstants::faderTrackWidth * 0.5f);
-
-        // Fill
-        float fillHeight = sliderPos - trackBounds.getY();
-        if (fillHeight > 0)
-        {
-            auto fillBounds = trackBounds.withHeight(fillHeight);
-            g.setColour(DesignColours::trackFill());
-            g.fillRoundedRectangle(fillBounds, DesignConstants::faderTrackWidth * 0.5f);
-        }
-
-        // Thumb (standard, non-liquid-glass here - Fader component overrides)
-        float thumbY = sliderPos - DesignConstants::faderThumbHeight * 0.5f;
-        auto thumbBounds = juce::Rectangle<float>(
-            bounds.getCentreX() - DesignConstants::faderThumbWidth * 0.5f,
-            thumbY, DesignConstants::faderThumbWidth, DesignConstants::faderThumbHeight);
-
-        drawMatteSurface(g, thumbBounds, DesignConstants::cornerRadiusSmall,
-                         slider.isMouseButtonDown(), slider.isMouseOverOrDragging(), false);
-    }
-    else
-    {
-        // Horizontal fallback
-        juce::LookAndFeel_V4::drawLinearSlider(g, x, y, width, height, sliderPos,
-                                                minSliderPos, maxSliderPos, style, slider);
     }
 }
 
@@ -391,11 +297,15 @@ void DesignLookAndFeel::drawPopupMenuItem(juce::Graphics& g, const juce::Rectang
                                            const juce::Drawable* icon,
                                            const juce::Colour* textColour)
 {
+    juce::ignoreUnused (hasSubMenu, icon);   // LAF 虚函数签名所需（F-021：消除 C4100）
+
     if (isSeparator)
     {
         auto sepBounds = area.reduced(8, 0);
         g.setColour(DesignColours::shadowEdge());
-        g.drawHorizontalLine(area.getCentreY(), sepBounds.getX(), sepBounds.getRight());
+        g.drawHorizontalLine(area.getCentreY(),
+                             static_cast<float>(sepBounds.getX()),
+                             static_cast<float>(sepBounds.getRight()));
         return;
     }
 
@@ -446,6 +356,8 @@ void DesignLookAndFeel::drawDocumentWindowTitleBar(juce::DocumentWindow& window,
                                                     const juce::Image* icon,
                                                     bool drawTitleTextOnLeft)
 {
+    juce::ignoreUnused (icon);   // LAF 虚函数签名所需（F-021：消除 C4100）
+
     // Warm matte title bar, continuous with the toolbar below
     juce::ColourGradient bg(DesignColours::surfaceDark().brighter(0.02f),
                             0.0f, 0.0f,
@@ -769,7 +681,9 @@ juce::Image DesignLookAndFeel::getDropShadowSprite()
 
 juce::Image DesignLookAndFeel::getTintedShadowSprite(const juce::Colour& colour)
 {
-    // Cache tinted sprites per colour — only a handful of shadow colours exist
+    // 注意（F-020）：仅限 GUI 消息线程调用——全部调用方都在 paint 路径。
+    // 若未来被非 GUI 线程调用，std::map 并发插入构成 UB。缓存键为少量
+    // 固定 ARGB 阴影色，不会无限增长。
     static std::map<juce::uint32, juce::Image> cache;
     auto it = cache.find(colour.getARGB());
     if (it != cache.end())
@@ -801,10 +715,15 @@ void DesignLookAndFeel::drawDropShadow(juce::Graphics& g, juce::Rectangle<float>
     auto inner = bounds.reduced(bodyInset);
     auto shadowArea = inner.expanded(reach).translated(0.0f, 2.0f);
 
-    g.drawImage(getTintedShadowSprite(shadowColour),
-                shadowArea.getX(), shadowArea.getY(),
-                shadowArea.getWidth(), shadowArea.getHeight(),
-                0, 0, spriteSize, spriteSize, false);
+    // 阴影圆角由 sprite 烘焙的 6px 决定：精灵按 9 宫格拉伸绘制，不随传入
+    // cornerRadius 重烘焙（F-018 注释化；偏移 2px 亦为精灵方案固定值）。
+    juce::ignoreUnused (cornerRadius);
 
-    (void)cornerRadius;
+    const int sx = juce::roundToInt(shadowArea.getX());
+    const int sy = juce::roundToInt(shadowArea.getY());
+    const int sw = juce::roundToInt(shadowArea.getWidth());
+    const int sh = juce::roundToInt(shadowArea.getHeight());
+    g.drawImage(getTintedShadowSprite(shadowColour),
+                sx, sy, sw, sh,
+                0, 0, spriteSize, spriteSize, false);
 }

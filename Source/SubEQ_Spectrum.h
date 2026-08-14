@@ -58,7 +58,6 @@ public:
 private:
     void performAnalysis();
     void updateBandBounds(int bands);
-    void regenerateWindow();
 
     double sampleRate = 48000.0;
 
@@ -76,8 +75,16 @@ private:
     // Pre-allocated at maximum size (no allocation on reconfiguration)
     std::vector<float> ringBuffer;   // MaxFftSize
     std::vector<std::complex<double>> fftData; // MaxFftSize (self FFT)
-    std::vector<float> window;       // MaxFftSize
     std::vector<double> binPower;    // MaxFftSize / 2
+
+    // 三档 Hann 窗缓存（order 12/13/14，构造时一次性生成，F-011）：
+    // configure() 只切换指针/尺寸，音频线程不再执行 O(N) 三角函数尖峰。
+    float cachedWindows[3][MaxFftSize] = {};
+    const float* activeWindow = cachedWindows[1];   // 8192 默认（order 13）
+
+    // 音频线程惰性 twiddle 预热去重（F-010）：prepareToPlay 可能运行于
+    // 其他线程（thread_local 缓存未命中），尺寸变化时在音频线程预热。
+    int twiddlePrewarmedOrder = -1;
 
     int writeIndex = 0;
     int samplesSinceLastAnalysis = 0;

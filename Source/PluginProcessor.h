@@ -59,11 +59,17 @@ public:
 
     //==============================================================================
     juce::AudioProcessorValueTreeState& getAPVTS() { return apvts; }
+
+    // 音频线程引擎引用（非线程安全）：仅供音频线程/诊断使用。当前全仓无
+    // 调用方（GUI 曲线使用自己的引擎副本 responseEngine），请勿新增跨线程
+    // 调用（F-009）。
     SubEQ::EQEngine& getEQEngine() { return eqEngine; }
     const SubEQ::EQEngine& getEQEngine() const { return eqEngine; }
 
-    // Synchronize EQ engine state from APVTS parameters (audio thread only —
-    // writes eqEngine and the non-atomic caches; never call from the GUI thread)
+    // Synchronize EQ engine state from APVTS parameters. Audio thread, or the
+    // prepareToPlay context where the host has stopped processing (JUCE does
+    // not guarantee prepareToPlay runs on the audio thread) — writes eqEngine
+    // and the non-atomic caches; never call from the GUI thread (F-009).
     void updateEQParameters();
 
     // Spectrum analyzer access

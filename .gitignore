@@ -5,3 +5,5 @@ Tests/*.exe
 *.obj
 Tests/*.pdb
 /.mimosa/
+# 审查轮次构建证据日志（台账 docs/review/findings.md 已记录验证汇总）
+docs/review/build_*.log

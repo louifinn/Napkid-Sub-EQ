@@ -25,6 +25,6 @@ private:
     static juce::Font withTypeface(juce::Typeface::Ptr typeface, float size,
                                     juce::Font::FontStyleFlags style = juce::Font::plain);
 
-    static juce::Typeface::Ptr avenirTypeface;
-    static bool initialised;
+    // 无静态可变成员：字体加载由 .cpp 内函数局部 static（magic static，
+    // C++11 线程安全一次初始化）承载，任意线程首次调用均安全（F-020）。
 };
