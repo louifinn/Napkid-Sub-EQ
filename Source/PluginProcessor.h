@@ -122,9 +122,10 @@ private:
     int firLengthCache = 0;
 
     // Spectrum analyzer config cache (indexes into the APVTS choice params)
-    int spectrumFftCache = 1;      // 0=4096, 1=8192, 2=16384
-    int spectrumDensityCache = 0;  // 0=1/6 oct (61), 1=1/12 oct (121)
-    int spectrumHopCache = 0;      // 0=512, 1=1024, 2=2048
+    int spectrumResolutionCache = 1;  // 0=Fast, 1=Balanced, 2=Fine（VQT 核长尺度）
+    int spectrumWindowCache = 2;      // 0=Hann, 1=Blackman, 2=B-Harris, 3=Nuttall
+    int spectrumDensityCache = 0;     // 0=1/6 oct (61), 1=1/12 oct (121)
+    int spectrumHopCache = 0;         // 0=512, 1=1024, 2=2048
 
     // Cached atomic parameter pointers (avoid per-block string lookups).
     // Index order matches ParamID: Freq, Gain, Q, Type, Enabled.
@@ -132,7 +133,8 @@ private:
     std::atomic<float>* bypassParam = nullptr;
     std::atomic<float>* eqModeParam = nullptr;
     std::atomic<float>* firLengthParam = nullptr;
-    std::atomic<float>* spectrumFftParam = nullptr;
+    std::atomic<float>* spectrumFftParam = nullptr;     // spectrum_fft_size（v0.4.0 起为分辨率档）
+    std::atomic<float>* spectrumWindowParam = nullptr;  // spectrum_window
     std::atomic<float>* spectrumDensityParam = nullptr;
     std::atomic<float>* spectrumHopParam = nullptr;
     std::atomic<float>* nodeParams[SubEQ::NumNodes][5] = {};

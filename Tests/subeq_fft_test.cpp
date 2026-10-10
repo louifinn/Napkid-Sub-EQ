@@ -1,16 +1,18 @@
-// Standalone regression tests for the shared standalone DSP (11 header-only
+// Standalone regression tests for the shared standalone DSP (13 header-only
 // modules, included directly — no copy drift):
 //   - Source/SubEQ_DSPMath.h          (radix-2 FFT/IDFT, multi-slot twiddle cache)
 //   - Source/SubEQ_FIRDesign.h        (linear / minimum phase FIR design)
 //   - Source/SubEQ_FFTConvolver.h     (the shipped overlap-add convolution core)
 //   - Source/SubEQ_Biquad.h           (double-precision biquad coeffs/state/response)
 //   - Source/SubEQ_BiquadDesign.h     (RBJ coefficient design)
-//   - Source/SubEQ_SpectrumMath.h     (octave bands / Hann / bin calibration)
+//   - Source/SubEQ_SpectrumMath.h     (octave band centre frequencies)
 //   - Source/SubEQ_SpectrumConfig.h   (spectrum choice-index decoders)
 //   - Source/SubEQ_CoordinateMapper.h (response-plot coordinate mapping)
 //   - Source/SubEQ_NodeInteraction.h  (gain sensitivity / type-switch / Q rules)
 //   - Source/SubEQ_Spring.h           (underdamped spring integrator)
 //   - Source/SubEQ_FilterType.h       (FilterType enum <-> int mapping)
+//   - Source/SubEQ_WindowFunctions.h  (Hann/Blackman/BH-4/Nuttall window family)
+//   - Source/SubEQ_VQTDesign.h        (multi-rate VQT tier/kernel design + offline engine math)
 //
 // Build (Windows, VS dev prompt; /utf-8 for the non-ASCII comments):
 //   cl /EHsc /std:c++17 /O2 /utf-8 Tests/subeq_fft_test.cpp /Fo:Tests\subeq_fft_test.obj /Fe:Tests\subeq_fft_test.exe
@@ -25,6 +27,8 @@
 #include "../Source/SubEQ_FilterType.h"
 #include "../Source/SubEQ_Biquad.h"
 #include "../Source/SubEQ_BiquadDesign.h"
+#include "../Source/SubEQ_WindowFunctions.h"
+#include "../Source/SubEQ_VQTDesign.h"
 
 #include <complex>
 #include <vector>
@@ -107,6 +111,163 @@ static void olaProcess(const std::vector<double>& fir, const std::vector<double>
     output.assign(input.size(), 0.0);
     processOlaChannel(st, input.data(), output.data(), (int)input.size(),
                       M, L, H.data(), scratch);
+}
+
+// ============================================================================
+// 离线 VQT 原型引擎（v0.4.0 频谱分析内核原型）
+// 与 SubEQ_Spectrum 运行时相同的数学——层布局/核/帧谱/段功率/抽取系数/DC
+// 阻断全部来自 SubEQ_VQTDesign.h——仅组装方式不同（无原子、无 JUCE）。
+// 校准 / 泄漏 / 封顶 / 性能断言都在这里跑；数值路径与交付代码零漂移。
+// ============================================================================
+struct OfflineVqtAnalyzer
+{
+    static constexpr int MaxStages = 24;
+
+    double sampleRate = 48000.0;
+    int hop = 512;
+    const VQTKernelSet* set = nullptr;
+
+    // 0.05 Hz 一阶直流阻断
+    double dcPole = 0.0, dcState = 0.0;
+
+    // 抽取级联：stage k 输入率 fs/2^k，每 2 个输入向下一级发射 1 个样本
+    struct Stage
+    {
+        BiquadCoefficients coeffs[2];
+        BiquadState state[2];
+        int phase = 0;
+    };
+    Stage stages[MaxStages];
+    int numStages = 0;
+
+    // 各层状态：环形缓冲（容量 = 层帧长）+ 帧谱 scratch
+    struct TierState
+    {
+        std::vector<double> ring;
+        int write = 0;
+        int sinceAnalysis = 0;
+        std::vector<std::complex<double>> scratch;
+    };
+    TierState tier[VQTNumTiers];
+
+    // 输出（与运行时相同的包络约定）
+    double bandDb[121] = {};
+    double rawDb[121] = {};
+    static constexpr double AttackCoeff = 0.92;
+    static constexpr double ReleaseCoeff = 0.55;
+
+    void prepare (double fs, const VQTKernelSet& kernelSet, int hopSamples)
+    {
+        sampleRate = fs;
+        set = &kernelSet;
+        hop = hopSamples;
+
+        dcPole = vqtDcBlockerPole (fs);
+        dcState = 0.0;
+
+        numStages = vqtTopDecimationExponent (fs) + VQTNumTiers - 1;
+        for (int k = 0; k < numStages; ++k)
+        {
+            vqtDecimatorCoefficients (fs / std::ldexp (1.0, k), stages[k].coeffs);
+            for (auto& s : stages[k].state) s.reset();
+            stages[k].phase = 0;
+        }
+
+        for (int t = 0; t < VQTNumTiers; ++t)
+        {
+            const int F = kernelSet.tiers[t].fftSize;
+            tier[t].ring.assign (static_cast<size_t> (F), 0.0);
+            tier[t].scratch.assign (static_cast<size_t> (F), {});
+            tier[t].write = 0;
+            tier[t].sinceAnalysis = 0;
+        }
+
+        for (int b = 0; b < 121; ++b) { bandDb[b] = -60.0; rawDb[b] = -60.0; }
+    }
+
+    void processSample (double input)
+    {
+        dcState = dcPole * dcState + (1.0 - dcPole) * input;
+        double x = input - dcState;
+
+        // stage k 的输出率 = fs/2^(k+1)；层 o 的抽取因子 D_o = numStages+1-…，
+        // 即 o = numStages-1-k（k = numStages-1 → 层 0；k = numStages-10 → 层 9）
+        const int firstTierStage = numStages - VQTNumTiers;
+        for (int k = 0; k < numStages; ++k)
+        {
+            Stage& st = stages[k];
+            double y = st.state[0].process (x, st.coeffs[0]);
+            y = st.state[1].process (y, st.coeffs[1]);
+            if (++st.phase >= 2)
+            {
+                st.phase = 0;
+                if (k >= firstTierStage)
+                    pushTierSample (numStages - 1 - k, y);
+                x = y;
+            }
+            else
+            {
+                break;   // 本样本未到达更深层
+            }
+        }
+    }
+
+    // 最近频段下标（用于把测试音对准某个频段中心）
+    static int bandIndexNear (double freqHz, int numBands)
+    {
+        const int div = octaveDivisorForBands (numBands);
+        const int n = static_cast<int> (std::lround (std::log2 (freqHz / 0.5) * div));
+        return std::min (std::max (n, 0), numBands - 1);
+    }
+
+private:
+    void pushTierSample (int t, double y)
+    {
+        TierState& ts = tier[t];
+        const int F = set->tiers[t].fftSize;
+        ts.ring[static_cast<size_t> (ts.write)] = y;
+        if (++ts.write >= F) ts.write = 0;
+        if (++ts.sinceAnalysis >= vqtTierStride (set->tiers[t].decimation, hop))
+        {
+            ts.sinceAnalysis = 0;
+            analyzeTier (t);
+        }
+    }
+
+    void analyzeTier (int t)
+    {
+        TierState& ts = tier[t];
+        const VQTTier& T = set->tiers[t];
+        vqtTierFrameSpectrum (ts.ring.data(), ts.write, set->frameWindow[t].data(),
+                              ts.scratch.data(), T.fftSize);
+        for (int i = 0; i < T.numBandsInTier; ++i)
+        {
+            const double p = vqtBandPower (ts.scratch.data(), set->kernels[t][static_cast<size_t> (i)]);
+            // rawDb 不钳位（泄漏断言要读真值）；显示/包络路径钳 [-60, 0]
+            const double raw = (p > 1.0e-16) ? 10.0 * std::log10 (p) : -200.0;
+            double db = (p > 1.0e-12) ? 10.0 * std::log10 (p) : -60.0;
+            if (db < -60.0) db = -60.0;
+            if (db > 0.0)   db = 0.0;
+
+            const int b = T.firstBand + i;
+            rawDb[b] = raw;
+            double& sm = bandDb[b];
+            sm = (db > sm) ? sm * (1.0 - AttackCoeff) + db * AttackCoeff
+                           : sm * (1.0 - ReleaseCoeff) + db * ReleaseCoeff;
+        }
+    }
+};
+
+// 喂一段合成信号（秒），返回喂入的样本数
+static int feedSignal (OfflineVqtAnalyzer& a, double freqHz, double amplitude,
+                       double seconds, double sampleRate)
+{
+    // 相位延续不必精确——测试只看稳态
+    const int n = static_cast<int> (seconds * sampleRate);
+    const double w = 2.0 * 3.14159265358979323846 * freqHz / sampleRate;
+    for (int i = 0; i < n; ++i)
+        a.processSample (amplitude * std::sin (w * i));
+    return n;
 }
 
 static int failures = 0;
@@ -479,7 +640,7 @@ int main()
         check(convolutionFftSize(4097, 512) == 8192, "convFftSize(4097,512) == 8192");
     }
 
-    // ---- Test 13: spectrum math (octave bands / Hann / calibration) ----
+    // ---- Test 13: spectrum math (octave bands / Hann window basics) ----
     {
         check(octaveDivisorForBands(61) == 6, "octave divisor 61 bands == 6");
         check(octaveDivisorForBands(121) == 12, "octave divisor 121 bands == 12");
@@ -488,12 +649,9 @@ int main()
         check(std::abs(octaveBandCenterFreq(0.5f, 12, 121) - 1.0f) < 1e-6f, "octave band 12 (1/12 oct) == 1.0 Hz");
 
         const int N = 1025;   // odd: the exact centre sample lands on i=(N-1)/2
-        check(std::abs(hannWindowValue(0, N)) < 1e-6f, "hann window[0] == 0");
-        check(std::abs(hannWindowValue(N - 1, N)) < 1e-6f, "hann window[N-1] == 0");
-        check(std::abs(hannWindowValue((N - 1) / 2, N) - 1.0f) < 1e-6f, "hann window[mid] == 1");
-
-        check(std::abs(spectrumBinPowerScale(8192) - 16.0 / (8192.0 * 8192.0)) < 1e-20,
-              "spectrum bin scale == 16/N^2");
+        check(std::abs(windowValue(WindowType::Hann, 0, N)) < 1e-9, "hann window[0] == 0");
+        check(std::abs(windowValue(WindowType::Hann, N - 1, N)) < 1e-9, "hann window[N-1] == 0");
+        check(std::abs(windowValue(WindowType::Hann, (N - 1) / 2, N) - 1.0) < 1e-9, "hann window[mid] == 1");
     }
 
     // ---- Test 14: coordinate mapper round-trips and clamping ----
@@ -584,9 +742,13 @@ int main()
 
     // ---- Test 18: spectrum choice-index decoders ----
     {
-        check(spectrumFftChoiceToOrder(0) == 12, "fft choice 0 -> order 12 (4096)");
-        check(spectrumFftChoiceToOrder(1) == 13, "fft choice 1 -> order 13 (8192)");
-        check(spectrumFftChoiceToOrder(2) == 14, "fft choice 2 -> order 14 (16384)");
+        check(spectrumResolutionChoiceToIndex(0) == 0, "resolution choice 0 -> Fast (0)");
+        check(spectrumResolutionChoiceToIndex(1) == 1, "resolution choice 1 -> Balanced (1)");
+        check(spectrumResolutionChoiceToIndex(2) == 2, "resolution choice 2 -> Fine (2)");
+        check(spectrumWindowChoiceToType(0) == WindowType::Hann, "window choice 0 -> Hann");
+        check(spectrumWindowChoiceToType(1) == WindowType::Blackman, "window choice 1 -> Blackman");
+        check(spectrumWindowChoiceToType(2) == WindowType::BlackmanHarris, "window choice 2 -> Blackman-Harris");
+        check(spectrumWindowChoiceToType(3) == WindowType::Nuttall, "window choice 3 -> Nuttall");
         check(spectrumDensityChoiceToBands(0) == 61, "density choice 0 -> 61 bands");
         check(spectrumDensityChoiceToBands(1) == 121, "density choice 1 -> 121 bands");
         check(spectrumHopChoiceToSamples(0) == 512, "hop choice 0 -> 512");
@@ -595,7 +757,8 @@ int main()
         check(spectrumRefreshChoiceToHz(0) == 15, "refresh choice 0 -> 15 Hz");
         check(spectrumRefreshChoiceToHz(1) == 30, "refresh choice 1 -> 30 Hz");
         check(spectrumRefreshChoiceToHz(2) == 60, "refresh choice 2 -> 60 Hz");
-        check(spectrumFftChoiceToOrder(99) == 13, "fft choice invalid -> order 13");
+        check(spectrumResolutionChoiceToIndex(99) == 1, "resolution choice invalid -> Balanced");
+        check(spectrumWindowChoiceToType(99) == WindowType::BlackmanHarris, "window choice invalid -> BH-4");
         check(spectrumDensityChoiceToBands(99) == 61, "density choice invalid -> 61");
         check(spectrumHopChoiceToSamples(99) == 512, "hop choice invalid -> 512");
         check(spectrumRefreshChoiceToHz(99) == 30, "refresh choice invalid -> 30 Hz");
@@ -705,6 +868,257 @@ int main()
         // 单 biquad 常态：无额外淡化状态
         auto e = computeBiquadFadePlan(1, 1, false);
         check(!e.fadeOutExtra && !e.startFromCurrent, "single-biquad steady state has no extra fade");
+    }
+
+    // ---- Test 22: window family (mean / ENBW / sidelobe) ----
+    {
+        const int M = 8192;
+        const WindowType types[] = { WindowType::Hann, WindowType::Blackman,
+                                     WindowType::BlackmanHarris, WindowType::Nuttall };
+
+        for (WindowType wt : types)
+        {
+            std::vector<double> w(static_cast<size_t> (M));
+            double wSum = 0.0, w2Sum = 0.0;
+            for (int i = 0; i < M; ++i)
+            {
+                w[static_cast<size_t> (i)] = windowValue (wt, i, M);
+                wSum  += w[static_cast<size_t> (i)];
+                w2Sum += w[static_cast<size_t> (i)] * w[static_cast<size_t> (i)];
+            }
+
+            // 均值 → 解析相干增益 a0
+            check(std::abs(wSum / M - windowMean(wt)) < 3.0e-3, "window mean ~= analytic a0");
+
+            // ENBW = M·Σw²/(Σw)² → 文献值
+            const double enbw = M * w2Sum / (wSum * wSum);
+            check(std::abs(enbw - windowEnbwBins(wt)) < 0.05, "window ENBW ~= datasheet");
+
+            // 端点：cosine-sum 窗端点 = a0 − a1 + a2 − a3（Hann 精确为 0；
+            // Blackman/Nuttall 的系数和在浮点下可能产生 ~1e-17 的负零）
+            check(std::abs(w.front()) < 1.0e-3, "window endpoint ~0");
+            check(std::abs(w.front() - w.back()) < 1.0e-12, "window symmetric endpoints");
+
+            // 实测首旁瓣（16384 点 FFT，跳过主瓣区）：不得比标称差 3 dB 以上
+            const int Nfft = 16384;
+            std::vector<std::complex<double>> spec (static_cast<size_t> (Nfft), {0.0, 0.0});
+            for (int i = 0; i < M; ++i)
+                spec[static_cast<size_t> (i)] = { w[static_cast<size_t> (i)], 0.0 };
+            fftInPlace (spec.data(), Nfft);
+
+            int pk = 0;
+            double peak = -1.0;
+            for (int m = 0; m < Nfft / 2; ++m)
+            {
+                const double a = std::abs (spec[static_cast<size_t> (m)]);
+                if (a > peak) { peak = a; pk = m; }
+            }
+            // 主瓣半宽（bin）：Hann 2·N/M，BH/Nuttall ~4·N/M（Heinzel 表）
+            const int halfMainLobe = static_cast<int> (1.6 * 4.0 * Nfft / M);
+            double sidelobe = 0.0;
+            for (int m = pk + halfMainLobe; m < Nfft / 2; ++m)
+                sidelobe = std::max (sidelobe, std::abs (spec[static_cast<size_t> (m)]));
+            const double sidelobeDb = 20.0 * std::log10 (sidelobe / peak);
+            check(sidelobeDb <= windowSidelobeDb(wt) + 3.0, "window sidelobe within +3 dB of datasheet");
+            std::printf ("      window %-14s ENBW=%.2f bins  sidelobe=%.1f dB (nominal %.1f)\n",
+                         wt == WindowType::Hann ? "Hann" :
+                         wt == WindowType::Blackman ? "Blackman" :
+                         wt == WindowType::BlackmanHarris ? "BlackmanHarris" : "Nuttall",
+                         enbw, sidelobeDb, windowSidelobeDb (wt));
+        }
+    }
+
+    // ---- Test 23: VQT tier layout & kernel design ----
+    {
+        check(vqtTopDecimationExponent(48000.0) == 4,  "48k top decimation -> 16 (3 kHz)");
+        check(vqtTopDecimationExponent(44100.0) == 2,  "44.1k top decimation -> 4 (11.025 kHz, 16 not integral)");
+        check(vqtTopDecimationExponent(96000.0) == 5,  "96k top decimation -> 32 (3 kHz)");
+        check(vqtTopDecimationExponent(192000.0) == 6, "192k top decimation -> 64 (3 kHz)");
+
+        check(vqtTierStride(16, 512) == 32, "tier stride D=16 hop512 -> 32");
+        check(vqtTierStride(256, 512) == 2, "tier stride D=256 hop512 -> 2");
+        check(vqtTierStride(2048, 512) == 1, "tier stride D=2048 hop512 -> 1 (clamped)");
+
+        const double fs = 48000.0;
+        for (int numBands : { 61, 121 })
+        {
+            for (double scale : { 0.7, 1.0, 1.5 })
+            {
+                const VQTKernelSet set = buildVQTKernelSet (fs, numBands, scale, WindowType::BlackmanHarris);
+
+                // 层率：顶层 fs/2^d9，向下逐层 ÷2；频段划分总和 == numBands
+                int totalBands = 0;
+                bool ladderOk = true, pow2Ok = true, capOk = true;
+                const int d9 = vqtTopDecimationExponent (fs);
+                for (int t = 0; t < VQTNumTiers; ++t)
+                {
+                    const VQTTier& T = set.tiers[t];
+                    if (T.decimation != (1 << (d9 + VQTNumTiers - 1 - t))) ladderOk = false;
+                    if (T.fftSize < nextPowerOfTwo(T.fftSize)) pow2Ok = false;
+                    if (T.windowSeconds > VQTTierCapSeconds + 1.0e-9) capOk = false;
+                    if (T.fftSize < VQTMinTierFftSize) pow2Ok = false;
+                    totalBands += T.numBandsInTier;
+                }
+                check(ladderOk, "tier decimation ladder");
+                check(pow2Ok, "tier fft size is pow2 (>= guard)");
+                check(capOk, "tier windows respect 2 s cap (pow2-quantised)");
+                check(totalBands == numBands, "tier band partition sums to band count");
+
+                // 核支撑必须落在帧谱范围内且非空
+                bool supportOk = true;
+                for (int t = 0; t < VQTNumTiers; ++t)
+                    for (const auto& k : set.kernels[t])
+                        if (k.loBin < 0 || k.hiBin >= set.tiers[t].fftSize
+                            || k.hiBin < k.loBin || k.taps.empty())
+                            supportOk = false;
+                check(supportOk, "kernel spectral support within frame");
+            }
+        }
+
+        // 层窗时长表（informational）：封顶层与满分辨交叉点，供调研报告引用。
+        for (WindowType wt : { WindowType::Hann, WindowType::BlackmanHarris, WindowType::Nuttall })
+        {
+            const VQTKernelSet set = buildVQTKernelSet (fs, 121, 1.0, wt);
+            std::printf ("      window %-14s tier windows (s):", 
+                         wt == WindowType::Hann ? "Hann" :
+                         wt == WindowType::BlackmanHarris ? "BlackmanHarris" : "Nuttall");
+            for (int t = 0; t < VQTNumTiers; ++t)
+                std::printf (" %.3f", set.tiers[t].windowSeconds);
+            std::printf ("\n");
+        }
+    }
+
+    // ---- Test 24: offline VQT engine (calibration / leakage / DC / benchmark) ----
+    {
+        const double fs = 48000.0;
+        const int numBands = 121;
+        const int hop = 512;
+
+        // 校准：满幅正弦落段中心 -> 0 dB（逐窗型、跨十倍频程的频段抽样）
+        const double freqs[] = { 0.5, 1.0, 4.0, 16.0, 63.5, 200.0, 453.0 };
+        for (WindowType wt : { WindowType::Hann, WindowType::Blackman,
+                               WindowType::BlackmanHarris, WindowType::Nuttall })
+        {
+            const VQTKernelSet set = buildVQTKernelSet (fs, numBands, 1.0, wt);
+            OfflineVqtAnalyzer a;
+            bool ok = true;
+            double worst = 0.0;
+            for (double f : freqs)
+            {
+                a.prepare (fs, set, hop);
+                const int band = OfflineVqtAnalyzer::bandIndexNear (f, numBands);
+                // 喂"段中心频率"而非名义频率：段间裙响应（scalloping）不是校准
+                // 误差——0.27 个段距的偏移本就应读 ~-2 dB（BH 主瓣更宽，裙更沉）。
+                const double fc = octaveBandCenterFreq (0.5f, band, numBands);
+                const int t = vqtBandTier (band, 12);
+                const double settle = 3.0 * set.tiers[t].windowSeconds + 1.0;
+                feedSignal (a, fc, 1.0, settle, fs);
+                // gamma 区容差：窗内不足 ~2 个整周期的频段（2 s 封顶下的 0.5 Hz
+                // 段），实信号镜像项落在主瓣裙内，读数有 ±2 dB 量级的相位相依摆
+                // 动（物理后果，见调研报告）；其余频段容差 0.75 dB。
+                const double cycles = fc * set.tiers[t].windowSeconds;
+                const double tol = (cycles < 2.0) ? 3.5 : 0.75;
+                const double err = std::abs (a.bandDb[band]);
+                std::printf ("      calib %-14s %7.2f Hz (band %3d, %.2f cyc/win): %+6.2f dB\n",
+                             wt == WindowType::Hann ? "Hann" :
+                             wt == WindowType::Blackman ? "Blackman" :
+                             wt == WindowType::BlackmanHarris ? "BlackmanHarris" : "Nuttall",
+                             fc, band, cycles, a.bandDb[band]);
+                worst = std::max (worst, err);
+                if (err > tol) ok = false;
+            }
+            check(ok, "full-scale sine at band centre reads 0 dB (+/-0.75)");
+            std::printf ("      window %-14s worst calibration error %.2f dB\n",
+                         wt == WindowType::Hann ? "Hann" :
+                         wt == WindowType::Blackman ? "Blackman" :
+                         wt == WindowType::BlackmanHarris ? "BlackmanHarris" : "Nuttall",
+                         worst);
+        }
+
+        // 泄漏（窗函数专项基准）：~100 Hz 满幅单音，3 个频段之外必须安静。
+        // 读未钳位的 rawDb：BH-4 旁瓣 -92 dB -> +3 段 <= -70 dB；Hann 裙摆
+        // -31.5 dB 衰减 18 dB/oct（打印对照）。
+        for (WindowType wt : { WindowType::BlackmanHarris, WindowType::Hann })
+        {
+            const VQTKernelSet set = buildVQTKernelSet (fs, numBands, 1.0, wt);
+            OfflineVqtAnalyzer a;
+            a.prepare (fs, set, hop);
+            const int band = OfflineVqtAnalyzer::bandIndexNear (100.0, numBands);
+            feedSignal (a, octaveBandCenterFreq (0.5f, band, numBands), 1.0, 2.0, fs);
+
+            const double b3 = a.rawDb[band + 3];
+            const double b5 = a.rawDb[band + 5];
+            if (wt == WindowType::BlackmanHarris)
+            {
+                check(b3 <= -70.0, "BH-4: tone 3 bands away suppressed below -70 dB");
+                check(b5 <= -80.0, "BH-4: tone 5 bands away suppressed below -80 dB");
+            }
+            std::printf ("      leakage (100 Hz tone): %-14s +3 bands %.1f dB, +5 bands %.1f dB\n",
+                         wt == WindowType::BlackmanHarris ? "BlackmanHarris" : "Hann", b3, b5);
+        }
+
+        // 直流抑制：0.3 常量偏置，DC 阻断 + 核旁瓣联合作用下所有频段 <= -30 dB
+        {
+            const VQTKernelSet set = buildVQTKernelSet (fs, numBands, 1.0, WindowType::BlackmanHarris);
+            OfflineVqtAnalyzer a;
+            a.prepare (fs, set, hop);
+            for (int i = 0; i < static_cast<int> (12.0 * fs); ++i)
+                a.processSample (0.3);
+            bool ok = true;
+            for (int b = 0; b < numBands; ++b)
+                if (a.bandDb[b] > -30.0) ok = false;
+            check(ok, "DC offset 0.3 keeps all bands below -30 dB");
+        }
+
+        // 双音分辨：28 / 34 Hz 各 0.5 幅度 -> 两个中心段各读 ~ -6 dB
+        {
+            const VQTKernelSet set = buildVQTKernelSet (fs, numBands, 1.5, WindowType::BlackmanHarris);
+            OfflineVqtAnalyzer a;
+            a.prepare (fs, set, hop);
+            const double w1 = 2.0 * 3.14159265358979323846 * 28.0 / fs;
+            const double w2 = 2.0 * 3.14159265358979323846 * 34.0 / fs;
+            for (int i = 0; i < static_cast<int> (8.0 * fs); ++i)
+                a.processSample (0.5 * std::sin (w1 * i) + 0.5 * std::sin (w2 * i));
+
+            const int b28 = OfflineVqtAnalyzer::bandIndexNear (28.0, numBands);
+            const int b34 = OfflineVqtAnalyzer::bandIndexNear (34.0, numBands);
+            check(a.bandDb[b28] > -8.0 && a.bandDb[b28] < -4.0, "28 Hz tone reads ~-6 dB");
+            check(a.bandDb[b34] > -8.0 && a.bandDb[b34] < -4.0, "34 Hz tone reads ~-6 dB");
+            check(b28 != b34, "28/34 Hz fall into distinct bands");
+        }
+
+        // 性能基准（informational + 断言）：5 s @48k 单分析器。
+        // 旧方案 = 每 512 样本一次 8192 点 double FFT；VQT 应明显更快。
+        {
+            const VQTKernelSet set = buildVQTKernelSet (fs, numBands, 1.0, WindowType::BlackmanHarris);
+            OfflineVqtAnalyzer a;
+            a.prepare (fs, set, hop);
+            const int n = static_cast<int> (5.0 * fs);
+            const double w = 2.0 * 3.14159265358979323846 * 55.0 / fs;
+
+            auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < n; ++i)
+                a.processSample (std::sin (w * i));
+            auto t1 = std::chrono::steady_clock::now();
+            const double vqtMs = std::chrono::duration<double, std::milli> (t1 - t0).count();
+
+            std::vector<std::complex<double>> legacy (8192);
+            auto t2 = std::chrono::steady_clock::now();
+            int legacyFfts = 0;
+            for (int i = 0; i < n; i += 512)
+            {
+                for (int j = 0; j < 8192; ++j)
+                    legacy[static_cast<size_t> (j)] = { std::sin (w * (i + j)), 0.0 };
+                fftInPlace (legacy.data(), 8192);
+                ++legacyFfts;
+            }
+            auto t3 = std::chrono::steady_clock::now();
+            const double legacyMs = std::chrono::duration<double, std::milli> (t3 - t2).count();
+
+            std::printf ("BENCH: 5 s @48k  VQT(121 bands)=%.1f ms  legacy(8192-pt FFT/hop512)=%.1f ms  (%d FFTs)\n",
+                         vqtMs, legacyMs, legacyFfts);
+            check(vqtMs < legacyMs, "VQT pipeline cheaper than legacy per-hop FFT");
+        }
     }
 
     if (failures == 0)

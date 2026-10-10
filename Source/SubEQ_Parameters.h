@@ -3,7 +3,7 @@
 
     SubEQ_Parameters.h
     AudioProcessorValueTreeState parameter definitions for Sub EQ.
-    8 EQ nodes × 5 params + master/bypass/mode/FIR length + 4 spectrum = 48 parameters.
+    8 EQ nodes × 5 params + master/bypass/mode/FIR length + 5 spectrum = 49 parameters.
 
   ==============================================================================
 */
@@ -197,11 +197,13 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout
     ));
 
     // Spectrum display parameters (input/output analysers, GUI read-back)
+    // v0.4.0：spectrum_fft_size 的参数 ID 保留（老 session 按下标兼容映射），
+    // 语义从 FFT 点数改为 VQT 分析分辨率档（核长尺度 Fast/Balanced/Fine）。
     layout.add(std::make_unique<juce::AudioParameterChoice>(
         "spectrum_fft_size",
-        "Spectrum FFT Size",
-        juce::StringArray { "4096", "8192", "16384" },
-        1 // default 8192
+        "Spectrum Resolution",
+        juce::StringArray { "Fast", "Balanced", "Fine" },
+        1 // default Balanced
     ));
     layout.add(std::make_unique<juce::AudioParameterChoice>(
         "spectrum_band_density",
@@ -220,6 +222,12 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout
         "Spectrum Analysis Hop",
         juce::StringArray { "512", "1024", "2048" },
         0 // default 512 samples
+    ));
+    layout.add(std::make_unique<juce::AudioParameterChoice>(
+        "spectrum_window",
+        "Spectrum Window",
+        juce::StringArray { "Hann", "Blackman", "B-Harris", "Nuttall" },
+        2 // default Blackman-Harris（-92 dB 旁瓣 vs -60 dB 显示动态范围）
     ));
 
     return layout;

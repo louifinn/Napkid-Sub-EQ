@@ -43,6 +43,7 @@ SubEQAudioProcessor::SubEQAudioProcessor()
     eqModeParam = apvts.getRawParameterValue ("eq_mode");
     firLengthParam = apvts.getRawParameterValue ("fir_length");
     spectrumFftParam = apvts.getRawParameterValue ("spectrum_fft_size");
+    spectrumWindowParam = apvts.getRawParameterValue ("spectrum_window");
     spectrumDensityParam = apvts.getRawParameterValue ("spectrum_band_density");
     spectrumHopParam = apvts.getRawParameterValue ("spectrum_hop_size");
 
@@ -232,24 +233,29 @@ void SubEQAudioProcessor::updateEQParameters()
     }
 
     // Spectrum analyzer configuration changes (audio-thread safe: the
-    // analysers only write pre-allocated buffers and plain integers)
-    int spectrumFft = static_cast<int> (spectrumFftParam->load());
+    // analysers only switch pre-built kernel-set pointers and write plain
+    // integers / pre-allocated buffers)
+    int spectrumResolution = static_cast<int> (spectrumFftParam->load());
+    int spectrumWindow = static_cast<int> (spectrumWindowParam->load());
     int spectrumDensity = static_cast<int> (spectrumDensityParam->load());
     int spectrumHop = static_cast<int> (spectrumHopParam->load());
-    if (spectrumFft != spectrumFftCache
+    if (spectrumResolution != spectrumResolutionCache
+        || spectrumWindow != spectrumWindowCache
         || spectrumDensity != spectrumDensityCache
         || spectrumHop != spectrumHopCache)
     {
-        spectrumFftCache = spectrumFft;
+        spectrumResolutionCache = spectrumResolution;
+        spectrumWindowCache = spectrumWindow;
         spectrumDensityCache = spectrumDensity;
         spectrumHopCache = spectrumHop;
 
-        int fftOrder = SubEQ::spectrumFftChoiceToOrder (spectrumFft);
+        int resolutionIndex = SubEQ::spectrumResolutionChoiceToIndex (spectrumResolution);
+        SubEQ::WindowType window = SubEQ::spectrumWindowChoiceToType (spectrumWindow);
         int numBands = SubEQ::spectrumDensityChoiceToBands (spectrumDensity);
         int hop = SubEQ::spectrumHopChoiceToSamples (spectrumHop);
 
-        spectrumAnalyzer.configure (fftOrder, numBands, hop);
-        inputAnalyzer.configure (fftOrder, numBands, hop);
+        spectrumAnalyzer.configure (resolutionIndex, numBands, hop, window);
+        inputAnalyzer.configure (resolutionIndex, numBands, hop, window);
     }
 
     // Update each node

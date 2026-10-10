@@ -38,7 +38,7 @@ ModeSelector::ModeSelector (juce::AudioProcessorValueTreeState& apvtsRef)
     firLengthBox.setColour (juce::ComboBox::backgroundColourId, DesignColours::surface());
     addAndMakeVisible (firLengthBox);
 
-    // Spectrum display selectors (FFT size / band density / refresh rate / hop)
+    // Spectrum display selectors (resolution / window / band density / refresh rate / hop)
     struct SpectrumControl
     {
         juce::ComboBox* box;
@@ -51,8 +51,10 @@ ModeSelector::ModeSelector (juce::AudioProcessorValueTreeState& apvtsRef)
 
     const SpectrumControl controls[] =
     {
-        { &fftSizeBox, &fftSizeLabel, "FFT Size", "Spectrum FFT size (analysis resolution)",
-          { "4096", "8192", "16384" }, "spectrum_fft_size" },
+        { &resolutionBox, &resolutionLabel, "Resolution", "VQT analysis resolution (kernel length scale: faster response vs finer bands)",
+          { "Fast", "Balanced", "Fine" }, "spectrum_fft_size" },
+        { &windowBox, &windowLabel, "Window", "Spectrum analysis window (leakage suppression vs band sharpness)",
+          { "Hann", "Blackman", "B-Harris", "Nuttall" }, "spectrum_window" },
         { &densityBox, &densityLabel, "Density", "Spectrum band density (1/6 or 1/12 octave)",
           { "1/6 oct", "1/12 oct" }, "spectrum_band_density" },
         { &refreshBox, &refreshLabel, "Refresh", "Spectrum display refresh rate",
@@ -99,7 +101,8 @@ ModeSelector::ModeSelector (juce::AudioProcessorValueTreeState& apvtsRef)
     // 手工 APVTS 同步（见 .h 注释）：初始同步 + 监听 + onChange 回写。
     attachChoice ("eq_mode", modeBox);
     attachChoice ("fir_length", firLengthBox);
-    attachChoice ("spectrum_fft_size", fftSizeBox);
+    attachChoice ("spectrum_fft_size", resolutionBox);
+    attachChoice ("spectrum_window", windowBox);
     attachChoice ("spectrum_band_density", densityBox);
     attachChoice ("spectrum_refresh_rate", refreshBox);
     attachChoice ("spectrum_hop_size", hopBox);
@@ -113,6 +116,7 @@ ModeSelector::~ModeSelector()
     apvts.removeParameterListener ("eq_mode", this);
     apvts.removeParameterListener ("fir_length", this);
     apvts.removeParameterListener ("spectrum_fft_size", this);
+    apvts.removeParameterListener ("spectrum_window", this);
     apvts.removeParameterListener ("spectrum_band_density", this);
     apvts.removeParameterListener ("spectrum_refresh_rate", this);
     apvts.removeParameterListener ("spectrum_hop_size", this);
@@ -154,7 +158,8 @@ juce::ComboBox* ModeSelector::boxForParameter (const juce::String& parameterID)
 {
     if (parameterID == "eq_mode")               return &modeBox;
     if (parameterID == "fir_length")            return &firLengthBox;
-    if (parameterID == "spectrum_fft_size")     return &fftSizeBox;
+    if (parameterID == "spectrum_fft_size")     return &resolutionBox;
+    if (parameterID == "spectrum_window")       return &windowBox;
     if (parameterID == "spectrum_band_density") return &densityBox;
     if (parameterID == "spectrum_refresh_rate") return &refreshBox;
     if (parameterID == "spectrum_hop_size")     return &hopBox;
@@ -225,11 +230,12 @@ void ModeSelector::resized()
     labelRow.removeFromLeft (groupGap);
     dividerX = firLengthBox.getRight() + groupGap / 2;
 
-    // Spectrum group: 4 selectors with captions
+    // Spectrum group: 5 selectors with captions
     struct Col { juce::ComboBox* box; juce::Label* label; };
     const Col cols[] =
     {
-        { &fftSizeBox, &fftSizeLabel },
+        { &resolutionBox, &resolutionLabel },
+        { &windowBox, &windowLabel },
         { &densityBox, &densityLabel },
         { &refreshBox, &refreshLabel },
         { &hopBox, &hopLabel }

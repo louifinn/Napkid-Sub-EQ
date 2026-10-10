@@ -34,13 +34,15 @@ private:
     juce::AudioProcessorValueTreeState& apvts;
     juce::ComboBox modeBox;
     juce::ComboBox firLengthBox;
-    juce::ComboBox fftSizeBox;      // spectrum FFT size
+    juce::ComboBox resolutionBox;   // spectrum VQT resolution（核长尺度）
+    juce::ComboBox windowBox;       // spectrum analysis window family
     juce::ComboBox densityBox;      // spectrum band density
     juce::ComboBox refreshBox;      // spectrum refresh rate
     juce::ComboBox hopBox;          // spectrum analysis hop
     juce::Label modeLabel;
     juce::Label firLabel;
-    juce::Label fftSizeLabel;
+    juce::Label resolutionLabel;
+    juce::Label windowLabel;
     juce::Label densityLabel;
     juce::Label refreshLabel;
     juce::Label hopLabel;

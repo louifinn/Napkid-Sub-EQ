@@ -37,7 +37,7 @@ Napkid Sub EQ 是一款专为低频信号处理设计的参量均衡器插件。
 - **自动延迟补偿（PDC）**：模式切换或参数调整时自动向宿主报告延迟，支持 DAW 插件延迟补偿
 - **实时延迟显示**：底部面板实时显示当前模式的延迟量（ms / samples）
 - **实时相位响应曲线**：与幅频曲线同步显示（零延迟模式），非零延迟模式自动隐藏
-- **实时频谱分析**：输入/输出双频谱曲线，1/6 或 1/12 倍频程密度、4096/8192/16384 点 FFT、15/30/60 Hz 刷新率可选
+- **实时频谱分析（v0.4.0 起为多采样率 VQT 引擎）**：输入/输出双频谱曲线，0.5~500 Hz 全十倍频程独立估计（旧 FFT 引擎在 ~6 Hz 以下由 bin 插值伪造）；1/6 或 1/12 倍频程密度、三档分辨率、四种分析窗（Hann/Blackman/B-Harris/Nuttall）、15/30/60 Hz 刷新率均可选
 - **便捷交互**：点击创建、拖拽移动、右击删除、滚轮调 Q（HP/LP/Notch/BP 上下拖动调 Q）
 - **双击重置**：Bell/Shelf/Tilt 双击归零增益和 Q，HP/LP/Notch/BP 双击仅重置 Q
 - **ASIO 支持**：低延迟音频接口兼容
@@ -54,14 +54,16 @@ Napkid Sub EQ 是一款专为低频信号处理设计的参量均衡器插件。
 | 节点数量 | 8 个（独立开关） |
 | 滤波器精度 | double (64-bit) |
 | 频谱分辨率 | 1/6 倍频程（61 频段，默认）或 1/12 倍频程（121 频段） |
+| 频谱分析引擎 | 多采样率 VQT 滤波器组（10 倍频程层，帧长 2 s 封顶） |
+| 频谱分辨率档 | Fast / Balanced / Fine（核长尺度 0.7/1.0/1.5，默认 Balanced） |
+| 频谱分析窗 | Hann / Blackman / B-Harris / Nuttall（默认 B-Harris，-92 dB 旁瓣） |
 | 频谱更新率 | 15 / 30 / 60 Hz 可选（默认 30 Hz） |
-| 频谱 FFT 大小 | 4096 / 8192 / 16384 点（默认 8192） |
-| 频谱 FFT 跳步 | 512 / 1024 / 2048 样本（默认 512） |
+| 频谱分析跳步 | 512 / 1024 / 2048 样本（默认 512，顶层步距、全层实时锁步） |
 | FIR 长度 | 4096 / 16384 / 65536 点（Linear / Minimum Phase 模式可选） |
 | 处理模式 | Zero Latency / Linear Phase / Minimum Phase |
 | 处理延迟 | 0 ~ 32767 + 511 样本块延迟（依模式与 FIR 长度而定） |
 | 支持格式 | VST3, Standalone |
-| 窗口尺寸 | 900 × 620 像素 |
+| 窗口尺寸 | 950 × 620 像素 |
 | 建议最低采样率 | 44100 Hz（软性规格声明，无代码强制下限） |
 
 ---
@@ -125,7 +127,7 @@ Builds/VisualStudio2022/x64/Release/Standalone Plugin/
 - **Linear Phase**：严格线性相位 FIR，固定延迟 (N-1)/2 + 511 样本块延迟，相位失真为零，适合母带处理
 - **Minimum Phase**：最小相位 FIR（因果设计，群延迟为 0），延迟仅 511 样本块延迟，无预振铃（pre-ringing），适合一般混音使用
 
-底部面板的 **FIR Length** 选择器（4096 / 16384 / 65536）在两种 FIR 模式下生效：更长 FIR 提升低频精度（65536 点 @48 kHz 频域分辨率约 0.37 Hz，接近 0.5 Hz 完整周期），但延迟与 CPU 占用同步增加。切换时插件自动向宿主报告延迟（PDC）。底部面板同时提供频谱显示参数选择器（FFT 大小 / 频段密度 / 刷新率 / 分析 hop）。
+底部面板的 **FIR Length** 选择器（4096 / 16384 / 65536）在两种 FIR 模式下生效：更长 FIR 提升低频精度（65536 点 @48 kHz 频域分辨率约 0.37 Hz，接近 0.5 Hz 完整周期），但延迟与 CPU 占用同步增加。切换时插件自动向宿主报告延迟（PDC）。底部面板同时提供频谱显示参数选择器（分辨率 / 窗函数 / 频段密度 / 刷新率 / 分析 hop，v0.4.0 起频谱组为五列）。
 
 切换模式时插件会自动向宿主报告延迟，确保 DAW 的延迟补偿（PDC）正常工作。
 
@@ -156,13 +158,15 @@ Sub EQ/
 │   ├── SubEQ_DSPMath.h              # 共享 DSP 数学（模板 FFT/IDFT、nextPow2、convolutionFftSize）
 │   ├── SubEQ_FFTProcessor.h/.cpp    # FIR 系数设计与 overlap-add 卷积（Linear / Minimum Phase）
 │   ├── SubEQ_Parameters.h           # APVTS 参数定义
-│   ├── SubEQ_Spectrum.h/.cpp        # 实时频谱分析器
+│   ├── SubEQ_Spectrum.h/.cpp        # 实时频谱分析器（多采样率 VQT 内核）
 │   ├── SubEQ_Biquad.h               # 双精度 biquad 系数/状态/频响（共享纯计算，无 JUCE）
 │   ├── SubEQ_BiquadDesign.h         # RBJ 系数设计（共享纯计算，无 JUCE）
 │   ├── SubEQ_FIRDesign.h            # 线性/最小相位 FIR 设计（共享纯计算，无 JUCE）
 │   ├── SubEQ_FFTConvolver.h         # overlap-add 卷积原语（共享纯计算，无 JUCE）
-│   ├── SubEQ_SpectrumMath.h         # octave 频段/Hann/16·N⁻² 校准（共享纯计算）
+│   ├── SubEQ_SpectrumMath.h         # octave 频段中心频率（共享纯计算）
 │   ├── SubEQ_SpectrumConfig.h       # 频谱 choice 下标→语义值解码（共享纯计算）
+│   ├── SubEQ_WindowFunctions.h       # 窗函数族系数/ENBW/旁瓣（共享纯计算）
+│   ├── SubEQ_VQTDesign.h             # VQT 层结构/帧长/匹配核/抽取链（共享纯计算）
 │   ├── SubEQ_CoordinateMapper.h     # 频响图坐标映射（共享纯计算）
 │   ├── SubEQ_NodeInteraction.h      # 增益敏感类型/切换重置/对数 Q 步进（共享纯计算）
 │   ├── SubEQ_Spring.h               # 二阶弹簧积分器（共享纯计算）
@@ -219,7 +223,9 @@ Sub EQ/
 ## 已知限制
 
 - **GUI 仅限 Windows**：当前使用 Projucer 的 VS2022 导出目标
-- **频谱下限**：FFT bin 分辨率限制了 500 Hz 以下的精细频谱显示（8192 点 FFT @ 48 kHz 约 5.86 Hz/bin）
+- **频谱极低频段（0.5~1 Hz）的显示摆动**：v0.4.0 起 VQT 引擎在约 4~16 Hz 以上（随窗型/分辨率档）恢复满倍频程分辨；2 s 分析窗封顶下，0.5 Hz 段窗内不足一个完整周期，读数存在 ±2~3 dB 的慢速相位摆动（物理约束，已加镜像抑制缓解）。详见 `Documentation/SubEQ_VQT_Feasibility.md` §8
+- **频谱噪声底口径**：VQT 段能量按窗 ENBW × 层带宽聚合（层间 2 倍阶梯），噪声底形状与旧"单 bin 取样"不同——更平（每倍频程恒定带宽比例），属预期行为
+- **44.1 kHz 下频谱 CPU 偏高**：2 的幂抽取整除约束使顶层过采样比偏高（约 2 倍于 48 kHz），成本回到旧引擎量级；48/96/192 kHz 不受影响
 - **FIR 模式低频精度与延迟的权衡**：FIR 长度可选（4096 / 16384 / 65536 点）；4096 点 @48 kHz 频域分辨率约 11.7 Hz，10 Hz 以下响应为插值近似；65536 点分辨率约 0.37 Hz，但 Linear Phase 延迟达 1.37 秒且 CPU 占用较高。FIR 模式另有 511 样本（约 10.6 ms @48 kHz）overlap-add 块处理延迟
 
 ---

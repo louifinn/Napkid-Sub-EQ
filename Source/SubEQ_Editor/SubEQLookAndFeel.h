@@ -15,10 +15,10 @@
 namespace SubEQLookAndFeel
 {
     // Layout constants
-    constexpr int WindowWidth = 900;
+    constexpr int WindowWidth = 950;   // v0.4.0：频谱组增至五列（含窗函数）后加宽 50
     constexpr int WindowHeight = 620;
     constexpr int MasterGainSliderWidth = 60;
-    constexpr int ResponseAreaWidth = WindowWidth - MasterGainSliderWidth; // 840
+    constexpr int ResponseAreaWidth = WindowWidth - MasterGainSliderWidth; // 890
     constexpr int BottomPanelHeight = 60;
 
     // Node visual constants
