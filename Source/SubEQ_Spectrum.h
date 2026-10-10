@@ -17,6 +17,8 @@
       - Band density: 61 bands (1/6 octave) or 121 bands (1/12 octave)
       - Analysis hop: 512 / 1024 / 2048 samples（顶层步距，全层实时锁步）
       - Window: Hann / Blackman / Blackman–Harris / Nuttall
+      - Smoothing: 频域段间平滑 + 时间包络（v0.4.1，全部在功率域——见
+        SubEQ_SpectrumMath.h；包络系数按各层真实分析间隔归一化）
     全部 24 个核组合（窗 × 密度 × 分辨率）在 prepare() 预生成，configure()
     只切指针/复位状态（F-011 模式的推广）。
 
@@ -52,8 +54,10 @@ public:
     // Runtime reconfiguration (audio-thread safe: only pointer swaps, plain
     // integers and pre-allocated buffer writes — no allocation, no locks).
     // resolutionIndex: 0=Fast, 1=Balanced, 2=Fine; numBands: 61 or 121;
-    // hopSize: 512/1024/2048; window: analysis window family.
-    void configure(int resolutionIndex, int numBands, int hopSize, WindowType window);
+    // hopSize: 512/1024/2048; window: analysis window family; smoothingIndex:
+    // 0=Off, 1=1/6 oct, 2=1/3 oct, 3=2/3 oct（核半径见 smoothingRadiusBands）。
+    void configure(int resolutionIndex, int numBands, int hopSize, WindowType window,
+                   int smoothingIndex);
 
     int getNumBands() const noexcept { return numBands.load(); }
     int getHopSize() const noexcept { return hopSize.load(); }
@@ -123,10 +127,12 @@ private:
     // Spectrum output (atomic for thread safety)
     std::atomic<float> bandData[MaxBands];
 
-    // Attack/release envelope following（每次分析迭代一次，与旧实现一致）
-    float smoothedBands[MaxBands];
-    static constexpr float AttackCoeff = 0.92f;  // Very fast attack
-    static constexpr float ReleaseCoeff = 0.55f; // Fast release
+    // 显示平滑管线状态（v0.4.1，功率域——v0.4.0 的 dB 域包络已废弃）：
+    // bandPowers 为各段最近一次属主层分析的瞬时功率；频域平滑与时间包络
+    // 全部在功率域进行，dB 转换与 [-60, 0] 钳位只在写入 bandData 前发生。
+    float bandPowers[MaxBands] {};   // 瞬时功率（满幅正弦落段中心 = 1.0）
+    float envPowers[MaxBands] {};    // 时间包络状态（复位为 1e-6 ≈ -60 dB）
+    int smoothRadius = 1;            // 频域平滑核半径（段），configure() 换算
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(SpectrumAnalyzer)
 };

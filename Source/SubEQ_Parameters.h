@@ -3,7 +3,7 @@
 
     SubEQ_Parameters.h
     AudioProcessorValueTreeState parameter definitions for Sub EQ.
-    8 EQ nodes × 5 params + master/bypass/mode/FIR length + 5 spectrum = 49 parameters.
+    8 EQ nodes × 5 params + master/bypass/mode/FIR length + 6 spectrum = 50 parameters.
 
   ==============================================================================
 */
@@ -228,6 +228,12 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout
         "Spectrum Window",
         juce::StringArray { "Hann", "Blackman", "B-Harris", "Nuttall" },
         2 // default Blackman-Harris（-92 dB 旁瓣 vs -60 dB 显示动态范围）
+    ));
+    layout.add(std::make_unique<juce::AudioParameterChoice>(
+        "spectrum_smoothing",
+        "Spectrum Smoothing",
+        juce::StringArray { "Off", "1/6", "1/3", "2/3" },
+        1 // default 1/6 octave（功率域段间平滑，宽度以倍频程计；Off 保持逐段原始读数）
     ));
 
     return layout;

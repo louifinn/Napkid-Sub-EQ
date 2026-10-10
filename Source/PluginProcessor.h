@@ -126,6 +126,7 @@ private:
     int spectrumWindowCache = 2;      // 0=Hann, 1=Blackman, 2=B-Harris, 3=Nuttall
     int spectrumDensityCache = 0;     // 0=1/6 oct (61), 1=1/12 oct (121)
     int spectrumHopCache = 0;         // 0=512, 1=1024, 2=2048
+    int spectrumSmoothingCache = 1;   // 0=Off, 1=1/6 oct, 2=1/3 oct, 3=2/3 oct（v0.4.1）
 
     // Cached atomic parameter pointers (avoid per-block string lookups).
     // Index order matches ParamID: Freq, Gain, Q, Type, Enabled.
@@ -137,6 +138,7 @@ private:
     std::atomic<float>* spectrumWindowParam = nullptr;  // spectrum_window
     std::atomic<float>* spectrumDensityParam = nullptr;
     std::atomic<float>* spectrumHopParam = nullptr;
+    std::atomic<float>* spectrumSmoothingParam = nullptr;  // spectrum_smoothing（v0.4.1）
     std::atomic<float>* nodeParams[SubEQ::NumNodes][5] = {};
     std::atomic<int> reportedLatency { 0 };
     std::atomic<int> currentMode { static_cast<int> (SubEQ::EQMode::ZeroLatency) };

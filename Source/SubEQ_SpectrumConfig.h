@@ -56,4 +56,12 @@ inline int spectrumRefreshChoiceToHz (int choice) noexcept
     return choice == 0 ? 15 : (choice == 2 ? 60 : 30);
 }
 
+// 频域平滑档位下标 -> 平滑档（0=Off, 1=1/6 oct, 2=1/3 oct, 3=2/3 oct）。
+// 非法值回落 1/6 oct（默认档）。档位 -> 核半径（段数）换算见
+// SubEQ_SpectrumMath.h 的 smoothingRadiusBands（61/121 段各自查表）。
+inline int spectrumSmoothingChoiceToIndex (int choice) noexcept
+{
+    return choice == 0 ? 0 : (choice == 2 ? 2 : (choice == 3 ? 3 : 1));
+}
+
 } // namespace SubEQ

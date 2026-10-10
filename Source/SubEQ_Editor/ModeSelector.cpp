@@ -38,7 +38,7 @@ ModeSelector::ModeSelector (juce::AudioProcessorValueTreeState& apvtsRef)
     firLengthBox.setColour (juce::ComboBox::backgroundColourId, DesignColours::surface());
     addAndMakeVisible (firLengthBox);
 
-    // Spectrum display selectors (resolution / window / band density / refresh rate / hop)
+    // Spectrum display selectors (resolution / window / density / refresh / hop / smoothing)
     struct SpectrumControl
     {
         juce::ComboBox* box;
@@ -60,7 +60,9 @@ ModeSelector::ModeSelector (juce::AudioProcessorValueTreeState& apvtsRef)
         { &refreshBox, &refreshLabel, "Refresh", "Spectrum display refresh rate",
           { "15 Hz", "30 Hz", "60 Hz" }, "spectrum_refresh_rate" },
         { &hopBox, &hopLabel, "Hop", "Spectrum analysis hop (analysis frequency)",
-          { "512", "1024", "2048" }, "spectrum_hop_size" }
+          { "512", "1024", "2048" }, "spectrum_hop_size" },
+        { &smoothingBox, &smoothingLabel, "Smoothing", "Inter-band display smoothing in the power domain (fractional-octave width; Off keeps raw per-band readings)",
+          { "Off", "1/6", "1/3", "2/3" }, "spectrum_smoothing" }
     };
 
     for (const auto& c : controls)
@@ -106,6 +108,7 @@ ModeSelector::ModeSelector (juce::AudioProcessorValueTreeState& apvtsRef)
     attachChoice ("spectrum_band_density", densityBox);
     attachChoice ("spectrum_refresh_rate", refreshBox);
     attachChoice ("spectrum_hop_size", hopBox);
+    attachChoice ("spectrum_smoothing", smoothingBox);
 
     startTimerHz (10); // 100ms refresh
 }
@@ -120,6 +123,7 @@ ModeSelector::~ModeSelector()
     apvts.removeParameterListener ("spectrum_band_density", this);
     apvts.removeParameterListener ("spectrum_refresh_rate", this);
     apvts.removeParameterListener ("spectrum_hop_size", this);
+    apvts.removeParameterListener ("spectrum_smoothing", this);
 }
 
 //==============================================================================
@@ -163,6 +167,7 @@ juce::ComboBox* ModeSelector::boxForParameter (const juce::String& parameterID)
     if (parameterID == "spectrum_band_density") return &densityBox;
     if (parameterID == "spectrum_refresh_rate") return &refreshBox;
     if (parameterID == "spectrum_hop_size")     return &hopBox;
+    if (parameterID == "spectrum_smoothing")    return &smoothingBox;
     return nullptr;
 }
 
@@ -230,7 +235,7 @@ void ModeSelector::resized()
     labelRow.removeFromLeft (groupGap);
     dividerX = firLengthBox.getRight() + groupGap / 2;
 
-    // Spectrum group: 5 selectors with captions
+    // Spectrum group: 6 selectors with captions（列间间距，无尾部浪费）
     struct Col { juce::ComboBox* box; juce::Label* label; };
     const Col cols[] =
     {
@@ -238,15 +243,19 @@ void ModeSelector::resized()
         { &windowBox, &windowLabel },
         { &densityBox, &densityLabel },
         { &refreshBox, &refreshLabel },
-        { &hopBox, &hopLabel }
+        { &hopBox, &hopLabel },
+        { &smoothingBox, &smoothingLabel }
     };
 
-    for (const auto& c : cols)
+    for (size_t c = 0; c < sizeof (cols) / sizeof (cols[0]); ++c)
     {
-        c.box->setBounds (bounds.removeFromLeft (spectrumW));
-        c.label->setBounds (labelRow.removeFromLeft (spectrumW));
-        bounds.removeFromLeft (gap);
-        labelRow.removeFromLeft (gap);
+        if (c > 0)
+        {
+            bounds.removeFromLeft (gap);
+            labelRow.removeFromLeft (gap);
+        }
+        cols[c].box->setBounds (bounds.removeFromLeft (spectrumW));
+        cols[c].label->setBounds (labelRow.removeFromLeft (spectrumW));
     }
 }
 

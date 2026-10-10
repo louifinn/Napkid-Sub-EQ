@@ -39,6 +39,7 @@ private:
     juce::ComboBox densityBox;      // spectrum band density
     juce::ComboBox refreshBox;      // spectrum refresh rate
     juce::ComboBox hopBox;          // spectrum analysis hop
+    juce::ComboBox smoothingBox;    // spectrum display smoothing（v0.4.1，功率域段间平滑）
     juce::Label modeLabel;
     juce::Label firLabel;
     juce::Label resolutionLabel;
@@ -46,6 +47,7 @@ private:
     juce::Label densityLabel;
     juce::Label refreshLabel;
     juce::Label hopLabel;
+    juce::Label smoothingLabel;
     juce::Label latencyLabel;
     // 手工 APVTS 同步（替代 ComboBoxAttachment：附件的监听器同样会在宿主
     // 自动化时于音频线程同步回调并直接改 ComboBox，属消息线程专属操作——

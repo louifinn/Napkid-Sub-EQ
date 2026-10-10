@@ -46,6 +46,7 @@ SubEQAudioProcessor::SubEQAudioProcessor()
     spectrumWindowParam = apvts.getRawParameterValue ("spectrum_window");
     spectrumDensityParam = apvts.getRawParameterValue ("spectrum_band_density");
     spectrumHopParam = apvts.getRawParameterValue ("spectrum_hop_size");
+    spectrumSmoothingParam = apvts.getRawParameterValue ("spectrum_smoothing");
 
     for (int i = 0; i < SubEQ::NumNodes; ++i)
     {
@@ -239,23 +240,27 @@ void SubEQAudioProcessor::updateEQParameters()
     int spectrumWindow = static_cast<int> (spectrumWindowParam->load());
     int spectrumDensity = static_cast<int> (spectrumDensityParam->load());
     int spectrumHop = static_cast<int> (spectrumHopParam->load());
+    int spectrumSmoothing = static_cast<int> (spectrumSmoothingParam->load());
     if (spectrumResolution != spectrumResolutionCache
         || spectrumWindow != spectrumWindowCache
         || spectrumDensity != spectrumDensityCache
-        || spectrumHop != spectrumHopCache)
+        || spectrumHop != spectrumHopCache
+        || spectrumSmoothing != spectrumSmoothingCache)
     {
         spectrumResolutionCache = spectrumResolution;
         spectrumWindowCache = spectrumWindow;
         spectrumDensityCache = spectrumDensity;
         spectrumHopCache = spectrumHop;
+        spectrumSmoothingCache = spectrumSmoothing;
 
         int resolutionIndex = SubEQ::spectrumResolutionChoiceToIndex (spectrumResolution);
         SubEQ::WindowType window = SubEQ::spectrumWindowChoiceToType (spectrumWindow);
         int numBands = SubEQ::spectrumDensityChoiceToBands (spectrumDensity);
         int hop = SubEQ::spectrumHopChoiceToSamples (spectrumHop);
+        int smoothingIndex = SubEQ::spectrumSmoothingChoiceToIndex (spectrumSmoothing);
 
-        spectrumAnalyzer.configure (resolutionIndex, numBands, hop, window);
-        inputAnalyzer.configure (resolutionIndex, numBands, hop, window);
+        spectrumAnalyzer.configure (resolutionIndex, numBands, hop, window, smoothingIndex);
+        inputAnalyzer.configure (resolutionIndex, numBands, hop, window, smoothingIndex);
     }
 
     // Update each node

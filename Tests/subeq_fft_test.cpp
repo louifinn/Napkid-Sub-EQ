@@ -5,7 +5,7 @@
 //   - Source/SubEQ_FFTConvolver.h     (the shipped overlap-add convolution core)
 //   - Source/SubEQ_Biquad.h           (double-precision biquad coeffs/state/response)
 //   - Source/SubEQ_BiquadDesign.h     (RBJ coefficient design)
-//   - Source/SubEQ_SpectrumMath.h     (octave band centre frequencies)
+//   - Source/SubEQ_SpectrumMath.h     (octave band centres + display smoothing math)
 //   - Source/SubEQ_SpectrumConfig.h   (spectrum choice-index decoders)
 //   - Source/SubEQ_CoordinateMapper.h (response-plot coordinate mapping)
 //   - Source/SubEQ_NodeInteraction.h  (gain sensitivity / type-switch / Q rules)
@@ -34,6 +34,7 @@
 #include <vector>
 #include <cmath>
 #include <chrono>
+#include <random>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -150,17 +151,27 @@ struct OfflineVqtAnalyzer
     };
     TierState tier[VQTNumTiers];
 
-    // 输出（与运行时相同的包络约定）
+    // 输出（与运行时相同的显示管线约定：频域平滑 + 功率域时间包络，见
+    // SubEQ_SpectrumMath.h）：bandDb 为钳位 [-60, 0] 的显示值，rawDb 为
+    // 未钳位的逐段瞬时真值（泄漏断言用，不含平滑/包络）
     double bandDb[121] = {};
     double rawDb[121] = {};
-    static constexpr double AttackCoeff = 0.92;
-    static constexpr double ReleaseCoeff = 0.55;
+    double bandPowers[121] = {};
+    double envPowers[121] = {};
+    int numBands = 61;
+    int smoothRadius = 0;   // 默认 Off（校准/泄漏断言看逐段原始行为）
 
-    void prepare (double fs, const VQTKernelSet& kernelSet, int hopSamples)
+    void prepare (double fs, const VQTKernelSet& kernelSet, int hopSamples,
+                  int smoothingIndex = 0)
     {
         sampleRate = fs;
         set = &kernelSet;
         hop = hopSamples;
+
+        // 段总数 = 顶层（最后一个 tier）的末段下标 + 1，与运行时 configure 相同
+        numBands = kernelSet.tiers[VQTNumTiers - 1].firstBand
+                 + kernelSet.tiers[VQTNumTiers - 1].numBandsInTier;
+        smoothRadius = smoothingRadiusBands (smoothingIndex, numBands);
 
         dcPole = vqtDcBlockerPole (fs);
         dcState = 0.0;
@@ -182,7 +193,13 @@ struct OfflineVqtAnalyzer
             tier[t].sinceAnalysis = 0;
         }
 
-        for (int b = 0; b < 121; ++b) { bandDb[b] = -60.0; rawDb[b] = -60.0; }
+        for (int b = 0; b < 121; ++b)
+        {
+            bandDb[b] = -60.0;
+            rawDb[b] = -60.0;
+            bandPowers[b] = 0.0;
+            envPowers[b] = 1.0e-6;   // -60 dB 地板的等效功率（与运行时复位一致）
+        }
     }
 
     void processSample (double input)
@@ -240,20 +257,35 @@ private:
         const VQTTier& T = set->tiers[t];
         vqtTierFrameSpectrum (ts.ring.data(), ts.write, set->frameWindow[t].data(),
                               ts.scratch.data(), T.fftSize);
+
+        // 与运行时 analyzeTier 相同的时间归一化包络系数（逐层 dt 折算）
+        const int stride = vqtTierStride (T.decimation, hop);
+        const double dt = static_cast<double> (stride) * T.decimation / sampleRate;
+        const double attackAlpha  = ballisticAlpha (dt, SpectrumAttackSeconds);
+        const double releaseAlpha = ballisticAlpha (dt, SpectrumReleaseTau);
+
+        // 第一遍：本层各段瞬时功率
         for (int i = 0; i < T.numBandsInTier; ++i)
         {
+            const int b = T.firstBand + i;
             const double p = vqtBandPower (ts.scratch.data(), set->kernels[t][static_cast<size_t> (i)]);
+            bandPowers[b] = p;
             // rawDb 不钳位（泄漏断言要读真值）；显示/包络路径钳 [-60, 0]
-            const double raw = (p > 1.0e-16) ? 10.0 * std::log10 (p) : -200.0;
-            double db = (p > 1.0e-12) ? 10.0 * std::log10 (p) : -60.0;
+            rawDb[b] = (p > 1.0e-16) ? 10.0 * std::log10 (p) : -200.0;
+        }
+
+        // 第二遍：频域平滑（功率域）→ 时间包络（功率域一阶）→ dB/钳位
+        for (int i = 0; i < T.numBandsInTier; ++i)
+        {
+            const int b = T.firstBand + i;
+            const double ps = smoothBandPowerAt (bandPowers, b, numBands, smoothRadius);
+            double& env = envPowers[b];
+            env += ((ps > env) ? attackAlpha : releaseAlpha) * (ps - env);
+
+            double db = (env > 1.0e-12) ? 10.0 * std::log10 (env) : -60.0;
             if (db < -60.0) db = -60.0;
             if (db > 0.0)   db = 0.0;
-
-            const int b = T.firstBand + i;
-            rawDb[b] = raw;
-            double& sm = bandDb[b];
-            sm = (db > sm) ? sm * (1.0 - AttackCoeff) + db * AttackCoeff
-                           : sm * (1.0 - ReleaseCoeff) + db * ReleaseCoeff;
+            bandDb[b] = db;
         }
     }
 };
@@ -762,6 +794,11 @@ int main()
         check(spectrumDensityChoiceToBands(99) == 61, "density choice invalid -> 61");
         check(spectrumHopChoiceToSamples(99) == 512, "hop choice invalid -> 512");
         check(spectrumRefreshChoiceToHz(99) == 30, "refresh choice invalid -> 30 Hz");
+        check(spectrumSmoothingChoiceToIndex(0) == 0, "smoothing choice 0 -> Off");
+        check(spectrumSmoothingChoiceToIndex(1) == 1, "smoothing choice 1 -> 1/6 oct");
+        check(spectrumSmoothingChoiceToIndex(2) == 2, "smoothing choice 2 -> 1/3 oct");
+        check(spectrumSmoothingChoiceToIndex(3) == 3, "smoothing choice 3 -> 2/3 oct");
+        check(spectrumSmoothingChoiceToIndex(99) == 1, "smoothing choice invalid -> 1/6 oct");
     }
 
     // ---- Test 19: biquad coefficients / state / response ----
@@ -1013,17 +1050,35 @@ int main()
                 const int t = vqtBandTier (band, 12);
                 const double settle = 3.0 * set.tiers[t].windowSeconds + 1.0;
                 feedSignal (a, fc, 1.0, settle, fs);
+                // v0.4.1：显示包络对底层帧摆动近乎透明（层 dt >> 包络 τ，读数
+                // 诚实跟随每帧功率），gamma 段馈末读数依赖摆动相位——校准改为对
+                // 尾段做功率域时间平均：测的是核的无偏性，与摆动相位解耦。
+                const double measure = 3.0 * set.tiers[t].windowSeconds + 2.0;
+                const double w = 2.0 * 3.14159265358979323846 * fc / fs;
+                const int measureN = static_cast<int> (measure * fs);
+                double pAcc = 0.0;
+                int pCount = 0;
+                for (int i = 0; i < measureN; ++i)
+                {
+                    a.processSample (std::sin (w * i));
+                    if ((i & 511) == 511)   // 每 ~10.7 ms 采样一次显示值
+                    {
+                        pAcc += std::pow (10.0, a.bandDb[band] / 10.0);
+                        ++pCount;
+                    }
+                }
+                const double reading = 10.0 * std::log10 (pAcc / pCount);
                 // gamma 区容差：窗内不足 ~2 个整周期的频段（2 s 封顶下的 0.5 Hz
                 // 段），实信号镜像项落在主瓣裙内，读数有 ±2 dB 量级的相位相依摆
                 // 动（物理后果，见调研报告）；其余频段容差 0.75 dB。
                 const double cycles = fc * set.tiers[t].windowSeconds;
                 const double tol = (cycles < 2.0) ? 3.5 : 0.75;
-                const double err = std::abs (a.bandDb[band]);
+                const double err = std::abs (reading);
                 std::printf ("      calib %-14s %7.2f Hz (band %3d, %.2f cyc/win): %+6.2f dB\n",
                              wt == WindowType::Hann ? "Hann" :
                              wt == WindowType::Blackman ? "Blackman" :
                              wt == WindowType::BlackmanHarris ? "BlackmanHarris" : "Nuttall",
-                             fc, band, cycles, a.bandDb[band]);
+                             fc, band, cycles, reading);
                 worst = std::max (worst, err);
                 if (err > tol) ok = false;
             }
@@ -1118,6 +1173,170 @@ int main()
             std::printf ("BENCH: 5 s @48k  VQT(121 bands)=%.1f ms  legacy(8192-pt FFT/hop512)=%.1f ms  (%d FFTs)\n",
                          vqtMs, legacyMs, legacyFfts);
             check(vqtMs < legacyMs, "VQT pipeline cheaper than legacy per-hop FFT");
+        }
+    }
+
+    // ---- Test 25: display smoothing math (v0.4.1, power domain) ----
+    {
+        // 半径查表：61/121 段各自交付近似相同的倍频程平滑宽度
+        check(smoothingRadiusBands(0, 61) == 0 && smoothingRadiusBands(0, 121) == 0,
+              "smoothing radius: Off -> 0 for both densities");
+        check(smoothingRadiusBands(1, 61) == 1 && smoothingRadiusBands(1, 121) == 2,
+              "smoothing radius: 1/6 oct -> r1(61) / r2(121)");
+        check(smoothingRadiusBands(2, 61) == 2 && smoothingRadiusBands(2, 121) == 4,
+              "smoothing radius: 1/3 oct -> r2(61) / r4(121)");
+        check(smoothingRadiusBands(3, 61) == 4 && smoothingRadiusBands(3, 121) == 8,
+              "smoothing radius: 2/3 oct -> r4(61) / r8(121)");
+        check(smoothingRadiusBands(-3, 121) == 0 && smoothingRadiusBands(99, 61) == 4,
+              "smoothing radius: index clamped (<0 -> Off, >3 -> strongest)");
+
+        // 恒等与归一化：radius 0 原样返回；全等功率向量平滑后不变
+        //（证明权重和 == 1，含边缘截断重归一）
+        double p[8] = { 1e-9, 0.02, 1.0, 0.5, 0.25, 1e-7, 3.0, 0.001 };
+        check(smoothBandPowerAt(p, 3, 8, 0) == 0.5, "smoothing radius 0 is identity");
+        double eq[8] = { 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7 };
+        bool eqOk = true;
+        for (int b = 0; b < 8; ++b)
+            for (int r = 1; r <= 4; ++r)
+                if (std::abs(smoothBandPowerAt(eq, b, 8, r) - 0.7) > 1e-12) eqOk = false;
+        check(eqOk, "uniform powers smooth to themselves (renormalized, incl. edges)");
+
+        // 功率域而非 dB 域（Jensen 偏差）：{0.001, 1.0} 两段，band 0 截断
+        // 重归一（权重 {1, 0.5}/1.5）：功率域 = (0.001 + 0.5)/1.5 = 0.334 ->
+        // -4.76 dB；dB 域平均 = (-30 + 0)/2 = -15 dB，差 10 dB。
+        double two[2] = { 0.001, 1.0 };
+        const double s0 = smoothBandPowerAt(two, 0, 2, 1);
+        check(std::abs(s0 - (0.001 + 0.5) / 1.5) < 1e-12,
+              "edge band renormalized power-domain weighted average");
+        check(10.0 * std::log10(s0) - (-15.0) > 8.0,
+              "power-domain averaging beats dB-domain averaging by >8 dB on this vector");
+
+        // 峰展宽：单段冲激（其余近零）——峰值随半径单调下降、不抬升，邻段抬升
+        double imp[16] = {};
+        imp[7] = 1.0;
+        bool monoOk = true;
+        double prevPeak = imp[7];
+        for (int r = 1; r <= 4; ++r)
+        {
+            const double peak = smoothBandPowerAt(imp, 7, 16, r);
+            if (peak >= prevPeak || peak > imp[7]) monoOk = false;
+            if (smoothBandPowerAt(imp, 8, 16, r) <= imp[8]) monoOk = false;
+            prevPeak = peak;
+        }
+        check(monoOk, "impulse peak drops monotonically with radius, neighbour rises");
+        check(std::abs(10.0 * std::log10(smoothBandPowerAt(imp, 7, 16, 2)) - 10.0 * std::log10(1.0 / 3.0)) < 0.05,
+              "impulse peak drop at r=2 matches Hann kernel theory (-4.77 dB = 1/{0.25,0.75,1,0.75,0.25} sum 3)");
+
+        // 弹道系数：α = 1 - e^(-dt/τ)
+        check(ballisticAlpha(0.0, 0.02) == 0.0, "ballisticAlpha dt=0 -> 0");
+        check(ballisticAlpha(1.0, 0.0) == 1.0, "ballisticAlpha tau<=0 -> 1 (instant)");
+        check(std::abs(ballisticAlpha(0.02, 0.02) - (1.0 - std::exp(-1.0))) < 1e-12,
+              "ballisticAlpha dt==tau -> 1-e^-1");
+        check(ballisticAlpha(100.0, 0.02) == 1.0, "ballisticAlpha clamps to 1");
+
+        // 时间归一化的恒 dB/s 释放（v0.4.1 核心修复的单元级锁）：顶层 dt≈10.7 ms
+        // 与最底层 dt≈170.7 ms 必须以同一物理速率下落——v0.4.0 的按迭代系数
+        // 在这两层差 ~16 倍。1-α = e^(-dt/τ) 精确成立，故下落时间无离散误差。
+        {
+            const double fs = 48000.0;
+            const double dtTop = 512.0 / fs;        // 顶层 6 层：每 hop 分析一次
+            const double dtBottom = 8192.0 / fs;    // 最底层：步距钳 1，每层样本一次
+            auto fallTime20dB = [](double dt)
+            {
+                double env = 1.0;                    // 0 dB 起步
+                const double alpha = ballisticAlpha(dt, SpectrumReleaseTau);
+                double t = 0.0;
+                while (env > 0.01 && t < 10.0)       // 跌到 -20 dB
+                {
+                    env += alpha * (0.0 - env);
+                    t += dt;
+                }
+                return t;
+            };
+            const double expect = 20.0 / SpectrumReleaseDbPerSecond;   // = 111 ms
+            const double tTop = fallTime20dB(dtTop);
+            const double tBottom = fallTime20dB(dtBottom);
+            check(tTop >= expect && tTop <= expect + dtTop + 1e-9,
+                  "top-tier envelope falls 20 dB at 180 dB/s");
+            check(tBottom >= expect && tBottom <= expect + dtBottom + 1e-9,
+                  "bottom-tier envelope falls 20 dB at the same physical rate (16x fix)");
+        }
+    }
+
+    // ---- Test 26: smoothing pipeline end-to-end (v0.4.1, via offline prototype) ----
+    {
+        const double fs = 48000.0;
+        const int hop = 512, numBands = 121;
+
+        // 峰展宽预算：~200 Hz 段中心满幅正弦（高层，段间独立——最坏情形）。
+        // 各档峰值单调不升；1/6 档（r=2）>= -5.5 dB（Hann 核冲激理论精确值
+        // 10·log10(1/3) = -4.77 dB：核权重 {0.25,0.75,1,0.75,0.25} 和为 3，
+        // 200 Hz 邻段几乎无裙能量，实测即理论值；低频核跨段重叠，损失更小）。
+        double peak[4] = {};
+        for (int setting = 0; setting <= 3; ++setting)
+        {
+            const VQTKernelSet set = buildVQTKernelSet(fs, numBands, 1.0, WindowType::BlackmanHarris);
+            OfflineVqtAnalyzer a;
+            a.prepare(fs, set, hop, setting);
+            const int band = OfflineVqtAnalyzer::bandIndexNear(200.0, numBands);
+            feedSignal(a, octaveBandCenterFreq(0.5f, band, numBands), 1.0, 2.0, fs);
+            peak[setting] = a.bandDb[band];
+        }
+        check(peak[0] > -0.75 && peak[0] < 0.75, "e2e smoothing: Off keeps tone at ~0 dB");
+        check(peak[1] > -5.5 && peak[1] <= peak[0] + 0.05,
+              "e2e smoothing: 1/6 oct peak within -5.5 dB and no higher than Off");
+        check(peak[2] <= peak[1] + 0.05 && peak[3] <= peak[2] + 0.05,
+              "e2e smoothing: peak drop monotonic with smoothing depth");
+        std::printf("      smoothing peak, 200 Hz tone (121 bands): Off %.2f / 1/6 %.2f / 1/3 %.2f / 2/3 %.2f dB\n",
+                    peak[0], peak[1], peak[2], peak[3]);
+
+        // 噪声驯服：白噪声下顶层（band 109..120，同层段独立）的段间读数起伏
+        // 随 1/6 oct 平滑显著下降。
+        auto noiseSpread = [&](int setting)
+        {
+            const VQTKernelSet set = buildVQTKernelSet(fs, numBands, 1.0, WindowType::BlackmanHarris);
+            OfflineVqtAnalyzer a;
+            a.prepare(fs, set, hop, setting);
+            std::mt19937 rng(12345);
+            std::normal_distribution<double> noise(0.0, 0.2);
+            for (int i = 0; i < static_cast<int>(4.0 * fs); ++i)
+                a.processSample(noise(rng));
+            const int lo = 109, hi = 120;
+            double mean = 0.0;
+            for (int b = lo; b <= hi; ++b) mean += a.bandDb[b];
+            mean /= (hi - lo + 1);
+            double var = 0.0;
+            for (int b = lo; b <= hi; ++b) var += (a.bandDb[b] - mean) * (a.bandDb[b] - mean);
+            return std::sqrt(var / (hi - lo + 1));
+        };
+        const double spreadOff = noiseSpread(0);
+        const double spreadOn = noiseSpread(1);
+        check(spreadOn < spreadOff * 0.75, "e2e smoothing: 1/6 oct tames inter-band noise spread");
+        std::printf("      noise band spread (top tier): Off %.2f dB -> 1/6 oct %.2f dB\n",
+                    spreadOff, spreadOn);
+
+        // 时间归一化（端到端）：200 Hz 段关断后 -10 -> -50 dB 的下落。包络期望
+        // 40/180 s = 222 ms，叠加顶层帧退出的涂抹（~341 ms 帧滑出）——预算放宽
+        // 到 [120, 600] ms：足以抓住包络失效/过慢（v0.4.0 底层式 ~3 s 拖尾）。
+        {
+            const VQTKernelSet set = buildVQTKernelSet(fs, numBands, 1.0, WindowType::BlackmanHarris);
+            OfflineVqtAnalyzer a;
+            a.prepare(fs, set, hop, 0);
+            const int band = OfflineVqtAnalyzer::bandIndexNear(200.0, numBands);
+            feedSignal(a, octaveBandCenterFreq(0.5f, band, numBands), 1.0, 2.0, fs);
+            double tCross10 = -1.0, tCross50 = -1.0;
+            for (int i = 0; i < static_cast<int>(2.5 * fs); ++i)
+            {
+                a.processSample(0.0);
+                if (tCross10 < 0.0 && a.bandDb[band] < -10.0) tCross10 = i / fs;
+                if (tCross50 < 0.0 && a.bandDb[band] < -50.0) { tCross50 = i / fs; break; }
+            }
+            const double fall = tCross50 - tCross10;
+            const double expect = 40.0 / SpectrumReleaseDbPerSecond;
+            check(fall > 0.12 && fall < 0.60,
+                  "e2e envelope: 40 dB fall lands in [120, 600] ms window");
+            std::printf("      fall time -10 -> -50 dB: %.0f ms (envelope expectation %.0f ms + frame smear)\n",
+                        fall * 1000.0, expect * 1000.0);
         }
     }
 

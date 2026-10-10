@@ -22,7 +22,8 @@ SpectrumAnalyzer::SpectrumAnalyzer()
     for (int i = 0; i < MaxBands; ++i)
     {
         bandData[i].store(-RangeDb);
-        smoothedBands[i] = -RangeDb;
+        bandPowers[i] = 0.0f;
+        envPowers[i] = 1.0e-6f;   // -60 dB 地板的等效功率
     }
 
     updateBandBounds (61);
@@ -105,11 +106,13 @@ void SpectrumAnalyzer::resetRuntimeState()
     for (int i = 0; i < MaxBands; ++i)
     {
         bandData[i].store(-RangeDb);
-        smoothedBands[i] = -RangeDb;
+        bandPowers[i] = 0.0f;
+        envPowers[i] = 1.0e-6f;
     }
 }
 
-void SpectrumAnalyzer::configure (int resolutionIndex, int numBandsIn, int hopSizeIn, WindowType window)
+void SpectrumAnalyzer::configure (int resolutionIndex, int numBandsIn, int hopSizeIn,
+                                  WindowType window, int smoothingIndex)
 {
     const int bands = (numBandsIn == 121) ? 121 : 61;
     const int hop = (hopSizeIn == 1024) ? 1024 : (hopSizeIn == 2048 ? 2048 : 512);
@@ -122,6 +125,7 @@ void SpectrumAnalyzer::configure (int resolutionIndex, int numBandsIn, int hopSi
     activeNumBands = bands;
     lastResolutionIndex = (resolutionIndex >= 0 && resolutionIndex < NumResolutionLevels) ? resolutionIndex : 1;
     lastWindow = window;
+    smoothRadius = smoothingRadiusBands (smoothingIndex, bands);
     if (! kernelSets.empty())
         activeSet = &kernelSets[static_cast<size_t> (
             kernelSetIndex (lastResolutionIndex, bands, window))];
@@ -187,6 +191,7 @@ void SpectrumAnalyzer::analyzeTier (int t)
     const VQTTier& T = activeSet->tiers[t];
     TierRuntime& rt = tier[t];
     const int f = T.fftSize;
+    const int bands = activeNumBands;
 
     // 音频线程惰性 twiddle 预热（F-010）：prepareToPlay 可能运行于其他线程
     // （thread_local 缓存未命中）；命中后为 O(log n) 查找。
@@ -199,28 +204,36 @@ void SpectrumAnalyzer::analyzeTier (int t)
     vqtTierFrameSpectrum (rt.ring.data(), rt.write, activeSet->frameWindow[t].data(),
                           rt.scratch.data(), f);
 
+    // 本层真实分析间隔（秒）= 步距 × 抽取因子 / 采样率。VQT 各层节奏不同
+    // （48k/hop512：顶层 ~10.7 ms、最底层 ~170 ms），包络系数按它折算——
+    // 全频段以统一物理速率上冲/下落（v0.4.1 修复 v0.4.0 的 ~16× 不一致）。
+    const int stride = vqtTierStride (T.decimation, hopSize.load());
+    const float dt = static_cast<float> (static_cast<double> (stride) * T.decimation / sampleRate);
+    const float attackAlpha  = static_cast<float> (ballisticAlpha (dt, SpectrumAttackSeconds));
+    const float releaseAlpha = static_cast<float> (ballisticAlpha (dt, SpectrumReleaseTau));
+
+    // 第一遍：本层各段瞬时功率（邻段平滑要用到同层的新值，先整层更新）
     for (int i = 0; i < T.numBandsInTier; ++i)
     {
-        const double p = vqtBandPower (rt.scratch.data(), activeSet->kernels[t][static_cast<size_t> (i)]);
+        bandPowers[T.firstBand + i] = static_cast<float> (
+            vqtBandPower (rt.scratch.data(), activeSet->kernels[t][static_cast<size_t> (i)]));
+    }
 
-        float db;
-        if (p > 1.0e-12)
-            db = static_cast<float> (10.0 * std::log10 (p));
-        else
-            db = -RangeDb;
+    // 第二遍：频域平滑（功率域）→ 时间包络（功率域一阶）→ dB/钳位/发布。
+    // 只更新本层属主段——邻层段由其属主层按自己的 dt 更新，杜绝跨层双计。
+    for (int i = 0; i < T.numBandsInTier; ++i)
+    {
+        const int b = T.firstBand + i;
+        const float pSmooth = smoothBandPowerAt (bandPowers, b, bands, smoothRadius);
 
-        // Clamp to display range
+        float& env = envPowers[b];
+        env += ((pSmooth > env) ? attackAlpha : releaseAlpha) * (pSmooth - env);
+
+        float db = (env > 1.0e-12f) ? 10.0f * std::log10 (env) : -RangeDb;
         if (db < -RangeDb) db = -RangeDb;
         if (db > 0.0f)    db = 0.0f;
 
-        // Attack/release envelope following
-        const int b = T.firstBand + i;
-        if (db > smoothedBands[b])
-            smoothedBands[b] = smoothedBands[b] * (1.0f - AttackCoeff) + db * AttackCoeff;
-        else
-            smoothedBands[b] = smoothedBands[b] * (1.0f - ReleaseCoeff) + db * ReleaseCoeff;
-
-        bandData[b].store (smoothedBands[b]);
+        bandData[b].store (db);
     }
 }
 
