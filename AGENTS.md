@@ -50,4 +50,6 @@
 
 ## Notes
 
-- 空（快速补充占位）
+- 从 Git Bash 跑 cl/MSBuild：`vcvars64.bat`（`D:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\`）直接 `cmd //c` 调用会因引号/参数转义失败——用 Write 工具写一个临时 .bat（`call vcvars64 → cd /d 项目目录 → cl/MSBuild`）到 `%TEMP%` 再 `cmd //c` 执行；批处理内 MSBuild 参数用单斜杠 `/p:`。Bash 内联 printf 写 .bat 会把 `\U` 当 Unicode 转义损坏文件
+- 残留 standalone 进程会锁住 exe 导致 LNK1104 链接失败：`tasklist //fi "IMAGENAME eq Napkid Sub EQ.exe"` 查到后 `taskkill //pid <pid> //f` 再重建
+- 统计回归断言数：测试 exe 逐条打印 `PASS:`，`awk '/^PASS:/{p++} END{print p}'` 统计（grep -c 在 Git Bash 此环境输出异常）；文档中的"X 项"以实跑计数为准
