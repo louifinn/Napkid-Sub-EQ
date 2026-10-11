@@ -21,6 +21,8 @@ Napkid Sub EQ 的所有重要变更都将记录在此文件中。
 - **R3-F5 显示范围派生（#22）**：`kDisplayRangeDb` / `kDisplayFloorDb` / `kDisplayPowerGuard` / `kDisplayFloorPower` 进 `SubEQ_SpectrumMath.h`（`SubEQ_Spectrum.h:46` 的 `RangeDb` 以 `static_assert` 精确镜像）；`SpectrumAnalyzer` 复位初值与暂存、GUI 频谱缓冲初值全部从该来源派生——−60 dB 地板不再多处独立表达。
 - **R4-F4 地板闸门改往返相等（#26）**：具名 `kDisplayFloorSteps`（`SubEQ_SpectrumMath.h:151`），断言改为 `-kDisplayFloorDb == 10.0 * kDisplayFloorSteps`（截断型分数地板不再蒙混），功率展开与断言共用同一常量（`:156`）；Test 25 增加一条运行时断言核对地板 dB 与地板功率互为精确换算。
 - **R4-F5 / R4-F6 版本落账（#27 / #28）**：CHANGELOG 工程节的计数自述与 `AGENTS.md` 版本头分别对齐实测数据与 `.jucer` 的 0.4.2。
+- **STD-03 显示管线迁移 double（#3，维护者裁定）**：`bandPowers` / `envPowers` / `bandDbScratch` 由 `float` 改 `double`（`SubEQ_Spectrum.h`），dt/α 折算经共享 `vqtTierEnvelopeAlphas()`（`SubEQ_SpectrumMath.h`，全新共享原语）——运行时与离线原型数值精度完全一致，「被测代码即交付代码」对显示路径字面成立；仅原子发布边界收窄 float（`bandData.store`）。顺带收口 `findings-round3.md` 登记的 dt/α 局部镜像残留（`Source/SubEQ_Spectrum.cpp` 与 `Tests` 各写一份 → 同调一份）。
+- **SPC-06 结案（#17，维护者裁定：接受现状）**：复位值已对齐 `kDisplayFloorPower`（选项 a 已实施）；残余「未分析邻段」≤~170 ms 自愈暂态与既定跨层陈旧度取舍同模型，不追加排除逻辑。台账处置表已结案。
 
 ### 测试
 

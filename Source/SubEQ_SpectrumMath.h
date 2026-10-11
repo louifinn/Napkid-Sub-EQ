@@ -170,6 +170,28 @@ inline double ballisticAlpha(double dtSeconds, double tauSeconds) noexcept
     return (a > 1.0) ? 1.0 : a;
 }
 
+// 一层的显示包络系数折算（运行时分析器与离线原型共用，收口此前的局部镜像）：
+// 本层真实分析间隔 dt = 步距 × 抽取因子 / 采样率（48k/hop512 下顶层 ~10.7 ms、
+// 最底层 ~170 ms），attack/release 系数按 dt 归一化后传入 vqtUpdateDisplayBands
+// ——全频段统一物理速率（理由见 ballisticAlpha 说明）。
+struct VQTTierEnvelopeAlphas
+{
+    double dt = 0.0;            // 本层分析间隔（秒）
+    double attackAlpha = 1.0;   // 1 − e^(−dt/τ_attack)
+    double releaseAlpha = 1.0;  // 1 − e^(−dt/τ_release)
+};
+
+inline VQTTierEnvelopeAlphas vqtTierEnvelopeAlphas (int decimation, int stride,
+                                                    double sampleRate) noexcept
+{
+    VQTTierEnvelopeAlphas out;
+    if (sampleRate > 0.0)
+        out.dt = static_cast<double> (stride) * decimation / sampleRate;
+    out.attackAlpha  = ballisticAlpha (out.dt, SpectrumAttackSeconds);
+    out.releaseAlpha = ballisticAlpha (out.dt, SpectrumReleaseTau);
+    return out;
+}
+
 // ===== 一层频段的显示更新（运行时分析器与离线原型共用同一实现）=====
 //
 // 内部顺序固定为：本层各段瞬时功率 → smoothBandPowerAt（频域段间平滑）→
@@ -180,7 +202,8 @@ inline double ballisticAlpha(double dtSeconds, double tauSeconds) noexcept
 // 后者为包络状态）；[firstBand, firstBand + numBandsInTier) 为本层属主段区间；
 // numBands 为总段数（平滑核的截断边界）；radius 为平滑核半径（段）；
 // attack/releaseAlpha 为调用方按本层真实分析间隔折算的包络系数（dt 各层不同，
-// 见 ballisticAlpha）；outDb 为按全局段下标写的 dB 输出（仅本层属主段被写）；
+// 见 vqtTierEnvelopeAlphas / ballisticAlpha）；outDb 为按全局段下标写的 dB 输出
+// （仅本层属主段被写）；
 // powerAtBand(i) 返回本层第 i 段的瞬时功率（i 为层内下标）。
 //
 // 只更新本层属主段——邻层段由其属主层按自己的 dt 更新，杜绝跨层双计。

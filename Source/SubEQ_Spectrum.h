@@ -133,13 +133,14 @@ private:
     // Spectrum output (atomic for thread safety)
     std::atomic<float> bandData[MaxBands];
 
-    // 显示平滑管线状态（v0.4.1，功率域——v0.4.0 的 dB 域包络已废弃）：
+    // 显示平滑管线状态（v0.4.1，功率域——v0.4.0 的 dB 域包络已废弃；v0.4.2
+    // 裁定起全程 double，仅在原子发布边界收窄到 float，与离线原型精度一致）：
     // bandPowers 为各段最近一次属主层分析的瞬时功率；频域平滑与时间包络
     // 全部在功率域进行，dB 转换与 [kDisplayFloorDb, 0] 钳位只在写入 bandData
     // 前发生（地板与范围常量同源于 SubEQ_SpectrumMath.h，R3-F5）。
-    float bandPowers[MaxBands] {};   // 瞬时功率（满幅正弦落段中心 = 1.0；未分析前 = kDisplayFloorPower）
-    float envPowers[MaxBands] {};    // 时间包络状态（复位为 kDisplayFloorPower ≈ -60 dB）
-    float bandDbScratch[MaxBands] {}; // 显示 dB 暂存（共享管线的输出，随后发布到 bandData）
+    double bandPowers[MaxBands] {};   // 瞬时功率（满幅正弦落段中心 = 1.0；未分析前 = kDisplayFloorPower）
+    double envPowers[MaxBands] {};    // 时间包络状态（复位为 kDisplayFloorPower ≈ -60 dB）
+    double bandDbScratch[MaxBands] {}; // 显示 dB 暂存（共享管线的输出，随后收窄 float 发布到 bandData）
     int smoothRadius = 1;            // 频域平滑核半径（段），configure() 换算
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(SpectrumAnalyzer)

@@ -239,17 +239,16 @@ private:
         vqtTierFrameSpectrum (ts.ring.data(), ts.write, set->frameWindow[t].data(),
                               ts.scratch.data(), T.fftSize);
 
-        // 与运行时 analyzeTier 相同的时间归一化包络系数（逐层 dt 折算）
+        // 与运行时 analyzeTier 相同的时间归一化包络系数——折算逻辑收口在
+        // 共享头（vqtTierEnvelopeAlphas），运行时与离线原型同调、零局部镜像。
         const int stride = vqtTierStride (T.decimation, hop);
-        const double dt = static_cast<double> (stride) * T.decimation / sampleRate;
-        const double attackAlpha  = ballisticAlpha (dt, SpectrumAttackSeconds);
-        const double releaseAlpha = ballisticAlpha (dt, SpectrumReleaseTau);
+        const VQTTierEnvelopeAlphas alphas = vqtTierEnvelopeAlphas (T.decimation, stride, sampleRate);
 
         // 显示管线（瞬时功率 → 频域平滑 → 功率域一阶包络 → dB/钳位）调用与
         // 运行时同一实现（SubEQ_SpectrumMath.h 的 vqtUpdateDisplayBands）——
         // 离线原型不再是手抄镜像，交付数学与回归数学零漂移（STD-04）。
         vqtUpdateDisplayBands (bandPowers, envPowers, T.firstBand, T.numBandsInTier,
-                               numBands, smoothRadius, attackAlpha, releaseAlpha, bandDb,
+                               numBands, smoothRadius, alphas.attackAlpha, alphas.releaseAlpha, bandDb,
                                [this, &ts, &T, t] (int i)
                                {
                                    return vqtBandPower (ts.scratch.data(),

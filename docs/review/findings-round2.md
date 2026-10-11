@@ -72,7 +72,7 @@
 |---|---|---|---|---|
 | STD-01 | 已修复 | `SubEQ_Spectrum.cpp` / `SubEQ_SpectrumMath.h` 文件头与新写注释中文化；复核轮补完 `SubEQ_SpectrumMath.h` 文件头残留英文（R4-F3） | [#1](https://github.com/louifinn/Napkid-Sub-EQ/issues/1) | 第 5 轮复核通过 |
 | STD-02 | 已修复 | `AGENTS.md:34` 顶层速率限定「48 kHz；44.1 kHz 因 2 的幂整除约束为 11025 Hz」 | [#2](https://github.com/louifinn/Napkid-Sub-EQ/issues/2) | 第 5 轮复核通过 |
-| STD-03 | needs-info | float 显示管线与「DSP 全 double」约定字面冲突——改代码或改约定属维护者口径决定 | [#3](https://github.com/louifinn/Napkid-Sub-EQ/issues/3) | 开放（needs-info） |
+| STD-03 | 已修复 | 维护者裁定「迁移 double」：显示管线全程 double——`bandPowers`/`envPowers`/`bandDbScratch` 改 `double`（`SubEQ_Spectrum.h:141-143`），dt/α 经共享 `vqtTierEnvelopeAlphas()`（`SubEQ_SpectrumMath.h`）按层折算，仅原子发布边界收窄 float（`SubEQ_Spectrum.cpp:203`）；运行时与离线原型（本就 double）数值一致 | [#3](https://github.com/louifinn/Napkid-Sub-EQ/issues/3) | 裁定轮门禁：回归 207 项 exit 0、增量与全量 Rebuild 零警告 + 独立复核通过 |
 | STD-04 | 已修复 | 三条共享原语：显示管线 `vqtUpdateDisplayBands()`（`SubEQ_SpectrumMath.h:188`）、抽取级联 `vqtDecimationStep()`（`SubEQ_VQTDesign.h:332`）、层环形装配 `vqtPushTierSample()`（`:366`）；运行时与离线原型同调。残留 dt/α 局部镜像记入 `findings-round3.md` | [#4](https://github.com/louifinn/Napkid-Sub-EQ/issues/4) | 第 5 轮复核通过（残留项另行登记） |
 | STD-05 | 已修复 | `SpectrumSettings`（五元组 + `operator==`）替代五个缓存整数；密度轴单一来源 `kBandsByDensity` / `bandDensityForBands`（`SubEQ_SpectrumMath.h:36-42`） | [#5](https://github.com/louifinn/Napkid-Sub-EQ/issues/5) | 第 5 轮复核通过 |
 | STD-06 | 已修复 | `WindowSpec` 表（`SubEQ_WindowFunctions.h`）；`vqtWindowResolutionMultiplier` 显式覆盖四窗型；`ModeSelector::spectrumControlTable()` 五处遍历同表 | [#6](https://github.com/louifinn/Napkid-Sub-EQ/issues/6) | 第 5 轮复核通过 |
@@ -86,7 +86,7 @@
 | SPC-03 | 已修复 | 1/3 与 2/3 档峰预算各加 ±0.75 dB 核理论数值界（`10·log10(1/5)` / `10·log10(1/9)`） | [#14](https://github.com/louifinn/Napkid-Sub-EQ/issues/14) | 第 5 轮复核通过 |
 | SPC-04 | wontfix | 窗口 950 → 1040 px 是六列布局的必要修正（CHANGELOG / README 已记录） | [#15](https://github.com/louifinn/Napkid-Sub-EQ/issues/15) | 已关闭 |
 | SPC-05 | wontfix | 校准改尾段功率域时间平均为新包络下的必要适配（已披露） | [#16](https://github.com/louifinn/Napkid-Sub-EQ/issues/16) | 已关闭 |
-| SPC-06 | needs-info | `bandPowers` 复位 0 与 `envPowers` 复位 1e-6 的口径与修复范围待维护者定 | [#17](https://github.com/louifinn/Napkid-Sub-EQ/issues/17) | 开放（needs-info） |
+| SPC-06 | 已结案（维护者裁定：接受现状） | 复位值已对齐地板等效功率 `kDisplayFloorPower`（构造器 / `resetRuntimeState` / 离线镜像三处同源，选项 a 已实施，原描述症状消除）；残余「未分析邻段」≤~170 ms 自愈暂态与已记录的跨层陈旧度取舍（`Documentation/SubEQ_VQT_Feasibility.md:229`）同模型，不追加排除逻辑 | [#17](https://github.com/louifinn/Napkid-Sub-EQ/issues/17) | 裁定结案 |
 | SPC-07 | wontfix | 平滑半径内层钳位与解码器回退语义不同——生产路径不可达（Choice 仅 4 项，先经解码器） | [#18](https://github.com/louifinn/Napkid-Sub-EQ/issues/18) | 已关闭 |
 
 ### 复核轮新增发现（第 3~5 轮复核，工作流 round 1~3）

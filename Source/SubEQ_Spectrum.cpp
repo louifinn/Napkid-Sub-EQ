@@ -26,9 +26,9 @@ SpectrumAnalyzer::SpectrumAnalyzer()
         // 在本层首次分析前读到的是它们的复位值，取 0 会把平滑结果拽向 0（在贴近
         // 地板的读数上可见若干 dB）；取地板等效功率则与显示下限自洽。与
         // kDisplayFloorDb 同源，改地板时两处一起变。
-        bandPowers[i] = static_cast<float> (kDisplayFloorPower);
-        envPowers[i] = static_cast<float> (kDisplayFloorPower);
-        bandDbScratch[i] = -RangeDb;
+        bandPowers[i] = kDisplayFloorPower;
+        envPowers[i] = kDisplayFloorPower;
+        bandDbScratch[i] = static_cast<double> (kDisplayFloorDb);
     }
 }
 
@@ -108,9 +108,9 @@ void SpectrumAnalyzer::resetRuntimeState()
     {
         bandData[i].store(-RangeDb);
         // 与构造器同口径：两个功率缓冲都从地板等效功率起步（SPC-06，见构造器注释）
-        bandPowers[i] = static_cast<float> (kDisplayFloorPower);
-        envPowers[i] = static_cast<float> (kDisplayFloorPower);
-        bandDbScratch[i] = -RangeDb;
+        bandPowers[i] = kDisplayFloorPower;
+        envPowers[i] = kDisplayFloorPower;
+        bandDbScratch[i] = static_cast<double> (kDisplayFloorDb);
     }
 }
 
@@ -181,16 +181,16 @@ void SpectrumAnalyzer::analyzeTier (int t)
     // 本层真实分析间隔（秒）= 步距 × 抽取因子 / 采样率。VQT 各层节奏不同
     // （48k/hop512：顶层 ~10.7 ms、最底层 ~170 ms），包络系数按它折算——
     // 全频段以统一物理速率上冲/下落（v0.4.1 修复 v0.4.0 的 ~16× 不一致）。
+    // 折算逻辑收口在共享头（vqtTierEnvelopeAlphas），与离线原型同调；
+    // 显示管线全程 double，仅在原子发布边界收窄到 float。
     const int stride = vqtTierStride (T.decimation, hopSize.load());
-    const float dt = static_cast<float> (static_cast<double> (stride) * T.decimation / sampleRate);
-    const float attackAlpha  = static_cast<float> (ballisticAlpha (dt, SpectrumAttackSeconds));
-    const float releaseAlpha = static_cast<float> (ballisticAlpha (dt, SpectrumReleaseTau));
+    const VQTTierEnvelopeAlphas alphas = vqtTierEnvelopeAlphas (T.decimation, stride, sampleRate);
 
     // 显示管线（瞬时功率 → 频域平滑 → 功率域一阶包络 → dB/钳位）与离线原型
     // 共用 SubEQ_SpectrumMath.h 的 vqtUpdateDisplayBands——被测代码即交付代码；
     // 该函数只更新本层属主段（邻层段由其属主层按自己的 dt 更新，杜绝跨层双计）。
     vqtUpdateDisplayBands (bandPowers, envPowers, T.firstBand, T.numBandsInTier,
-                           bands, smoothRadius, attackAlpha, releaseAlpha,
+                           bands, smoothRadius, alphas.attackAlpha, alphas.releaseAlpha,
                            bandDbScratch,
                            [&] (int i)
                            {
@@ -198,9 +198,9 @@ void SpectrumAnalyzer::analyzeTier (int t)
                                    activeSet->kernels[t][static_cast<size_t> (i)]);
                            });
 
-    // 逐段发布到原子输出（GUI 线程经 getSpectrum 读取）
+    // 逐段发布到原子输出（GUI 线程经 getSpectrum 读取；dB 在发布边界收窄 float）
     for (int i = 0; i < T.numBandsInTier; ++i)
-        bandData[T.firstBand + i].store (bandDbScratch[T.firstBand + i]);
+        bandData[T.firstBand + i].store (static_cast<float> (bandDbScratch[T.firstBand + i]));
 }
 
 int SpectrumAnalyzer::getSpectrum (float* outputBands) const

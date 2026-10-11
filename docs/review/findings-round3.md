@@ -40,7 +40,7 @@
 | R5-F1 | 回填的回归项数 206 与本 run 实跑记录 207 不符（少算本轮新增的 R4-F4 断言） | 本收尾轮以实跑定稿：`AGENTS.md:24`、`CHANGELOG.md` 测试节、`Documentation/SubEQ_VQT_Feasibility.md:218` 三处均回填 **207**（`git diff HEAD -- Tests/subeq_fft_test.cpp` 净增 6 处 `check(`，201 + 6 = 207，与实跑一致） | 已修复 |
 | R5-F5 | 本轮新增低严重度发现（正文未随 run 数据提供；全仓无 `R5-F*` 文本可引） | 待其正文可得时补记；其所述事项以 run 摘要为准（摘要载两条：计数不符、dt/α 残留镜像），计数条见 R5-F1 行处置 | 待补 |
 | R5-F6 | 同上（编号已登记） | 同上 | 待补 |
-| STD-04（复开） | dt / α 系数组成仍未收进共享头——STD-04 收口后的残留镜像（运行时 `SubEQ_Spectrum.cpp:185-187` 与离线 `Tests:244-246` 各写一份） | **残留项**：本轮不修（收尾轮仅动文档；且该处紧邻 STD-03 needs-info 的 float/double 显示域边界，改动需先定口径）。登记于本文件，待后续轮次处理 | 登记未修 |
+| STD-04（复开） | dt / α 系数组成仍未收进共享头——STD-04 收口后的残留镜像（运行时 `SubEQ_Spectrum.cpp:185-187` 与离线 `Tests:244-246` 各写一份） | **已收口（维护者裁定轮）**：新增共享原语 `vqtTierEnvelopeAlphas()`（`SubEQ_SpectrumMath.h`），运行时与离线原型同调一份；随之显示管线迁移 double（STD-03 裁定），发布边界收窄 float | 已修复 |
 | R3-F6（复开） | 文档计数与本 run 实跑 207 的偏差 | 同 R5-F1：收尾轮定稿 207 | 已修复 |
 | STD-11（复开） | 台账文本的行号 / 类型名过时 | 本收尾轮在 `findings-round2.md` 处理表中按当前工作树重核锚点（`MaxStages` = `SubEQ_Spectrum.h:112`、把守 = `SubEQ_Spectrum.cpp:63-65`、离线原型 = `Tests:180-181`），并在表中标注「行号按当前工作树重核」 | 已处置 |
 
@@ -64,5 +64,16 @@
 
 ## 五、遗留事项
 
-1. **dt/α 残留镜像（STD-04 复开）**：待后续轮次决定是否随显示域口径一并收口。
+1. ~~**dt/α 残留镜像（STD-04 复开）**：待后续轮次决定是否随显示域口径一并收口。~~ **已收口（维护者裁定轮）**：`vqtTierEnvelopeAlphas()` 共享原语 + 显示管线迁移 double（见上表）。
 2. **R5-F5 / R5-F6 正文**：本轮 run 数据仅提供编号与摘要，仓内无正文；其 issue / 正文可得时在本文件补记。
+
+---
+
+## 六、维护者裁决定性（2026-10-11，裁定轮）
+
+第 2 轮审查遗留的两条 needs-info 经维护者裁定并落实：
+
+| 项 | 裁定 | 落实 | 门禁 |
+|---|---|---|---|
+| STD-03（#3） | **迁移 double** | 显示管线三缓冲改 double（`SubEQ_Spectrum.h:141-143`）；dt/α 收口为共享 `vqtTierEnvelopeAlphas()`（`SubEQ_SpectrumMath.h`，顺带关闭上表 STD-04 复开残留）；仅发布边界 `bandData.store` 收窄 float（`SubEQ_Spectrum.cpp:203`）；运行时与离线原型数值一致 | 回归 207 项 exit 0；增量与全量 Rebuild 零警告；独立复核通过 |
+| SPC-06（#17） | **接受现状结案** | 复位值对齐 `kDisplayFloorPower` 已实施（构造器 / resetRuntimeState / 离线镜像三处同源）；残余「未分析邻段」≤~170 ms 自愈暂态与既定跨层陈旧度取舍同模型，不追加排除逻辑 | 无代码改动 |
