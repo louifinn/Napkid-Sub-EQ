@@ -24,6 +24,7 @@
 
 #pragma once
 
+#include <array>
 #include <cmath>
 
 namespace SubEQ
@@ -42,27 +43,40 @@ constexpr int kNumWindowTypes  = 4;
 constexpr int kMaxWindowTerms  = 4;
 constexpr double kWindowTwoPi  = 6.2831853071795864769;
 
+// 窗规格：cosine-sum 系数 + 有效项数 + 标称首旁瓣 + 等效噪声带宽。
+// 全部窗属性的单一事实来源——新增窗型只需在 kWindowSpecs 加一行。
+struct WindowSpec
+{
+    std::array<double, 4> a;   // a0..a3（未用的高次项为 0）
+    int    terms;              // 有效项数（Hann 2、Blackman 3、BH-4/Nuttall 4）
+    double sidelobeDb;         // 标称首旁瓣电平（dB，文献值）
+    double enbwBins;           // 等效噪声带宽（DFT bin，文献值）
+};
+
+// 按 WindowType 下标索引（顺序与枚举、与 APVTS spectrum_window choice 一致）
+inline constexpr WindowSpec kWindowSpecs[kNumWindowTypes] =
+{
+    { { 0.5, 0.5, 0.0, 0.0 },                     2, -31.5, 1.50 },   // Hann
+    { { 0.42, 0.5, 0.08, 0.0 },                   3, -58.0, 1.73 },   // Blackman
+    { { 0.35875, 0.48829, 0.14128, 0.01168 },     4, -92.0, 2.00 },   // BH-4
+    { { 0.355768, 0.487396, 0.144232, 0.012604 }, 4, -93.3, 2.02 }    // Nuttall
+};
+
+// 规格查询（非法 WindowType 回落 Hann，与旧 switch 的 default 分支取值一致）
+inline const WindowSpec& windowSpec (WindowType type) noexcept
+{
+    const int i = static_cast<int> (type);
+    return kWindowSpecs[(i >= 0 && i < kNumWindowTypes) ? i : 0];
+}
+
 // Cosine-sum 系数：w[i] = a0 − a1·cos(2πi/(M−1)) + a2·cos(4πi/(M−1)) − a3·cos(6πi/(M−1))
-// 未用的高次项为 0；返回有效项数（Hann 2、Blackman 3、BH-4/Nuttall 4）。
+// 未用的高次项为 0；返回有效项数（查 kWindowSpecs）。
 inline int windowCoefficients (WindowType type, double a[kMaxWindowTerms]) noexcept
 {
-    switch (type)
-    {
-        case WindowType::Hann:
-            a[0] = 0.5;      a[1] = 0.5;      a[2] = 0.0;     a[3] = 0.0;
-            return 2;
-        case WindowType::Blackman:
-            a[0] = 0.42;     a[1] = 0.5;      a[2] = 0.08;    a[3] = 0.0;
-            return 3;
-        case WindowType::BlackmanHarris:
-            a[0] = 0.35875;  a[1] = 0.48829;  a[2] = 0.14128; a[3] = 0.01168;
-            return 4;
-        case WindowType::Nuttall:
-            a[0] = 0.355768; a[1] = 0.487396; a[2] = 0.144232; a[3] = 0.012604;
-            return 4;
-    }
-    a[0] = 0.5; a[1] = 0.5; a[2] = 0.0; a[3] = 0.0;
-    return 2;
+    const WindowSpec& s = windowSpec (type);
+    for (int i = 0; i < kMaxWindowTerms; ++i)
+        a[i] = s.a[static_cast<size_t> (i)];
+    return s.terms;
 }
 
 // 窗样本值（对称窗，i ∈ [0, size)）。
@@ -82,36 +96,20 @@ inline double windowValue (WindowType type, int i, int size) noexcept
 // 解析均值（= a0，长窗极限下的相干增益 CG = Σw/M）。
 inline double windowMean (WindowType type) noexcept
 {
-    double a[kMaxWindowTerms];
-    windowCoefficients (type, a);
-    return a[0];
+    return windowSpec (type).a[0];
 }
 
 // 标称首旁瓣电平（dB，文献值——描述窗的泄漏抑制能力，测试中实测校验）。
 inline double windowSidelobeDb (WindowType type) noexcept
 {
-    switch (type)
-    {
-        case WindowType::Hann:           return -31.5;
-        case WindowType::Blackman:       return -58.0;
-        case WindowType::BlackmanHarris: return -92.0;
-        case WindowType::Nuttall:        return -93.3;
-    }
-    return -31.5;
+    return windowSpec (type).sidelobeDb;
 }
 
 // 等效噪声带宽（DFT bin 数，文献值）：ENBW = M·Σw² / (Σw)²。
 // 决定核对宽带噪声的通过量——旁瓣越低、主瓣越宽，ENBW 越大。
 inline double windowEnbwBins (WindowType type) noexcept
 {
-    switch (type)
-    {
-        case WindowType::Hann:           return 1.50;
-        case WindowType::Blackman:       return 1.73;
-        case WindowType::BlackmanHarris: return 2.00;
-        case WindowType::Nuttall:        return 2.02;
-    }
-    return 1.50;
+    return windowSpec (type).enbwBins;
 }
 
 } // namespace SubEQ

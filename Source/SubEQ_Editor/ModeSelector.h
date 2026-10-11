@@ -62,5 +62,24 @@ private:
     LatencyProvider latencyProvider;
     juce::String lastLatencyText;
 
+    // 频谱显示六组下拉的单一事实来源（控件指针 + 参数 ID + 标题 + 提示 + 项清单）。
+    // 新增一个频谱参数只需在 spectrumControlTable() 加一行——构造、attachChoice、
+    // 析构、boxForParameter 与 resized 五处全部遍历该表（STD-06）。
+    struct SpectrumControl
+    {
+        juce::ComboBox ModeSelector::* box;
+        juce::Label    ModeSelector::* label;
+        const char* labelText;
+        const char* tooltip;
+        juce::StringArray items;
+        const char* paramId;   // APVTS 参数 ID
+    };
+
+    static const SpectrumControl* spectrumControlTable (int& count) noexcept;
+
+    // 表项 → 本实例控件
+    juce::ComboBox& spectrumBox   (const SpectrumControl& c) noexcept { return this->*(c.box); }
+    juce::Label&    spectrumLabel (const SpectrumControl& c) noexcept { return this->*(c.label); }
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ModeSelector)
 };

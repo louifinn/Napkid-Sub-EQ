@@ -121,12 +121,28 @@ private:
     int eqModeCache = 0;
     int firLengthCache = 0;
 
-    // Spectrum analyzer config cache (indexes into the APVTS choice params)
-    int spectrumResolutionCache = 1;  // 0=Fast, 1=Balanced, 2=Fine（VQT 核长尺度）
-    int spectrumWindowCache = 2;      // 0=Hann, 1=Blackman, 2=B-Harris, 3=Nuttall
-    int spectrumDensityCache = 0;     // 0=1/6 oct (61), 1=1/12 oct (121)
-    int spectrumHopCache = 0;         // 0=512, 1=1024, 2=2048
-    int spectrumSmoothingCache = 1;   // 0=Off, 1=1/6 oct, 2=1/3 oct, 3=2/3 oct（v0.4.1）
+    // 频谱设置（把 APVTS 的五个 choice 下标打包成一个整体：比较与解码都只做
+    // 一次，解码器见 SubEQ_SpectrumConfig.h）
+    struct SpectrumSettings
+    {
+        int resolution = 1;   // 0=Fast, 1=Balanced, 2=Fine（VQT 核长尺度）
+        int window = 2;       // 0=Hann, 1=Blackman, 2=B-Harris, 3=Nuttall
+        int density = 0;      // 0=1/6 oct (61), 1=1/12 oct (121)
+        int hop = 0;          // 0=512, 1=1024, 2=2048
+        int smoothing = 1;    // 0=Off, 1=1/6 oct, 2=1/3 oct, 3=2/3 oct（v0.4.1）
+
+        bool operator== (const SpectrumSettings& other) const noexcept
+        {
+            return resolution == other.resolution
+                && window == other.window
+                && density == other.density
+                && hop == other.hop
+                && smoothing == other.smoothing;
+        }
+        bool operator!= (const SpectrumSettings& other) const noexcept { return ! (*this == other); }
+    };
+
+    SpectrumSettings spectrumSettings;
 
     // Cached atomic parameter pointers (avoid per-block string lookups).
     // Index order matches ParamID: Freq, Gain, Q, Type, Enabled.

@@ -29,11 +29,12 @@ FrequencyResponse::FrequencyResponse(SubEQAudioProcessor& proc)
 {
     setOpaque(true);
 
-    // Initialize spectrum data
+    // 频谱缓冲区初值 = 显示地板，取自 SubEQ_SpectrumMath.h 的单一来源
+    // kDisplayFloorDb（原先此处硬写 -60.0f，与范围常量无派生关系——R3-F5）
     for (int i = 0; i < SpectrumBands; ++i)
     {
-        spectrumData[i] = -60.0f;
-        inputSpectrumData[i] = -60.0f;
+        spectrumData[i] = static_cast<float> (SubEQ::kDisplayFloorDb);
+        inputSpectrumData[i] = static_cast<float> (SubEQ::kDisplayFloorDb);
     }
 
     // Prepare the GUI-side response engine (re-prepared on sample rate changes)

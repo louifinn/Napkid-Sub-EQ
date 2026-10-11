@@ -51,6 +51,11 @@ constexpr int    VQTMinTierFftSize  = 8;      // 极小帧防御下限
 constexpr double VQTDcBlockerHz     = 0.05;   // 直流阻断转折（0.5 Hz 处 −0.04 dB）
 constexpr double VQTSupportFloorDb  = -65.0;  // 频域支撑截断门限（相对峰值）
 
+// 顶层降采样指数上限（见 vqtTopDecimationExponent 的钳位）。抽取链级数
+// numStages = 该上限 + VQTNumTiers − 1（每层向下再 ÷2），音频线程的
+// stages[] 数组界必须覆盖它——运行时与离线原型共用该表达式（STD-11）。
+constexpr int    VQTMaxTopDecimationExponent = 16;
+
 //==============================================================================
 // 层结构与帧长
 //==============================================================================
@@ -71,14 +76,17 @@ inline double vqtQeff (int octaveDivisor) noexcept
 
 // 窗的分辨率倍率 = 主瓣零点宽（bin）/2：Hann 1、Blackman 1.5、BH-4/Nuttall 2。
 // 帧长需求 = 倍率 × R/段间距——低旁瓣窗的主瓣加宽诚实计入满分辨成本。
+// switch 显式覆盖四种窗型（新增窗型时编译器可提示遗漏），switch 后给兜底值。
 inline double vqtWindowResolutionMultiplier (WindowType type) noexcept
 {
     switch (type)
     {
-        case WindowType::Hann:     return 1.0;
-        case WindowType::Blackman: return 1.5;
-        default:                   return 2.0;   // BlackmanHarris / Nuttall
+        case WindowType::Hann:           return 1.0;
+        case WindowType::Blackman:       return 1.5;
+        case WindowType::BlackmanHarris: return 2.0;
+        case WindowType::Nuttall:        return 2.0;
     }
+    return 2.0;   // 非法 WindowType：按最宽主瓣处理（保守帧长）
 }
 
 // 顶层降采样指数 d：R9 = fs/2^d 落在 ~3 kHz 附近（round），且 fs 必须被 2^d
@@ -89,8 +97,8 @@ inline int vqtTopDecimationExponent (double sampleRateHz) noexcept
         return 4;
 
     int d = static_cast<int> (std::lround (std::log2 (sampleRateHz / VQTTopRateTargetHz)));
-    if (d < 1)  d = 1;
-    if (d > 16) d = 16;
+    if (d < 1) d = 1;
+    if (d > VQTMaxTopDecimationExponent) d = VQTMaxTopDecimationExponent;
     while (d > 1 && std::fmod (sampleRateHz, std::ldexp (1.0, d)) != 0.0)
         --d;
     return d;
@@ -302,6 +310,72 @@ inline void vqtDecimatorCoefficients (double stageInputRateHz, BiquadCoefficient
     out[0] = tmp[0];
     computeBiquadCoefficients (cutoffHz, 0.0, 1.30656296, FilterType::LowPass, stageInputRateHz, tmp);
     out[1] = tmp[0];
+}
+
+// 抽取链的一级状态：两个二阶节 + ↓2 相位计数。运行时分析器与离线原型共用
+// 同一布局（coeffs 在 prepare 路径写、state/phase 在音频线程写）。
+struct VQTDecimationStage
+{
+    BiquadCoefficients coeffs[2];
+    BiquadState state[2];
+    int phase = 0;
+};
+
+// 单个样本推进整条抽取链（运行时 SpectrumAnalyzer::process 与离线原型
+// OfflineVqtAnalyzer::processSample 共用同一实现——抽取级联决定进入分析的
+// 样本序列与速率，属数值路径，不得各写一份）：
+//   0.05 Hz 一阶直流阻断 → 逐级 ↓2 抗混叠（每级两个二阶节，每 2 个输入向下一级
+//   发射 1 个样本）。层 o 的抽取因子 D_o 对应 stage 下标 k = numStages-1-o，
+//   即只有 k ≥ numStages-VQTNumTiers 的级输出才进入某层（层号 = numStages-1-k）。
+// pushTierSample(tier, sample) 由调用方提供（层环形缓冲装配）。
+template <typename PushTierSampleFn>
+inline void vqtDecimationStep (double input, VQTDecimationStage* stages, int numStages,
+                               double dcPole, double& dcState,
+                               PushTierSampleFn&& pushTierSample) noexcept
+{
+    // 0.05 Hz 一阶直流阻断
+    dcState = dcPole * dcState + (1.0 - dcPole) * input;
+    double x = input - dcState;
+
+    const int firstTierStage = numStages - VQTNumTiers;
+    for (int k = 0; k < numStages; ++k)
+    {
+        VQTDecimationStage& st = stages[k];
+        double y = st.state[0].process (x, st.coeffs[0]);
+        y = st.state[1].process (y, st.coeffs[1]);
+        if (++st.phase >= 2)
+        {
+            st.phase = 0;
+            if (k >= firstTierStage)
+                pushTierSample (numStages - 1 - k, y);
+            x = y;
+        }
+        else
+        {
+            break;   // 本样本未到达更深层
+        }
+    }
+}
+
+// 层环形缓冲的样本装配 + 步距触发（运行时 SpectrumAnalyzer::pushTierSample 与
+// 离线原型 OfflineVqtAnalyzer::pushTierSample 共用同一实现）：写入环形缓冲，
+// 累计到 vqtTierStride(decimation, hop) 个层样本时触发一次 analyzeTier()。
+// stride 由调用方按本层抽取因子与顶层步距算好传入（两侧 hop 来源不同：运行时
+// 读原子量 hopSize，离线原型读成员 hop）。
+template <typename AnalyzeTierFn>
+inline void vqtPushTierSample (double* ring, int fftSize, double sample,
+                               int& write, int& sinceAnalysis, int stride,
+                               AnalyzeTierFn&& analyzeTier) noexcept
+{
+    ring[static_cast<size_t> (write)] = sample;
+    if (++write >= fftSize)
+        write = 0;
+
+    if (++sinceAnalysis >= stride)
+    {
+        sinceAnalysis = 0;
+        analyzeTier();
+    }
 }
 
 // 0.05 Hz 一阶直流阻断极点：y = x − s，s ← pole·s + (1−pole)·x。

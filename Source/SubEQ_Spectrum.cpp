@@ -2,11 +2,11 @@
   ==============================================================================
 
     SubEQ_Spectrum.cpp
-    Real-time multi-rate VQT spectrum analyzer implementation.
-    All tier / kernel / decimation / DC-blocker math lives in SubEQ_VQTDesign.h
-    (shared with Tests/subeq_fft_test.cpp — the offline prototype validated the
-    exact same numerics). This file is runtime assembly only: threading state,
-    atomics, zero-allocation configuration.
+    实时多采样率 VQT 频谱分析器的装配实现。
+    层结构 / 核 / 抽取 / 直流阻断的全部数学都在 SubEQ_VQTDesign.h（与
+    Tests/subeq_fft_test.cpp 共用——离线原型验证的正是同一套数值）；
+    显示管线（频域段间平滑 + 功率域包络 + dB/钳位）在 SubEQ_SpectrumMath.h。
+    本文件只做运行时装配：线程状态、原子量、零分配配置。
 
   ==============================================================================
 */
@@ -22,27 +22,22 @@ SpectrumAnalyzer::SpectrumAnalyzer()
     for (int i = 0; i < MaxBands; ++i)
     {
         bandData[i].store(-RangeDb);
-        bandPowers[i] = 0.0f;
-        envPowers[i] = 1.0e-6f;   // -60 dB 地板的等效功率
+        // 两个功率缓冲都从**地板等效功率**起步（而非 0，SPC-06）：跨层边界的邻段
+        // 在本层首次分析前读到的是它们的复位值，取 0 会把平滑结果拽向 0（在贴近
+        // 地板的读数上可见若干 dB）；取地板等效功率则与显示下限自洽。与
+        // kDisplayFloorDb 同源，改地板时两处一起变。
+        bandPowers[i] = static_cast<float> (kDisplayFloorPower);
+        envPowers[i] = static_cast<float> (kDisplayFloorPower);
+        bandDbScratch[i] = -RangeDb;
     }
-
-    updateBandBounds (61);
-}
-
-void SpectrumAnalyzer::updateBandBounds (int bands)
-{
-    // Octave band centres: fc_n = MinFreq * 2^(n/octaveDiv). Single source in
-    // SubEQ_SpectrumMath.h (shared with the GUI's frequency-axis drawing).
-    for (int i = 0; i < bands; ++i)
-        bandCenterFreqs[i] = octaveBandCenterFreq (MinFreq, i, bands);
 }
 
 int SpectrumAnalyzer::kernelSetIndex (int resolutionIndex, int bandCount, WindowType window) const noexcept
 {
     const int w = static_cast<int> (window) % kNumWindowTypes;
-    const int d = (bandCount == 121) ? 1 : 0;
+    const int d = bandDensityForBands (bandCount);
     const int r = (resolutionIndex >= 0 && resolutionIndex < NumResolutionLevels) ? resolutionIndex : 1;
-    return (w * 2 + d) * NumResolutionLevels + r;
+    return (w * kNumBandDensities + d) * NumResolutionLevels + r;
 }
 
 void SpectrumAnalyzer::prepare (double sr)
@@ -54,14 +49,20 @@ void SpectrumAnalyzer::prepare (double sr)
     kernelSets.clear();
     kernelSets.reserve (NumKernelSets);
     for (int w = 0; w < kNumWindowTypes; ++w)
-        for (int d = 0; d < 2; ++d)
+        for (int d = 0; d < kNumBandDensities; ++d)
             for (int r = 0; r < NumResolutionLevels; ++r)
                 kernelSets.push_back (buildVQTKernelSet (
-                    sr, d == 0 ? 61 : 121,
+                    sr, kBandsByDensity[d],
                     vqtFilterScale (r), static_cast<WindowType> (w)));
 
-    // 抽取链系数（与核组合无关，只随采样率变化）
-    numStages = vqtTopDecimationExponent (sr) + VQTNumTiers - 1;
+    // 抽取链系数（与核组合无关，只随采样率变化）。级数 = 顶层降采样指数
+    // （已被 vqtTopDecimationExponent 钳在 VQTMaxTopDecimationExponent）+ 层数，
+    // 与 stages[] 的容量同源；此处再对**函数实际返回值**把关：Debug 下
+    // jassert 暴露不一致，Release 下钳位兜底（钝化截断优于越界写）。
+    // 任何现实采样率下 d ≤ 8，钳位不会触发（STD-11 / R3-F4）。
+    const int wantedStages = vqtTopDecimationExponent (sr) + VQTNumTiers - 1;
+    jassert (wantedStages <= MaxStages);
+    numStages = std::min (wantedStages, MaxStages);
     for (int k = 0; k < numStages; ++k)
         vqtDecimatorCoefficients (sr / std::ldexp (1.0, k), stages[k].coeffs);
 
@@ -106,22 +107,23 @@ void SpectrumAnalyzer::resetRuntimeState()
     for (int i = 0; i < MaxBands; ++i)
     {
         bandData[i].store(-RangeDb);
-        bandPowers[i] = 0.0f;
-        envPowers[i] = 1.0e-6f;
+        // 与构造器同口径：两个功率缓冲都从地板等效功率起步（SPC-06，见构造器注释）
+        bandPowers[i] = static_cast<float> (kDisplayFloorPower);
+        envPowers[i] = static_cast<float> (kDisplayFloorPower);
+        bandDbScratch[i] = -RangeDb;
     }
 }
 
 void SpectrumAnalyzer::configure (int resolutionIndex, int numBandsIn, int hopSizeIn,
                                   WindowType window, int smoothingIndex)
 {
-    const int bands = (numBandsIn == 121) ? 121 : 61;
+    const int bands = kBandsByDensity[bandDensityForBands (numBandsIn)];
     const int hop = (hopSizeIn == 1024) ? 1024 : (hopSizeIn == 2048 ? 2048 : 512);
 
-    // Reset the analysis state so stale data never mixes across configs
+    // 复位分析状态：陈旧数据绝不跨配置混入
     resetRuntimeState();
-    updateBandBounds (bands);
 
-    // Publish the new config only after all state is consistent
+    // 状态全部一致后才发布新配置
     activeNumBands = bands;
     lastResolutionIndex = (resolutionIndex >= 0 && resolutionIndex < NumResolutionLevels) ? resolutionIndex : 1;
     lastWindow = window;
@@ -138,52 +140,24 @@ void SpectrumAnalyzer::process (const float* samples, int numSamples)
     if (activeSet == nullptr || numStages <= 0)
         return;
 
-    const int firstTierStage = numStages - VQTNumTiers;
-
+    // 抽取级联（直流阻断 + 逐级 ↓2）与离线原型共用 SubEQ_VQTDesign.h 的
+    // vqtDecimationStep——该级联决定进入分析的样本序列与速率，属数值路径。
     for (int i = 0; i < numSamples; ++i)
-    {
-        // 0.05 Hz 一阶直流阻断
-        const double input = static_cast<double> (samples[i]);
-        dcState = dcPole * dcState + (1.0 - dcPole) * input;
-        double x = input - dcState;
-
-        // 抽取链：stage k 的输出率 = fs/2^(k+1)；层 o 的抽取因子 D_o 对应
-        // o = numStages-1-k（k = numStages-1 → 层 0；k = firstTierStage → 层 9）
-        for (int k = 0; k < numStages; ++k)
-        {
-            Stage& st = stages[k];
-            double y = st.state[0].process (x, st.coeffs[0]);
-            y = st.state[1].process (y, st.coeffs[1]);
-            if (++st.phase >= 2)
-            {
-                st.phase = 0;
-                if (k >= firstTierStage)
-                    pushTierSample (numStages - 1 - k, y);
-                x = y;
-            }
-            else
-            {
-                break;   // 本样本未到达更深层
-            }
-        }
-    }
+        vqtDecimationStep (static_cast<double> (samples[i]), stages, numStages,
+                           dcPole, dcState,
+                           [this] (int t, double sample) { pushTierSample (t, sample); });
 }
 
 void SpectrumAnalyzer::pushTierSample (int t, double sample)
 {
     const VQTTier& T = activeSet->tiers[t];
     TierRuntime& rt = tier[t];
-    const int f = T.fftSize;
 
-    rt.ring[static_cast<size_t> (rt.write)] = sample;
-    if (++rt.write >= f)
-        rt.write = 0;
-
-    if (++rt.sinceAnalysis >= vqtTierStride (T.decimation, hopSize.load()))
-    {
-        rt.sinceAnalysis = 0;
-        analyzeTier (t);
-    }
+    // 环形缓冲装配 + 步距触发（与离线原型共用，见 SubEQ_VQTDesign.h）
+    vqtPushTierSample (rt.ring.data(), T.fftSize, sample,
+                       rt.write, rt.sinceAnalysis,
+                       vqtTierStride (T.decimation, hopSize.load()),
+                       [this, t] { analyzeTier (t); });
 }
 
 void SpectrumAnalyzer::analyzeTier (int t)
@@ -212,29 +186,21 @@ void SpectrumAnalyzer::analyzeTier (int t)
     const float attackAlpha  = static_cast<float> (ballisticAlpha (dt, SpectrumAttackSeconds));
     const float releaseAlpha = static_cast<float> (ballisticAlpha (dt, SpectrumReleaseTau));
 
-    // 第一遍：本层各段瞬时功率（邻段平滑要用到同层的新值，先整层更新）
+    // 显示管线（瞬时功率 → 频域平滑 → 功率域一阶包络 → dB/钳位）与离线原型
+    // 共用 SubEQ_SpectrumMath.h 的 vqtUpdateDisplayBands——被测代码即交付代码；
+    // 该函数只更新本层属主段（邻层段由其属主层按自己的 dt 更新，杜绝跨层双计）。
+    vqtUpdateDisplayBands (bandPowers, envPowers, T.firstBand, T.numBandsInTier,
+                           bands, smoothRadius, attackAlpha, releaseAlpha,
+                           bandDbScratch,
+                           [&] (int i)
+                           {
+                               return vqtBandPower (rt.scratch.data(),
+                                   activeSet->kernels[t][static_cast<size_t> (i)]);
+                           });
+
+    // 逐段发布到原子输出（GUI 线程经 getSpectrum 读取）
     for (int i = 0; i < T.numBandsInTier; ++i)
-    {
-        bandPowers[T.firstBand + i] = static_cast<float> (
-            vqtBandPower (rt.scratch.data(), activeSet->kernels[t][static_cast<size_t> (i)]));
-    }
-
-    // 第二遍：频域平滑（功率域）→ 时间包络（功率域一阶）→ dB/钳位/发布。
-    // 只更新本层属主段——邻层段由其属主层按自己的 dt 更新，杜绝跨层双计。
-    for (int i = 0; i < T.numBandsInTier; ++i)
-    {
-        const int b = T.firstBand + i;
-        const float pSmooth = smoothBandPowerAt (bandPowers, b, bands, smoothRadius);
-
-        float& env = envPowers[b];
-        env += ((pSmooth > env) ? attackAlpha : releaseAlpha) * (pSmooth - env);
-
-        float db = (env > 1.0e-12f) ? 10.0f * std::log10 (env) : -RangeDb;
-        if (db < -RangeDb) db = -RangeDb;
-        if (db > 0.0f)    db = 0.0f;
-
-        bandData[b].store (db);
-    }
+        bandData[T.firstBand + i].store (bandDbScratch[T.firstBand + i]);
 }
 
 int SpectrumAnalyzer::getSpectrum (float* outputBands) const

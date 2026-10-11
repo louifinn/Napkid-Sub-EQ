@@ -38,7 +38,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
-#include <random>
 #include <string>   // std::string / std::to_string（F-022：自包含性）
 
 using namespace SubEQ;
@@ -116,13 +115,18 @@ static void olaProcess(const std::vector<double>& fir, const std::vector<double>
 
 // ============================================================================
 // 离线 VQT 原型引擎（v0.4.0 频谱分析内核原型）
-// 与 SubEQ_Spectrum 运行时相同的数学——层布局/核/帧谱/段功率/抽取系数/DC
-// 阻断全部来自 SubEQ_VQTDesign.h——仅组装方式不同（无原子、无 JUCE）。
+// 与 SubEQ_Spectrum 运行时同一套交付数学：层布局/核/帧谱/段功率/抽取系数/DC
+// 阻断/显示管线全部来自共享头（SubEQ_VQTDesign.h 与 SubEQ_SpectrumMath.h）——
+// 抽取级联（vqtDecimationStep）、层环形缓冲装配（vqtPushTierSample）与显示
+// 管线（vqtUpdateDisplayBands）都是直接调用，不再有逐行镜像。
+// 本结构只负责组装（无原子、无 JUCE）与测试专有的读数（rawDb）。
 // 校准 / 泄漏 / 封顶 / 性能断言都在这里跑；数值路径与交付代码零漂移。
 // ============================================================================
 struct OfflineVqtAnalyzer
 {
-    static constexpr int MaxStages = 24;
+    // 级数上界与运行时同源（SubEQ_Spectrum.h 的 MaxStages 用同一表达式）：
+    // 顶层降采样指数上限 + 每层向下再 ÷2 的 9 级（STD-11）
+    static constexpr int MaxStages = VQTMaxTopDecimationExponent + VQTNumTiers - 1;
 
     double sampleRate = 48000.0;
     int hop = 512;
@@ -131,14 +135,9 @@ struct OfflineVqtAnalyzer
     // 0.05 Hz 一阶直流阻断
     double dcPole = 0.0, dcState = 0.0;
 
-    // 抽取级联：stage k 输入率 fs/2^k，每 2 个输入向下一级发射 1 个样本
-    struct Stage
-    {
-        BiquadCoefficients coeffs[2];
-        BiquadState state[2];
-        int phase = 0;
-    };
-    Stage stages[MaxStages];
+    // 抽取级联：stage k 输入率 fs/2^k，每 2 个输入向下一级发射 1 个样本。
+    // 一级状态与运行时共用 VQTDecimationStage（SubEQ_VQTDesign.h）。
+    VQTDecimationStage stages[MaxStages];
     int numStages = 0;
 
     // 各层状态：环形缓冲（容量 = 层帧长）+ 帧谱 scratch
@@ -176,7 +175,10 @@ struct OfflineVqtAnalyzer
         dcPole = vqtDcBlockerPole (fs);
         dcState = 0.0;
 
-        numStages = vqtTopDecimationExponent (fs) + VQTNumTiers - 1;
+        // 级数与运行时同源（SubEQ_Spectrum.cpp 的 prepare() 用同一表达式与
+        // 同一钳位）：顶层降采样指数上限 + 每层向下再 ÷2 的 9 级（STD-11）
+        const int wantedStages = vqtTopDecimationExponent (fs) + VQTNumTiers - 1;
+        numStages = std::min (wantedStages, MaxStages);
         for (int k = 0; k < numStages; ++k)
         {
             vqtDecimatorCoefficients (fs / std::ldexp (1.0, k), stages[k].coeffs);
@@ -195,38 +197,20 @@ struct OfflineVqtAnalyzer
 
         for (int b = 0; b < 121; ++b)
         {
-            bandDb[b] = -60.0;
-            rawDb[b] = -60.0;
-            bandPowers[b] = 0.0;
-            envPowers[b] = 1.0e-6;   // -60 dB 地板的等效功率（与运行时复位一致）
+            bandDb[b] = kDisplayFloorDb;
+            rawDb[b] = kDisplayFloorDb;      // 未钳位真值读数同从地板起步
+            // 两个功率缓冲同从地板等效功率起步（与运行时复位同源，SPC-06）
+            bandPowers[b] = kDisplayFloorPower;
+            envPowers[b] = kDisplayFloorPower;
         }
     }
 
     void processSample (double input)
     {
-        dcState = dcPole * dcState + (1.0 - dcPole) * input;
-        double x = input - dcState;
-
-        // stage k 的输出率 = fs/2^(k+1)；层 o 的抽取因子 D_o = numStages+1-…，
-        // 即 o = numStages-1-k（k = numStages-1 → 层 0；k = numStages-10 → 层 9）
-        const int firstTierStage = numStages - VQTNumTiers;
-        for (int k = 0; k < numStages; ++k)
-        {
-            Stage& st = stages[k];
-            double y = st.state[0].process (x, st.coeffs[0]);
-            y = st.state[1].process (y, st.coeffs[1]);
-            if (++st.phase >= 2)
-            {
-                st.phase = 0;
-                if (k >= firstTierStage)
-                    pushTierSample (numStages - 1 - k, y);
-                x = y;
-            }
-            else
-            {
-                break;   // 本样本未到达更深层
-            }
-        }
+        // 抽取级联（直流阻断 + 逐级 ↓2）与运行时 SpectrumAnalyzer::process 共用
+        // SubEQ_VQTDesign.h 的 vqtDecimationStep——数值路径不再各写一份
+        vqtDecimationStep (input, stages, numStages, dcPole, dcState,
+                           [this] (int t, double sample) { pushTierSample (t, sample); });
     }
 
     // 最近频段下标（用于把测试音对准某个频段中心）
@@ -241,14 +225,11 @@ private:
     void pushTierSample (int t, double y)
     {
         TierState& ts = tier[t];
-        const int F = set->tiers[t].fftSize;
-        ts.ring[static_cast<size_t> (ts.write)] = y;
-        if (++ts.write >= F) ts.write = 0;
-        if (++ts.sinceAnalysis >= vqtTierStride (set->tiers[t].decimation, hop))
-        {
-            ts.sinceAnalysis = 0;
-            analyzeTier (t);
-        }
+        // 环形缓冲装配 + 步距触发（与运行时共用，见 SubEQ_VQTDesign.h）
+        vqtPushTierSample (ts.ring.data(), set->tiers[t].fftSize, y,
+                           ts.write, ts.sinceAnalysis,
+                           vqtTierStride (set->tiers[t].decimation, hop),
+                           [this, t] { analyzeTier (t); });
     }
 
     void analyzeTier (int t)
@@ -264,28 +245,23 @@ private:
         const double attackAlpha  = ballisticAlpha (dt, SpectrumAttackSeconds);
         const double releaseAlpha = ballisticAlpha (dt, SpectrumReleaseTau);
 
-        // 第一遍：本层各段瞬时功率
+        // 显示管线（瞬时功率 → 频域平滑 → 功率域一阶包络 → dB/钳位）调用与
+        // 运行时同一实现（SubEQ_SpectrumMath.h 的 vqtUpdateDisplayBands）——
+        // 离线原型不再是手抄镜像，交付数学与回归数学零漂移（STD-04）。
+        vqtUpdateDisplayBands (bandPowers, envPowers, T.firstBand, T.numBandsInTier,
+                               numBands, smoothRadius, attackAlpha, releaseAlpha, bandDb,
+                               [this, &ts, &T, t] (int i)
+                               {
+                                   return vqtBandPower (ts.scratch.data(),
+                                       set->kernels[t][static_cast<size_t> (i)]);
+                               });
+
+        // rawDb（测试专有，泄漏断言要读逐段未钳位真值，不含平滑/包络）在共享
+        // 调用之外单独算：读的是本次刚写入的瞬时功率，与旧镜像逐值一致。
         for (int i = 0; i < T.numBandsInTier; ++i)
         {
-            const int b = T.firstBand + i;
-            const double p = vqtBandPower (ts.scratch.data(), set->kernels[t][static_cast<size_t> (i)]);
-            bandPowers[b] = p;
-            // rawDb 不钳位（泄漏断言要读真值）；显示/包络路径钳 [-60, 0]
-            rawDb[b] = (p > 1.0e-16) ? 10.0 * std::log10 (p) : -200.0;
-        }
-
-        // 第二遍：频域平滑（功率域）→ 时间包络（功率域一阶）→ dB/钳位
-        for (int i = 0; i < T.numBandsInTier; ++i)
-        {
-            const int b = T.firstBand + i;
-            const double ps = smoothBandPowerAt (bandPowers, b, numBands, smoothRadius);
-            double& env = envPowers[b];
-            env += ((ps > env) ? attackAlpha : releaseAlpha) * (ps - env);
-
-            double db = (env > 1.0e-12) ? 10.0 * std::log10 (env) : -60.0;
-            if (db < -60.0) db = -60.0;
-            if (db > 0.0)   db = 0.0;
-            bandDb[b] = db;
+            const double p = bandPowers[T.firstBand + i];
+            rawDb[T.firstBand + i] = (p > 1.0e-16) ? 10.0 * std::log10 (p) : -200.0;
         }
     }
 };
@@ -1227,6 +1203,13 @@ int main()
         check(std::abs(10.0 * std::log10(smoothBandPowerAt(imp, 7, 16, 2)) - 10.0 * std::log10(1.0 / 3.0)) < 0.05,
               "impulse peak drop at r=2 matches Hann kernel theory (-4.77 dB = 1/{0.25,0.75,1,0.75,0.25} sum 3)");
 
+        // 地板与功率初值必须互为精确换算（R4-F4）：头文件里的 static_assert 只在
+        // 编译期把关「地板是 10 dB 整数倍」，此处再按运行时读取的常量值核对一次
+        // 二者确实相等——10·log10(kDisplayFloorPower) 必须落在 kDisplayFloorDb 上。
+        check(kDisplayFloorSteps * 10 == static_cast<int>(-kDisplayFloorDb)
+              && std::abs(10.0 * std::log10(kDisplayFloorPower) - kDisplayFloorDb) < 1e-9,
+              "display floor dB and floor power are exact reciprocals");
+
         // 弹道系数：α = 1 - e^(-dt/τ)
         check(ballisticAlpha(0.0, 0.02) == 0.0, "ballisticAlpha dt=0 -> 0");
         check(ballisticAlpha(1.0, 0.0) == 1.0, "ballisticAlpha tau<=0 -> 1 (instant)");
@@ -1287,6 +1270,13 @@ int main()
               "e2e smoothing: 1/6 oct peak within -5.5 dB and no higher than Off");
         check(peak[2] <= peak[1] + 0.05 && peak[3] <= peak[2] + 0.05,
               "e2e smoothing: peak drop monotonic with smoothing depth");
+        // 各档数值预算（±0.75 dB，与 Off 档同口径）：核权重和 r+1（r=1/2/4/8 →
+        // 2/3/5/9），冲激峰理论值 10·log10(1/(r+1)) = -3.01 / -4.77 / -6.99 /
+        // -9.54 dB（附录 A.3；200 Hz 邻段几乎无裙能量，实测即理论值）。
+        check(std::abs(peak[2] - 10.0 * std::log10(1.0 / 5.0)) < 0.75,
+              "e2e smoothing: 1/3 oct peak within 0.75 dB of kernel theory (-6.99 dB = 1/5)");
+        check(std::abs(peak[3] - 10.0 * std::log10(1.0 / 9.0)) < 0.75,
+              "e2e smoothing: 2/3 oct peak within 0.75 dB of kernel theory (-9.54 dB = 1/9)");
         std::printf("      smoothing peak, 200 Hz tone (121 bands): Off %.2f / 1/6 %.2f / 1/3 %.2f / 2/3 %.2f dB\n",
                     peak[0], peak[1], peak[2], peak[3]);
 
@@ -1337,6 +1327,59 @@ int main()
                   "e2e envelope: 40 dB fall lands in [120, 600] ms window");
             std::printf("      fall time -10 -> -50 dB: %.0f ms (envelope expectation %.0f ms + frame smear)\n",
                         fall * 1000.0, expect * 1000.0);
+        }
+
+        // 低层段端到端关断（SPC-01）：上面 200 Hz 落在 tier 8（帧 0.341 s），
+        // 覆盖不到「低层帧远长于包络时间常数」的区间——那里的下落由帧滑出主导。
+        // band 31（≈3.00 Hz，属主层 tier 2，帧 1.365 s）是低层代表：
+        //   - 总下落（-10 → -50 dB）≤ windowSeconds + 2·dt（帧滑出是主导项，
+        //     该界宽松，只抓多秒级拖尾）；
+        //   - 尾段（-40 → -50 dB，此时帧已全零、纯包络穿越）≤ 10/180 + 3·dt——
+        //     界由两个物理量相加而成（不是拍出来的常数）：包络以 180 dB/s 匀速
+        //     下落，故 -40 → -50 dB 的 10 dB 至少需要 10/180 = 55.6 ms；加上
+        //     穿越点的检测量化——读数只在分析步上更新，每次更新可能把两个穿越
+        //     各推迟一步，故容 3·dt（48k/hop512 下 tier 2 为 3×42.7 = 128 ms，
+        //     合计 183.6 ms）。界内实测 43~85 ms（检测量化 1~2 步），留有一整个
+        //     分析步的余量；而「包络系数未按各层真实 dt 折算」（v0.4.0 式回归）
+        //     时低层释放慢一个抽取因子倍数，实测尾段 213 ms（检测量化 5 步）被
+        //     拒绝——顶层段与单元级断言都抓不到该回归。
+        // 界全部由 set.tiers[]、hop/fs 与 SpectrumReleaseDbPerSecond 推导，不硬编码。
+        {
+            const VQTKernelSet set = buildVQTKernelSet(fs, numBands, 1.0, WindowType::BlackmanHarris);
+            const int band = OfflineVqtAnalyzer::bandIndexNear(3.0, numBands);
+            const int tier = vqtBandTier(band, octaveDivisorForBands(numBands));
+            const VQTTier& T = set.tiers[tier];
+            const double dt = static_cast<double>(vqtTierStride(T.decimation, hop))
+                            * static_cast<double>(T.decimation) / fs;
+            const double totalBound = T.windowSeconds + 2.0 * dt;
+            const double tailBound = 10.0 / SpectrumReleaseDbPerSecond + 3.0 * dt;
+
+            OfflineVqtAnalyzer a;
+            a.prepare(fs, set, hop, 0);
+            feedSignal(a, octaveBandCenterFreq(0.5f, band, numBands), 1.0, 2.0, fs);
+
+            double tCross10 = -1.0, tCross40 = -1.0, tCross50 = -1.0;
+            for (int i = 0; i < static_cast<int>(6.0 * fs); ++i)
+            {
+                a.processSample(0.0);
+                if (tCross10 < 0.0 && a.bandDb[band] < -10.0) tCross10 = i / fs;
+                if (tCross40 < 0.0 && a.bandDb[band] < -40.0) tCross40 = i / fs;
+                if (tCross50 < 0.0 && a.bandDb[band] < -50.0) { tCross50 = i / fs; break; }
+            }
+            // 三个穿越都必须真的发生：tCrossXX 仍为 -1 哨兵时差值会退化成 0 而
+            // 从下方越过 `<= bound`（空过），故显式要求每个哨兵都已被替换。
+            const bool allCrossed = (tCross10 >= 0.0 && tCross40 >= 0.0 && tCross50 >= 0.0);
+            const double totalFall = tCross50 - tCross10;
+            const double tailFall  = tCross50 - tCross40;
+            check(allCrossed, "e2e envelope (low tier): -10/-40/-50 dB crossings all observed");
+            check(allCrossed && totalFall > 0.0 && totalFall <= totalBound + 1.0e-9,
+                  "e2e envelope (low tier): total 40 dB fall within window + 2*dt");
+            check(allCrossed && tailFall > 0.0 && tailFall <= tailBound + 1.0e-9,
+                  "e2e envelope (low tier): -40 -> -50 dB tail within 10/180 + 3*dt (per-tier dt fix)");
+            std::printf("      low-tier fall (band %d, tier %d, %.2f Hz): total %.0f ms <= %.0f ms, tail %.0f ms <= %.0f ms (dt %.1f ms)\n",
+                        band, tier, octaveBandCenterFreq(0.5f, band, numBands),
+                        totalFall * 1000.0, totalBound * 1000.0,
+                        tailFall * 1000.0, tailBound * 1000.0, dt * 1000.0);
         }
     }
 

@@ -40,22 +40,29 @@ public:
     static constexpr int MaxBands    = 121;      // 1/12 octave over 0.5..500 Hz
     static constexpr float MinFreq   = 0.5f;
     static constexpr float MaxFreq   = 500.0f;
-    static constexpr float RangeDb   = 60.0f;    // Display range in dB
+    // 显示范围（dB）：从 SubEQ_SpectrumMath.h 的 kDisplayRangeDb 派生（R3-F5），
+    // 使其与本类的 -RangeDb 用法、显示管线钳位下限（kDisplayFloorDb）以及
+    // GUI 频谱初值同源。断言检查 float 镜像无损（两侧相等是派生关系的实质
+    // 要求，不是恒真式：若 kDisplayRangeDb 取到 float 不可精确表示的值即报错）。
+    static constexpr float RangeDb   = static_cast<float> (kDisplayRangeDb);
+    static_assert (static_cast<double> (RangeDb) == -kDisplayFloorDb,
+                   "RangeDb mirror must stay exact and match the display floor");
 
     static constexpr int NumResolutionLevels = 3;            // Fast / Balanced / Fine
-    static constexpr int NumKernelSets = kNumWindowTypes * 2 * NumResolutionLevels; // 24
+    static constexpr int NumKernelSets = kNumWindowTypes * kNumBandDensities
+                                       * NumResolutionLevels; // 24
 
     SpectrumAnalyzer();
 
-    // Build every kernel variant + decimator ladder for this sample rate.
-    // Setup thread only (prepareToPlay): allocates and runs O(N) trigonometry.
+    // 构建本采样率下的全部核组合与抽取级联系数。
+    // 仅 setup 线程（prepareToPlay）调用：内部分配并执行 O(N) 三角函数。
     void prepare(double sampleRate);
 
-    // Runtime reconfiguration (audio-thread safe: only pointer swaps, plain
-    // integers and pre-allocated buffer writes — no allocation, no locks).
-    // resolutionIndex: 0=Fast, 1=Balanced, 2=Fine; numBands: 61 or 121;
-    // hopSize: 512/1024/2048; window: analysis window family; smoothingIndex:
-    // 0=Off, 1=1/6 oct, 2=1/3 oct, 3=2/3 oct（核半径见 smoothingRadiusBands）。
+    // 运行时重配置（音频线程安全：只切指针、写普通整数与预分配缓冲——
+    // 不分配、不加锁）。resolutionIndex: 0=Fast, 1=Balanced, 2=Fine；
+    // numBands: 61 或 121；hopSize: 512/1024/2048；window: 分析窗型；
+    // 平滑档 smoothingIndex：0=Off, 1=1/6 oct, 2=1/3 oct, 3=2/3 oct
+    //（核半径见 smoothingRadiusBands）。
     void configure(int resolutionIndex, int numBands, int hopSize, WindowType window,
                    int smoothingIndex);
 
@@ -76,7 +83,6 @@ private:
     void pushTierSample(int tier, double sample);
     void analyzeTier(int tier);
     void resetRuntimeState();
-    void updateBandBounds(int bands);
     int kernelSetIndex(int resolutionIndex, int bandCount, WindowType window) const noexcept;
 
     double sampleRate = 48000.0;
@@ -86,25 +92,28 @@ private:
     std::atomic<int> numBands { 61 };   // 1/6 octave default
     std::atomic<int> hopSize  { 512 };  // ~10.7 ms @48kHz（顶层步距）
 
-    // Non-atomic mirror used by the audio thread (same thread as configure)
-    int activeNumBands = 61;
+    // 音频线程用的非原子镜像（与 configure() 同线程）
+    int activeNumBands = kBandsByDensity[0];
     int lastResolutionIndex = 1;            // prepare 重入后按最后配置重指向核组合
     WindowType lastWindow = WindowType::BlackmanHarris;
     const VQTKernelSet* activeSet = nullptr;   // 24 个预生成组合之一（或未 prepare）
 
-    // 核组合表：[window][density(0=61,1=121)][resolution]，prepare() 全量构建
+    // 核组合表：[window][density（kBandsByDensity 下标）][resolution]，prepare() 全量构建
     std::vector<VQTKernelSet> kernelSets;
 
     // ---- 抽取链 + 各层运行时状态（全部在 prepare() 按最大尺寸分配）----
-    static constexpr int MaxStages = 24;
+    // 级数来源：顶层降采样指数上限 + 每层向下再 ÷2 的 9 级（见
+    // SubEQ_VQTDesign.h 的 VQTMaxTopDecimationExponent）。数组界与
+    // numStages 的计算式同源（离线原型 Tests/subeq_fft_test.cpp 同式），
+    // 不变量由定义本身成立；**真正的把守在 prepare()**——那里对
+    // vqtTopDecimationExponent 的实际返回值做 jassert + 钳位（越界写比
+    // 钝化截断代价高得多）。此前放在这里的 static_assert 两侧是同一表达式
+    // （恒真），不提供任何机器保证且易被误读为「数组界已锁住」，故移除。
+    static constexpr int MaxStages = VQTMaxTopDecimationExponent + VQTNumTiers - 1;
 
-    struct Stage
-    {
-        BiquadCoefficients coeffs[2];
-        BiquadState state[2];
-        int phase = 0;
-    };
-    Stage stages[MaxStages];
+    // 抽取链一级 = VQTDecimationStage（共享头定义：运行时与离线原型同布局；
+    // 级联推进见 SubEQ_VQTDesign.h 的 vqtDecimationStep）
+    VQTDecimationStage stages[MaxStages];
     int numStages = 0;
 
     struct TierRuntime
@@ -121,17 +130,16 @@ private:
     double dcPole = 0.0;
     double dcState = 0.0;
 
-    // Band center frequencies (valid entries: 0..numBands-1)
-    float bandCenterFreqs[MaxBands];
-
     // Spectrum output (atomic for thread safety)
     std::atomic<float> bandData[MaxBands];
 
     // 显示平滑管线状态（v0.4.1，功率域——v0.4.0 的 dB 域包络已废弃）：
     // bandPowers 为各段最近一次属主层分析的瞬时功率；频域平滑与时间包络
-    // 全部在功率域进行，dB 转换与 [-60, 0] 钳位只在写入 bandData 前发生。
-    float bandPowers[MaxBands] {};   // 瞬时功率（满幅正弦落段中心 = 1.0）
-    float envPowers[MaxBands] {};    // 时间包络状态（复位为 1e-6 ≈ -60 dB）
+    // 全部在功率域进行，dB 转换与 [kDisplayFloorDb, 0] 钳位只在写入 bandData
+    // 前发生（地板与范围常量同源于 SubEQ_SpectrumMath.h，R3-F5）。
+    float bandPowers[MaxBands] {};   // 瞬时功率（满幅正弦落段中心 = 1.0；未分析前 = kDisplayFloorPower）
+    float envPowers[MaxBands] {};    // 时间包络状态（复位为 kDisplayFloorPower ≈ -60 dB）
+    float bandDbScratch[MaxBands] {}; // 显示 dB 暂存（共享管线的输出，随后发布到 bandData）
     int smoothRadius = 1;            // 频域平滑核半径（段），configure() 换算
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(SpectrumAnalyzer)

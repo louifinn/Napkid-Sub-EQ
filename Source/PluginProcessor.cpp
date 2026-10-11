@@ -235,29 +235,24 @@ void SubEQAudioProcessor::updateEQParameters()
 
     // Spectrum analyzer configuration changes (audio-thread safe: the
     // analysers only switch pre-built kernel-set pointers and write plain
-    // integers / pre-allocated buffers)
-    int spectrumResolution = static_cast<int> (spectrumFftParam->load());
-    int spectrumWindow = static_cast<int> (spectrumWindowParam->load());
-    int spectrumDensity = static_cast<int> (spectrumDensityParam->load());
-    int spectrumHop = static_cast<int> (spectrumHopParam->load());
-    int spectrumSmoothing = static_cast<int> (spectrumSmoothingParam->load());
-    if (spectrumResolution != spectrumResolutionCache
-        || spectrumWindow != spectrumWindowCache
-        || spectrumDensity != spectrumDensityCache
-        || spectrumHop != spectrumHopCache
-        || spectrumSmoothing != spectrumSmoothingCache)
+    // integers / pre-allocated buffers)。五元组打包成 SpectrumSettings：
+    // 一次比较、一次解码（解码器在 SubEQ_SpectrumConfig.h）。
+    const SpectrumSettings settings {
+        static_cast<int> (spectrumFftParam->load()),
+        static_cast<int> (spectrumWindowParam->load()),
+        static_cast<int> (spectrumDensityParam->load()),
+        static_cast<int> (spectrumHopParam->load()),
+        static_cast<int> (spectrumSmoothingParam->load())
+    };
+    if (settings != spectrumSettings)
     {
-        spectrumResolutionCache = spectrumResolution;
-        spectrumWindowCache = spectrumWindow;
-        spectrumDensityCache = spectrumDensity;
-        spectrumHopCache = spectrumHop;
-        spectrumSmoothingCache = spectrumSmoothing;
+        spectrumSettings = settings;
 
-        int resolutionIndex = SubEQ::spectrumResolutionChoiceToIndex (spectrumResolution);
-        SubEQ::WindowType window = SubEQ::spectrumWindowChoiceToType (spectrumWindow);
-        int numBands = SubEQ::spectrumDensityChoiceToBands (spectrumDensity);
-        int hop = SubEQ::spectrumHopChoiceToSamples (spectrumHop);
-        int smoothingIndex = SubEQ::spectrumSmoothingChoiceToIndex (spectrumSmoothing);
+        const int resolutionIndex = SubEQ::spectrumResolutionChoiceToIndex (settings.resolution);
+        const SubEQ::WindowType window = SubEQ::spectrumWindowChoiceToType (settings.window);
+        const int numBands = SubEQ::spectrumDensityChoiceToBands (settings.density);
+        const int hop = SubEQ::spectrumHopChoiceToSamples (settings.hop);
+        const int smoothingIndex = SubEQ::spectrumSmoothingChoiceToIndex (settings.smoothing);
 
         spectrumAnalyzer.configure (resolutionIndex, numBands, hop, window, smoothingIndex);
         inputAnalyzer.configure (resolutionIndex, numBands, hop, window, smoothingIndex);

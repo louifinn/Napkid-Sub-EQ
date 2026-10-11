@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include "SubEQ_SpectrumMath.h"   // kNumBandDensities / kBandsByDensity（密度轴单一来源）
 #include "SubEQ_WindowFunctions.h"
 
 namespace SubEQ
@@ -26,9 +27,11 @@ inline int spectrumResolutionChoiceToIndex (int choice) noexcept
 }
 
 // Band density choice index -> band count (0=1/6 oct -> 61, 1=1/12 oct -> 121).
+// 段数表在 SubEQ_SpectrumMath.h（kBandsByDensity），与运行时装配共用。
 inline int spectrumDensityChoiceToBands (int choice) noexcept
 {
-    return choice == 1 ? 121 : 61;
+    const int d = (choice >= 0 && choice < kNumBandDensities) ? choice : 0;
+    return kBandsByDensity[d];
 }
 
 // 窗函数档位下标 -> 窗型（0=Hann, 1=Blackman, 2=Blackman–Harris, 3=Nuttall）。

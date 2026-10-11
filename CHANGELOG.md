@@ -2,6 +2,38 @@
 
 Napkid Sub EQ 的所有重要变更都将记录在此文件中。
 
+## [0.4.2] - 2026-10-11
+
+> 第 2 轮对抗性审查（`docs/review/findings-round2.md`）闭环修复轮：运行时频谱装配（显示管线 / 抽取级联 / 层环形缓冲）抽为共享原语（离线原型与交付代码零漂移）、窗规格 / 密度轴 / 显示范围 / 抽取级数上界收为单一事实来源、注释与文档语言规范统一；三个闭环复核轮（记录见 `docs/review/findings-round3.md`）发现的残留项（恒真 static_assert、显示地板闸门、计数与版本落账）一并处理。
+
+### 修复
+
+- **STD-01 注释语言（#1）**：`SubEQ_Spectrum.cpp` / `SubEQ_SpectrumMath.h` 的文件头与新写注释改回简体中文（与同批 `SubEQ_VQTDesign.h` / `SubEQ_WindowFunctions.h` 一致）；复核轮补完 `SubEQ_SpectrumMath.h` 文件头残留英文（R4-F3 / #25）。
+- **STD-02 文档补注（#2）**：`AGENTS.md` 顶层速率补注采样率限定「48 kHz；44.1 kHz 因 2 的幂整除约束为 11025 Hz」，与 `Documentation/SubEQ_VQT_Feasibility.md` §4.1 一致。
+- **STD-04 运行时装配共享化（#4）**：三条原语挂进共享头——显示管线 `vqtUpdateDisplayBands()`（瞬时功率 → 频域段间平滑 → 功率域一阶包络 → dB/钳位，`SubEQ_SpectrumMath.h:188`）、抽取级联 `vqtDecimationStep()`（0.05 Hz 直流阻断 + 逐级 ↓2 抗混叠，`SubEQ_VQTDesign.h:332`）、层环形缓冲装配 `vqtPushTierSample()`（`:366`）——运行时 `analyzeTier` / `process()` / `pushTierSample()` 与 Tests 离线原型调用同一实现，「被测代码即交付代码」覆盖到运行时装配（仅余 dt/α 系数一处局部镜像，记入 `docs/review/findings-round3.md` 待后续）。
+- **STD-05 频谱设置打包（#5）**：新增 `SpectrumSettings`（五元组 + `operator==`）替代 `PluginProcessor` 的五个缓存整数（一次比较、一次解码）；段数（61/121）收敛为 `SubEQ_SpectrumMath.h` 的 `kBandsByDensity` / `bandDensityForBands()` 单一来源（核组合索引、`configure()` 归一、APVTS 解码共用，不再各写一份条件式）。
+- **STD-06 重复映射收敛（#6）**：`SubEQ_WindowFunctions.h` 新增 `WindowSpec` 表（cosine-sum 系数 / 项数 / 旁瓣 / ENBW 单一来源，新增窗型只加一行）；`SubEQ_VQTDesign.h` 的窗分辨率倍率改为显式覆盖四窗型（编译器可提示遗漏）；`ModeSelector` 频谱六组下拉收敛为 `spectrumControlTable()`，构造 / 析构 / attach / 查找 / 排版五处遍历同表。
+- **STD-07 死状态删除（#7）**：移除 `SpectrumAnalyzer` 的 `bandCenterFreqs` 与 `updateBandBounds()`——全仓无读者，且仍在音频线程 `configure()` 里做 61/121 次倍频程中心频率三角函数。
+- **STD-08 具名常数（#8）**：`SubEQ_SpectrumMath.h` 的硬写 π 字面量改用 `kWindowTwoPi`（`SubEQ_WindowFunctions.h` 已有），匿名 ln10 字面量提为具名 `kLn10`。
+- **STD-10 重复头文件（#10）**：Tests 删除重复的 `#include <random>`。
+- **STD-11 抽取级数守卫一致化（#11）**：顶层降采样指数上限提为具名 `VQTMaxTopDecimationExponent`（16，`SubEQ_VQTDesign.h:57`），`MaxStages`（`SubEQ_Spectrum.h:112`）与 `numStages`（`SubEQ_Spectrum.cpp:63`）计算式同源（运行时与离线原型同表达式）；`prepare()` 对该函数实际返回值 `jassert` + `min` 钳位兜底（`:64-65`）——守卫与数组界不一致时钝化为截断，不再越界写 `stages[]`；原头文件中两侧同一表达式的恒真 `static_assert` 经复核移除（R3-F4 / #21），把守改放 `prepare()`。
+- **R3-F2 单一来源自述补全（#23）**：`SubEQ_SpectrumMath.h` 文件头逐条声明密度轴（`kBandsByDensity`/`bandDensityForBands`）与显示范围/地板（`kDisplayRangeDb`/`kDisplayFloorDb`/`kDisplayFloorPower`）两组单一来源；`AGENTS.md` 的共享纯计算头文件枚举同步补全。
+- **R3-F5 显示范围派生（#22）**：`kDisplayRangeDb` / `kDisplayFloorDb` / `kDisplayPowerGuard` / `kDisplayFloorPower` 进 `SubEQ_SpectrumMath.h`（`SubEQ_Spectrum.h:46` 的 `RangeDb` 以 `static_assert` 精确镜像）；`SpectrumAnalyzer` 复位初值与暂存、GUI 频谱缓冲初值全部从该来源派生——−60 dB 地板不再多处独立表达。
+- **R4-F4 地板闸门改往返相等（#26）**：具名 `kDisplayFloorSteps`（`SubEQ_SpectrumMath.h:151`），断言改为 `-kDisplayFloorDb == 10.0 * kDisplayFloorSteps`（截断型分数地板不再蒙混），功率展开与断言共用同一常量（`:156`）；Test 25 增加一条运行时断言核对地板 dB 与地板功率互为精确换算。
+- **R4-F5 / R4-F6 版本落账（#27 / #28）**：CHANGELOG 工程节的计数自述与 `AGENTS.md` 版本头分别对齐实测数据与 `.jucer` 的 0.4.2。
+
+### 测试
+
+- 回归 **201 → 207 项，全部通过**（本轮门禁：回归 exit 0；Release 增量构建与全量 Rebuild 均零警告，exit 0）：新增 6 项无条件断言——SPC-03（#14）：1/3 与 2/3 平滑档峰预算各 ±0.75 dB 对核理论（−6.99 / −9.54 dB = 1/5 与 1/9）；SPC-01（#12）：低层段（≈3.00 Hz，属主层 tier 2）端到端关断三条——−10/−40/−50 三个 dB 阈值穿越的守卫断言（哨兵未替换即报错，杜绝空过）+ 总下落（−10 → −50 dB）≤ 窗长 + 2·dt + 尾段（−40 → −50 dB）≤ 10/180 s（≈55.6 ms）+ 3·dt，界由 `set.tiers[]` 与 hop/fs 推导；R4-F4（#26）：地板 dB 与功率初值互为精确换算的运行时核对。
+- 离线原型全部改调共享原语（显示管线 / 抽取级联 / 环形装配）；泄漏断言读的 `rawDb` 未钳位真值在共享调用之外单独计算，逐值语义不变。复位初值与钳位下限改用 `kDisplayFloorDb` / `kDisplayFloorPower`（与运行时同源）。
+
+### 工程
+
+- 版本号 0.4.1 → 0.4.2：`Napkid Sub EQ.jucer` 的 `version` 字段与 `AGENTS.md` 头部的「当前版本」行一并同步，并补写本条目（此前本轮改动无任何变更记录）。
+- 台账回填：`docs/review/findings-round2.md` 的「处理记录」改为逐条处置表（含 issue 链接），`docs/review/findings-round3.md` 记录第 5 轮起的复核与残留项。
+- `AGENTS.md` 同步：版本头 0.4.1 → 0.4.2、顶层速率采样率限定（#2）、回归项数 207、共享纯计算头文件枚举补全（#23）、Agent skills 段落（issue tracker / triage 标签 / 领域文档索引，见 `docs/agents/`）。
+- 单一事实来源收敛后音频线程约束不变：零分配、无锁（固定数组 + `prepare()` 预分配缓冲 + 指针切换）。
+
 ## [0.4.1] - 2026-10-11
 
 > 频谱显示平滑化：频域段间平滑（功率域、用户可选倍频程宽度）+ 时间包络重构（dB 域 → 功率域 + 按层时间归一化）。设计论证见 `Documentation/SubEQ_VQT_Feasibility.md` 附录 A。
