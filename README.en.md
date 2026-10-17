@@ -1,5 +1,7 @@
 # Napkid Sub EQ
 
+[简体中文](README.md) | English
+
 > English translation of README.md.
 
 A graphical parametric equalizer VST3 audio plugin built for sub-bass, precisely controlling the **0.5 Hz – 500 Hz** band.
@@ -34,7 +36,7 @@ It is particularly well suited to:
   - **Zero Latency**: pure IIR architecture, no additional processing latency
   - **Linear Phase**: a strictly linear-phase FIR designed from the IIR magnitude response; fixed latency (N-1)/2 + 511-sample block latency
   - **Minimum Phase**: a minimum-phase FIR designed from the IIR magnitude response via the cepstral method (causal FIR, group delay 0); latency is the 511-sample block latency
-- **Selectable FIR length** (new in v0.3.0): 4096 / 16384 / 65536 points (Linear / Minimum Phase modes). A longer FIR improves low-frequency accuracy (65536 points @48 kHz gives ~0.37 Hz resolution) at the cost of more latency and CPU
+- **Selectable FIR length** (new in v0.3.0): 4096 / 16384 / 65536 points (Linear / Minimum Phase modes). A longer FIR improves low-frequency accuracy (65536 points @48 kHz gives ~0.73 Hz resolution) at the cost of more latency and CPU
 - **FFT overlap-add convolution** (v0.3.0): in-house double-precision radix-2 FFT (lookup-table-optimised twiddles) for efficient, high-accuracy FIR processing
 - **Automatic delay compensation (PDC)**: reports latency to the host whenever the mode or parameters change, supporting DAW plugin delay compensation
 - **Real-time latency display**: the bottom panel shows the current mode's latency in ms / samples
@@ -132,7 +134,7 @@ The bottom panel provides the processing mode selector:
 - **Linear Phase**: strictly linear-phase FIR, fixed latency (N-1)/2 + 511-sample block latency, zero phase distortion — good for mastering
 - **Minimum Phase**: minimum-phase FIR (causal design, group delay 0), latency only the 511-sample block latency, no pre-ringing — good for general mixing
 
-The **FIR Length** selector (4096 / 16384 / 65536) in the bottom panel applies in both FIR modes: a longer FIR improves low-frequency accuracy (65536 points @48 kHz gives ~0.37 Hz frequency resolution, close to a full 0.5 Hz cycle) but increases latency and CPU usage accordingly. When switching, the plugin automatically reports the latency to the host (PDC). The bottom panel also provides the spectrum display parameter selectors (resolution / window / band density / refresh rate / analysis hop / smoothing; since v0.4.1 the spectrum group has six columns).
+The **FIR Length** selector (4096 / 16384 / 65536) in the bottom panel applies in both FIR modes: a longer FIR improves low-frequency accuracy (65536 points @48 kHz gives ~0.73 Hz frequency resolution; one full cycle of a 0.5 Hz signal is about 2 s) but increases latency and CPU usage accordingly. When switching, the plugin automatically reports the latency to the host (PDC). The bottom panel also provides the spectrum display parameter selectors (resolution / window / band density / refresh rate / analysis hop / smoothing; since v0.4.1 the spectrum group has six columns).
 
 Switching modes automatically reports latency to the host, ensuring that the DAW's delay compensation (PDC) works correctly.
 
@@ -233,7 +235,7 @@ One of the design goals of this plugin is processing near-DC control signals. At
 - **Spectrum noise-floor definition**: VQT band energy is aggregated by window ENBW × tier bandwidth (2× steps between tiers), so the noise-floor shape differs from the old "single-bin sampling" — it is flatter (constant bandwidth ratio per octave), which is expected behaviour
 - **Relatively high spectrum CPU at 44.1 kHz**: the power-of-two decimation divisibility constraint makes the top-tier oversampling ratio high (about 2× that at 48 kHz), bringing the cost back to the order of the old engine; 48/96/192 kHz are unaffected
 - **Peak broadening from spectrum smoothing (v0.4.1)**: inter-band smoothing tames noise fluctuation but broadens isolated pure-tone peaks — in the worst case (an isolated high-frequency tone) about -4.8 dB at 1/6, -7.0 dB at 1/3 and -9.5 dB at 2/3; the low-frequency range loses significantly less because its analysis kernel already overlaps bands. Choose Off when precise per-band readings are needed
-- **Low-frequency accuracy vs latency trade-off in FIR modes**: the FIR length is selectable (4096 / 16384 / 65536 points); 4096 points @48 kHz gives ~11.7 Hz frequency resolution, so the response below 10 Hz is an interpolated approximation; 65536 points gives ~0.37 Hz resolution, but Linear Phase latency reaches 1.37 s and CPU usage is high. FIR modes also add 511 samples (~10.6 ms @48 kHz) of overlap-add block processing latency
+- **Low-frequency accuracy vs latency trade-off in FIR modes**: the FIR length is selectable (4096 / 16384 / 65536 points); 4096 points @48 kHz gives ~11.7 Hz frequency resolution, so the response below 10 Hz is an interpolated approximation; 65536 points gives ~0.73 Hz resolution, but Linear Phase latency reaches 0.69 s and CPU usage is high. FIR modes also add 511 samples (~10.6 ms @48 kHz) of overlap-add block processing latency
 
 ---
 
