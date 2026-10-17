@@ -2,6 +2,30 @@
 
 Napkid Sub EQ 的所有重要变更都将记录在此文件中。
 
+## [0.4.3] - 2026-10-18
+
+> 相位可视化与文档收口轮：FIR 模式的相位曲线由占位隐藏改为真实渲染（扣除 FIR 群延迟后的剩余相位），新增英文 README 并回填第 5 轮审查台账、做仓库卫生清理；同时修正 README 中长期存在的两处 FIR 分辨率 / 延迟数值错误（历史 CHANGELOG 条目保持原样，不回改）。
+
+### 变更
+
+- **FIR 模式相位曲线（GUI）**：相位曲线现在在**三种处理模式都显示**，与幅频曲线同步。Zero Latency 绘制 IIR 相位；Minimum / Linear Phase 由已发布 FIR 的 `freqCoeffs` + `groupDelay` 计算**扣除 FIR 群延迟后的剩余相位（excess phase）**——Linear Phase 因此近似平坦的 0°；后台新设计发布后经版本号自动刷新曲线。旧「非零延迟模式隐藏相位」的 TODO 与占位逻辑一并删除。
+- **新增英文 README**：`README.en.md` 与中文 `README.md` 一一对应；`README.md` 顶部加语言链接 `[English](README.en.md) | 简体中文`，`README.en.md` 顶部加 `[简体中文](README.md) | English`。
+- **审查台账回填**：`docs/review/findings-round3.md` 补齐 R5-F5（回归项数记为 206 与实跑 207 不符，以实跑定稿）与 R5-F6（dt/α 折算的运行时 / 离线原型局部镜像，已由共享 `vqtTierEnvelopeAlphas()` 收口）两条处置记录。
+- **仓库卫生**：`.gitignore` 追加本地工具目录 `.v2c/`、`.video_agent/`、`.zcode/` 与 `.zcodeignore`；删除仓库根目录陈旧的 `subeq_fft_test.obj`（构建产物不入库）。
+
+### 文档修正
+
+- README（中 / 英）的 65536 点 @48 kHz FIR 频率分辨率 **0.37 Hz → 0.73 Hz**（设计网格 fs/N = 48000 / 65536 ≈ 0.73 Hz）。
+- README（中 / 英）的 Linear Phase 延迟 **1.37 s → 0.69 s**（(65536−1)/2 + 511 = 33278 samples @48 kHz ≈ 0.69 s）。
+- `README.md` 中「接近 0.5 Hz 完整周期」的错误暗示按实际分辨率改为自洽表述（0.5 Hz 信号的一个完整周期约 2 s）。
+- 上述均为既有文档的数值错误；历史 CHANGELOG 条目（0.3.0 等）保持原样，不回改。
+
+### 测试与工程
+
+- 回归：`Tests/subeq_fft_test.cpp` 以 `cl /nologo /EHsc /std:c++17 /O2 /utf-8` 重新编译，`Tests/subeq_fft_test.exe` 实跑 **207 项全部 PASS**、`ALL TESTS PASSED`、exit 0。
+- Release：VS2022 `Release x64` 增量构建与全量 Rebuild 均 **0 warning、0 error、exit 0**（VST3 / Standalone / VST3ManifestHelper / SharedCode 全目标）。
+- 版本号 0.4.2 → 0.4.3：`Napkid Sub EQ.jucer` 的 `version` 字段与 `AGENTS.md` 头部的「当前版本」行一并同步，并补写本条目。
+
 ## [0.4.2] - 2026-10-11
 
 > 第 2 轮对抗性审查（`docs/review/findings-round2.md`）闭环修复轮：运行时频谱装配（显示管线 / 抽取级联 / 层环形缓冲）抽为共享原语（离线原型与交付代码零漂移）、窗规格 / 密度轴 / 显示范围 / 抽取级数上界收为单一事实来源、注释与文档语言规范统一；三个闭环复核轮（记录见 `docs/review/findings-round3.md`）发现的残留项（恒真 static_assert、显示地板闸门、计数与版本落账）一并处理。
