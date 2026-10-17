@@ -2,6 +2,27 @@
 
 Napkid Sub EQ 的所有重要变更都将记录在此文件中。
 
+## [0.4.4] - 2026-10-18
+
+> 修复 F1：Minimum Phase FIR 对低频高通目标在通带内产生假陷波（最深 −31 dB）。最小相位倒谱法在设计网格的深零点处把 `epsilon` 钳位（−240 dB 尖峰）当成宽带特征做时域混叠，改为按需 8× 过采样设计网格后截断回 `firLength`；良性目标仍走原 1× 精确路径。回归 207 → 219 项，Release x64 零警告。
+
+### 修复
+
+- **F1（`Source/SubEQ_FIRDesign.h` `designMinimumPhaseFIR`）：低频高通目标的带内假陷波**。
+  - 根因：该函数在 N 点设计网格上采样 `log(|H(w)| + 1e-12)`。高通目标在 DC（低通目标在 Nyquist）的传输零点使采样幅度精确为 0，被 `epsilon = 1e-12` 钳位成 −240 dB 的孤立尖峰；倒谱法随后把这一带宽无限窄的尖峰当作宽带特征，其 N 点时域混叠落回通带，形成假陷波（v0.4.3 实测 HP30 Q0.9 N=4096 @48 kHz：@41.59 Hz 目标 +0.59 dB / FIR −19.48 dB；HP80 @100 Hz −19.92 dB；全带最深 −31 dB）。
+  - 修复：先按原 N 点网格采样并记录网格上的最小幅度；若最小幅度 < `kMinPhaseDeepNullThreshold`（1e-6 = −120 dB，即存在深零点）则把设计网格改为 `firLength × kMinPhaseDesignOversampling`（8×）重新采样同一 log 幅度，倒谱因果化 / DFT / exp / IDFT 全部在 8× 网格上完成后截断取前 `firLength` 个实抽头；否则维持原 N 点路径（平滑目标保持网格精确性，现有 1e-5 断言不变）。
+  - 保持不变：`epsilon = 1e-12` 与 NaN/Inf 传播语义（NaN 目标的 `if (mag < minMag)` 比较恒为假，不会命中过采样分支，仍回退冲激）、`latencyOut = 0`、无 JUCE 依赖、单缓冲内存（原 `cepstrum` 副本取消，同一条 `spectrum` 缓冲就地完成六步，8× 时仅扩容一次）。
+  - 实测（48 kHz，Q 0.9 高通目标，N=4096，通带 [fc, 500] Hz 上 1000 点直接 DTFT）：通带最深误差 HP30 **−27.9 → −0.45 dB**（旧实现最深点 ≈123 Hz）、HP80 **−20.0 → −0.05 dB**（≈99.7 Hz）、HP120 **−15.7 → −0.02 dB**（≈123 Hz）；N=16384 / 65536 约 0.00 dB；低通目标（Nyquist 零点，同样走 8× 路径）0.00 dB；Bell 路径不变（仍 1×）。
+  - 代价（后台设计线程，诚实记录）：8× 网格使 65536 点设计由约 4 ms 升至约 60 ms（48 kHz 本机实测 56~65 ms，4096 点约 2 ms），单缓冲峰值内存约 8 MB（524288 × complex\<double\>）。设计在后台 `juce::Thread` 上运行，音频线程零分配 / 无锁路径不变。
+
+### 测试与工程
+
+- 回归：`Tests/subeq_fft_test.cpp` 新增 Test 11b（编号沿用 Test 5b 的子编号风格）——HP30 / HP80 / HP120 Q 0.9 目标 N=4096，用直接 DTFT 在 [fc, 500] Hz 的 200 个对数点上核对通带：每个目标断言 `latency == 0`、系数有限、通带 max |dB 误差| < 0.6 dB、通带最深误差 > −1.0 dB（证明无深陷波）。Test 11 原有的平滑目标 1e-5 断言与 NaN 回退断言未改动且仍通过。
+- 回归：`cl /nologo /EHsc /std:c++17 /O2 /utf-8` 重新编译，`Tests/subeq_fft_test.exe` 实跑 **219 项全部 PASS**（原 207 + 新增 12）、`ALL TESTS PASSED`、exit 0。
+- Release：VS2022 `Release x64` 构建 **0 warning、0 error、exit 0**。
+- 版本号 0.4.3 → 0.4.4：`Napkid Sub EQ.jucer` 的 `version` 字段与 `AGENTS.md` 头部的「当前版本」行一并同步，并补写本条目。
+- 生成版本元数据同步：Projucer CLI 无头重存 `Napkid Sub EQ.jucer`，`JuceLibraryCode/JuceHeader.h`（`versionString` 0.4.3 → 0.4.4、`versionNumber` 0x403 → 0x404）与 `JuceLibraryCode/JucePluginDefines.h`（`JucePlugin_Version` / `JucePlugin_VersionCode` / `JucePlugin_VersionString` / ARA archive ID 0.4.3 → 0.4.4）落账；Release x64 重建后 VST3 `moduleinfo.json` 的 `Version` 报 0.4.4。
+
 ## [0.4.3] - 2026-10-18
 
 > 相位可视化与文档收口轮：FIR 模式的相位曲线由占位隐藏改为真实渲染（扣除 FIR 群延迟后的剩余相位），新增英文 README 并回填第 5 轮审查台账、做仓库卫生清理；同时修正 README 中长期存在的两处 FIR 分辨率 / 延迟数值错误（历史 CHANGELOG 条目保持原样，不回改）。

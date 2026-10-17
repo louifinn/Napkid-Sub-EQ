@@ -1,6 +1,6 @@
 # Napkid Sub EQ
 
-面向超低频（0.5 Hz ~ 500 Hz）的 8 节点参数均衡器 VST3 音频插件（C++ / JUCE 7.x / VS2022，仅 Windows）。GPL v3。当前版本 0.4.3。
+面向超低频（0.5 Hz ~ 500 Hz）的 8 节点参数均衡器 VST3 音频插件（C++ / JUCE 7.x / VS2022，仅 Windows）。GPL v3。当前版本 0.4.4。
 
 ## Project
 
@@ -21,7 +21,7 @@
 - VST3：`Builds/VisualStudio2022/x64/Release/VST3/`
 - Standalone：`Builds/VisualStudio2022/x64/Release/Standalone Plugin/`
 
-无自动化测试框架；回归测试为独立可执行 `Tests/subeq_fft_test.cpp`（无 JUCE 依赖，207 项：FFT/twiddle 多槽缓存/biquad 系数·状态·响应·设计/overlap-add 卷积原语/FIR 设计/FilterType 映射/频段中心频率/窗函数族（均值/ENBW/旁瓣）/频谱 choice 映射/VQT 层结构·帧长封顶·抽取阶梯/离线 VQT 原型引擎（校准/泄漏/直流/双音/性能基准）/显示平滑数学（功率域核/半径表/弹道系数）与端到端（峰展宽/噪声驯服/关断下落速率）/坐标映射/节点交互规则/级联淡化计划/弹簧积分器）：
+无自动化测试框架；回归测试为独立可执行 `Tests/subeq_fft_test.cpp`（无 JUCE 依赖，219 项：FFT/twiddle 多槽缓存/biquad 系数·状态·响应·设计/overlap-add 卷积原语/FIR 设计/FilterType 映射/频段中心频率/窗函数族（均值/ENBW/旁瓣）/频谱 choice 映射/VQT 层结构·帧长封顶·抽取阶梯/离线 VQT 原型引擎（校准/泄漏/直流/双音/性能基准）/显示平滑数学（功率域核/半径表/弹道系数）与端到端（峰展宽/噪声驯服/关断下落速率）/坐标映射/节点交互规则/级联淡化计划/弹簧积分器）：
 `cl /EHsc /std:c++17 /O2 /utf-8 Tests/subeq_fft_test.cpp /Fo:Tests\subeq_fft_test.obj /Fe:Tests\subeq_fft_test.exe && Tests\subeq_fft_test.exe`（需 VS 开发环境）。变更验证 = 编译 + 测试 + 人工。
 
 ## Architecture
