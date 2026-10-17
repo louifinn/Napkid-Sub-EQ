@@ -137,6 +137,19 @@ void FrequencyResponse::timerCallback()
     if (sr > 0.0 && std::abs (sr - responseSampleRate) > 0.5)
         parametersChanged = true;
 
+    // FIR 模式的设计由后台线程异步发布：版本号变化即说明新系数已就绪（新建
+    // 计、参数重设计或切入 FIR 后的首份设计），置脏以重建相位曲线——否则
+    // 相位会一直停留在“设计未就绪”的空曲线上。
+    if (processor.getCurrentMode() != SubEQ::EQMode::ZeroLatency)
+    {
+        const int firDesignVersion = processor.getFirDesignVersion();
+        if (firDesignVersion != lastFirDesignVersion)
+        {
+            lastFirDesignVersion = firDesignVersion;
+            parametersChanged = true;
+        }
+    }
+
     repaint();
 }
 
@@ -162,10 +175,10 @@ void FrequencyResponse::paint(juce::Graphics& g)
 
 bool FrequencyResponse::shouldShowPhaseCurve() const
 {
-    // Hide phase curve in FIR modes (Linear Phase and Minimum Phase)
-    // since they show IIR phase which is incorrect for FIR processing.
-    // TODO: compute and display actual FIR phase response.
-    return processor.getCurrentMode() == SubEQ::EQMode::ZeroLatency;
+    // 三种模式都显示相位曲线：Zero Latency 画 IIR 引擎的相位，FIR 模式
+    // （Linear / Minimum Phase）改画已发布 FIR 设计的去群延迟剩余相位
+    // （见 updateResponsePaths）。
+    return true;
 }
 
 void FrequencyResponse::resized()
@@ -283,7 +296,7 @@ void FrequencyResponse::drawGrid(juce::Graphics& g)
                    40, 14, juce::Justification::left, false);
     }
 
-    // Right-side phase angle labels (Zero Latency mode only)
+    // 右侧相位角度标签（三种模式都显示相位曲线：FIR 模式为剩余相位）
     if (shouldShowPhaseCurve())
     {
         g.setColour(DesignColours::morandiBlue().withAlpha(0.7f));
@@ -406,6 +419,12 @@ void FrequencyResponse::updateResponsePaths()
 
     const auto& eqEngine = responseEngine;
 
+    // FIR 模式（Linear / Minimum Phase）的相位取自已发布 FIR 设计的实际复数
+    // 响应（去群延迟后的剩余相位）；Zero Latency 模式沿用 IIR 引擎的相位。
+    const bool firMode = processor.getCurrentMode() != SubEQ::EQMode::ZeroLatency;
+    // FIR 设计尚未发布时置 false：本帧不建相位路径（只画增益曲线）。
+    bool phaseAvailable = true;
+
     bool firstGainPoint = true;
     bool firstPhasePoint = true;
     for (int px = static_cast<int>(area.getX()); px <= static_cast<int>(area.getRight()); px += 2)
@@ -418,8 +437,35 @@ void FrequencyResponse::updateResponsePaths()
             gainDb = (gainDb > 0.0) ? 60.0 : -120.0;
         gainDb = juce::jlimit(-120.0, 60.0, gainDb);
         float gainY = gainToY(static_cast<float>(gainDb));
-        double phaseDeg = eqEngine.getResponsePhaseDegrees(w);
-        float phaseY = phaseToY(static_cast<float>(phaseDeg));
+        float phaseY = 0.0f;
+
+        if (phaseAvailable)
+        {
+            double phaseDeg = 0.0;
+            bool havePhase = false;
+
+            if (firMode)
+            {
+                // FIR 查询失败 = 设计尚未发布（例如刚切入 FIR 模式）：清空并
+                // 停止构建相位路径，等设计发布后由 timerCallback 置脏重建。
+                havePhase = processor.getFirPhaseResponseDegrees(w, phaseDeg);
+            }
+            else
+            {
+                phaseDeg = eqEngine.getResponsePhaseDegrees(w);
+                havePhase = true;
+            }
+
+            if (!havePhase)
+            {
+                phasePath.clear();
+                phaseAvailable = false;
+            }
+            else
+            {
+                phaseY = phaseToY(static_cast<float>(phaseDeg));
+            }
+        }
 
         if (firstGainPoint)
         {
@@ -431,14 +477,17 @@ void FrequencyResponse::updateResponsePaths()
             responsePath.lineTo(static_cast<float>(px), gainY);
         }
 
-        if (firstPhasePoint)
+        if (phaseAvailable)
         {
-            phasePath.startNewSubPath(static_cast<float>(px), phaseY);
-            firstPhasePoint = false;
-        }
-        else
-        {
-            phasePath.lineTo(static_cast<float>(px), phaseY);
+            if (firstPhasePoint)
+            {
+                phasePath.startNewSubPath(static_cast<float>(px), phaseY);
+                firstPhasePoint = false;
+            }
+            else
+            {
+                phasePath.lineTo(static_cast<float>(px), phaseY);
+            }
         }
     }
 

@@ -74,6 +74,20 @@ public:
     // Total pipeline tail (FIR length + block latency), for tail-length reporting
     int getTailLengthSamples() const;
 
+    // GUI 线程查询：已发布 FIR 设计的相位响应（度）。返回的是去掉整体群延迟
+    // 后的“剩余相位/excess phase”——Linear Phase 因 groupDelay = (N-1)/2 而
+    // 显示平坦 0°（无相位失真），Minimum Phase（groupDelay = 0）显示真实的最
+    // 小相位曲线。内部只在 stateMutex 下拷贝 shared_ptr，出锁后按不可变快照
+    // 计算，不会阻塞音频线程。返回 false 表示当前没有可用设计（未进入 FIR
+    // 模式或首份设计尚未发布）。
+    // 注意：仅供 GUI（消息）线程调用，不要从音频线程调用——音频线程有自己的
+    // getPublishedStateForAudioThread() 快取，无需每次加锁。
+    bool getFirPhaseResponseDegrees(double normalizedW, double& phaseDeg) const;
+
+    // 已发布设计的版本号（每次发布/丢弃都自增）：GUI 据此在后台设计异步发布
+    // 之后刷新相位曲线，无需依赖参数变更通知。
+    int getDesignVersion() const noexcept { return stateVersion.load(std::memory_order_acquire); }
+
     static juce::StringArray getModeChoices();
     static juce::String getModeName(EQMode mode);
     static juce::String getLatencyText(int latencySamples, double sampleRate);

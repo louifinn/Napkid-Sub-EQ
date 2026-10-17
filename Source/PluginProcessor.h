@@ -82,6 +82,14 @@ public:
     SubEQ::EQMode getCurrentMode() const { return static_cast<SubEQ::EQMode> (currentMode.load()); }
     int getCurrentLatencySamples() const { return reportedLatency.load(); }
 
+    // GUI 线程查询：已发布 FIR 设计的去群延迟相位响应（度，剩余相位/excess
+    // phase）。转发到 fftProcessor，返回 false 表示当前没有可用设计（未进入
+    // FIR 模式，或首份设计尚未异步发布）。仅供消息线程调用。
+    bool getFirPhaseResponseDegrees(double normalizedW, double& phaseDeg) const;
+
+    // 已发布 FIR 设计的版本号：GUI 据此在后台设计异步发布后自动重绘相位曲线。
+    int getFirDesignVersion() const;
+
     // 频谱分析门控（GUI 线程计数、音频线程读取）：至少一个编辑器存在时才
     // 运行分析，避免无 GUI 时持续消耗音频线程 CPU；引用计数保证多编辑器
     // 并存时不会因其中一个关闭而误停分析。

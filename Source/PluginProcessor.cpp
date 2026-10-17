@@ -123,6 +123,16 @@ double SubEQAudioProcessor::getTailLengthSeconds() const
     return static_cast<double> (fftProcessor.getTailLengthSamples()) / sr;
 }
 
+bool SubEQAudioProcessor::getFirPhaseResponseDegrees (double normalizedW, double& phaseDeg) const
+{
+    return fftProcessor.getFirPhaseResponseDegrees (normalizedW, phaseDeg);
+}
+
+int SubEQAudioProcessor::getFirDesignVersion() const
+{
+    return fftProcessor.getDesignVersion();
+}
+
 int SubEQAudioProcessor::getNumPrograms()
 {
     return 1;

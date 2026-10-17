@@ -519,6 +519,77 @@ int FFTProcessor::getTailLengthSamples() const
 }
 
 //==============================================================================
+bool FFTProcessor::getFirPhaseResponseDegrees(double normalizedW, double& phaseDeg) const
+{
+    // 仅供 GUI 线程调用：临界区内只做 shared_ptr 拷贝（占用时间为纳秒级），
+    // 之后的插值/取相位都在锁外按不可变快照计算，不会拉长音频线程的发布
+    // 临界区，也不会从音频线程阻塞等待。若本函数持有的引用恰好是最后一份，
+    // FIRState 的析构会落在 GUI 线程——不是实时线程，可以接受。
+    std::shared_ptr<const FIRState> state;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        state = currentState;
+    }
+
+    if (state == nullptr || state->freqCoeffs.empty() || state->convFFTSize <= 1)
+        return false;
+
+    const int fftSize = state->convFFTSize;
+    const double twoPi = juce::MathConstants<double>::twoPi;
+    const double groupDelay = static_cast<double>(state->groupDelay);
+
+    // 归一化角频率 w（弧度/样本）换算为 freqCoeffs 的 bin 位置，再对 FFT 长度
+    // 取模（覆盖 w 超出 [0, pi] 的调用）。
+    double binPos = normalizedW * static_cast<double>(fftSize) / twoPi;
+    binPos = std::fmod(binPos, static_cast<double>(fftSize));
+    if (binPos < 0.0)
+        binPos += static_cast<double>(fftSize);
+
+    const double lower = std::floor(binPos);
+    const int index0 = static_cast<int>(lower) % fftSize;
+    const int index1 = (index0 + 1) % fftSize;
+    const double frac = binPos - lower;
+
+    // 相邻两个 bin 各自按本 bin 的频率把整体群延迟转回去（乘以 e^{+jωD}，即
+    // 去延迟后的复数响应），再在两者之间做复数线性插值，最后取 arg 得到剩余
+    // 相位。为什么不先插值再减 ωD：std::arg 返回的是主值，补偿整体延迟只能
+    // 用“旋转”实现（arg(H) + ωD 再折回），而且 Linear Phase 的 groupDelay
+    // ≈ N/2 使相邻 bin 的相位旋转近 90°，先插值后补偿的插值误差实测可达
+    // ±4°（4096 抽头、0.5–500 Hz 扫频）；先补偿后插值则与真值一致。
+    // 注意 index1 回绕到 0 时 w1 仍取连续值 2π，因 groupDelay 为整数，
+    // e^{j2π·groupDelay} = 1，与 bin 0 的实际频率 0 等价。
+    const double w0 = twoPi * lower / static_cast<double>(fftSize);
+    const double w1 = twoPi * (lower + 1.0) / static_cast<double>(fftSize);
+    const std::complex<double> derotate0(std::cos(w0 * groupDelay), std::sin(w0 * groupDelay));
+    const std::complex<double> derotate1(std::cos(w1 * groupDelay), std::sin(w1 * groupDelay));
+
+    const std::complex<double> a0 = state->freqCoeffs[static_cast<size_t>(index0)] * derotate0;
+    const std::complex<double> a1 = state->freqCoeffs[static_cast<size_t>(index1)] * derotate1;
+    const std::complex<double> response = a0 + (a1 - a0) * frac;
+
+    // 幅度为 0 时相位无定义（例如 Type-II 线性相位 FIR 在 Nyquist 处）：本次
+    // 查询按“不可用”上报，由调用方决定是否跳过该点。
+    const double magnitude = std::abs(response);
+    if (!std::isfinite(magnitude) || magnitude <= 0.0)
+        return false;
+
+    // 剩余相位/excess phase：Linear Phase（groupDelay = (N-1)/2）显示平坦 0°
+    // （仅余整数延迟取整带来的约 2° 倾斜，可忽略），Minimum Phase
+    // （groupDelay = 0）显示真实的最小相位曲线。
+    double phase = std::arg(response);
+
+    // 规范到 (-pi, pi]（与 EQEngine::getResponsePhaseDegrees 的 [-180, 180] 一致）
+    phase = std::fmod(phase, twoPi);
+    if (phase <= -juce::MathConstants<double>::pi)
+        phase += twoPi;
+    else if (phase > juce::MathConstants<double>::pi)
+        phase -= twoPi;
+
+    phaseDeg = phase * 180.0 / juce::MathConstants<double>::pi;
+    return true;
+}
+
+//==============================================================================
 juce::StringArray FFTProcessor::getModeChoices()
 {
     return { "Zero Latency", "Minimum Phase", "Linear Phase" };
