@@ -636,6 +636,66 @@ int main()
         check(isImpulse, "minimum phase FIR falls back to impulse for invalid magnitude");
     }
 
+    // ---- Test 11b: minimum phase FIR — 低频高通目标的带内假陷波回归（F1） ----
+    // 高通目标在 DC 的传输零点被 epsilon=1e-12 钳位成 -240 dB 孤立尖峰，N 点
+    // 倒谱把它当宽带特征做时域混叠，在通带内造出假陷波（v0.4.3 实测 HP30 Q0.9
+    // N=4096 @41.59 Hz：目标 +0.59 dB / FIR -19.48 dB，全带最深 -31 dB）。修复
+    // 为按需 8× 过采样设计网格后，此处用直接 DTFT 核对通带幅频误差。
+    {
+        const double fs = 48000.0;
+        struct HpTarget { const char* name; double cutoffHz; };
+        const HpTarget targets[] = { { "HP30", 30.0 }, { "HP80", 80.0 }, { "HP120", 120.0 } };
+
+        for (const HpTarget& t : targets)
+        {
+            BiquadCoefficients c[2];
+            computeBiquadCoefficients(t.cutoffHz, 0.0, 0.9, FilterType::HighPass, fs, c);
+            auto target = [&c] (double w) { return std::abs(biquadResponse(c[0], w)); };
+
+            int mpLatency = -1;
+            const std::vector<double> h = designMinimumPhaseFIR(target, 4096, mpLatency);
+
+            check(mpLatency == 0,
+                  std::string("min phase FIR passband: ") + t.name + " latency == 0");
+
+            bool mpFinite = true;
+            for (double v : h)
+                if (std::isnan(v) || std::isinf(v))
+                    mpFinite = false;
+            check(mpFinite,
+                  std::string("min phase FIR passband: ") + t.name + " coefficients finite");
+
+            // 通带 [fc, 500] Hz 上 200 个对数点逐点算 dB 误差（直接 DTFT，不做插值）
+            double maxDbErr = 0.0, minDbErr = 0.0;
+            for (int i = 0; i < 200; ++i)
+            {
+                const double f = t.cutoffHz * std::pow(500.0 / t.cutoffHz, i / 199.0);
+                const double w = 2.0 * kPi * f / fs;
+                std::complex<double> acc(0.0, 0.0);
+                for (int n = 0; n < 4096; ++n)
+                {
+                    const double ang = -w * n;
+                    acc += h[n] * std::complex<double>(std::cos(ang), std::sin(ang));
+                }
+                const double firdB = 20.0 * std::log10(std::abs(acc));
+                const double targetdB = 20.0 * std::log10(std::abs(biquadResponse(c[0], w)));
+                const double err = firdB - targetdB;
+                maxDbErr = std::max(maxDbErr, std::abs(err));
+                minDbErr = std::min(minDbErr, err);
+            }
+
+            std::printf("      min phase FIR passband %s: max |dB err| %.3f dB, deepest %.3f dB\n",
+                        t.name, maxDbErr, minDbErr);
+
+            check(maxDbErr < 0.6,
+                  std::string("min phase FIR passband: ") + t.name + " max |dB err| < 0.6 dB (err="
+                      + std::to_string(maxDbErr) + ")");
+            check(minDbErr > -1.0,
+                  std::string("min phase FIR passband: ") + t.name + " no in-band notch (deepest="
+                      + std::to_string(minDbErr) + " dB)");
+        }
+    }
+
     // ---- Test 12: convolutionFftSize / nextPowerOfTwo extra cases ----
     {
         check(nextPowerOfTwo(1) == 1, "nextPow2(1) == 1");

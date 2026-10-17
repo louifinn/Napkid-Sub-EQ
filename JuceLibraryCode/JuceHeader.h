@@ -46,7 +46,7 @@ namespace ProjectInfo
 {
     const char* const  projectName    = "Napkid Sub EQ";
     const char* const  companyName    = "Napkid Audio";
-    const char* const  versionString  = "0.4.3";
-    const int          versionNumber  = 0x403;
+    const char* const  versionString  = "0.4.4";
+    const int          versionNumber  = 0x404;
 }
 #endif
