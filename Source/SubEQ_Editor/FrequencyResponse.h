@@ -63,6 +63,10 @@ private:
     SubEQ::EQEngine responseEngine;
     double responseSampleRate = 0.0;
 
+    // 上一次看到的 FIR 设计版本号（只由 GUI 线程读写）：FIR 模式下版本变化
+    // 说明后台设计已异步发布，需要重建相位曲线。-1 表示从未同步过。
+    int lastFirDesignVersion = -1;
+
     // Node selection state
     int selectedNode = -1;
     bool nodePressed = false;   // mouse button down on a node (minimal ring)
