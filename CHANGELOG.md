@@ -25,6 +25,7 @@ Napkid Sub EQ 的所有重要变更都将记录在此文件中。
 - 回归：`Tests/subeq_fft_test.cpp` 以 `cl /nologo /EHsc /std:c++17 /O2 /utf-8` 重新编译，`Tests/subeq_fft_test.exe` 实跑 **207 项全部 PASS**、`ALL TESTS PASSED`、exit 0。
 - Release：VS2022 `Release x64` 增量构建与全量 Rebuild 均 **0 warning、0 error、exit 0**（VST3 / Standalone / VST3ManifestHelper / SharedCode 全目标）。
 - 版本号 0.4.2 → 0.4.3：`Napkid Sub EQ.jucer` 的 `version` 字段与 `AGENTS.md` 头部的「当前版本」行一并同步，并补写本条目。
+- 生成版本元数据同步：Projucer CLI 无头重存 `Napkid Sub EQ.jucer`，`JuceLibraryCode/JuceHeader.h`（`versionString` 0.3.1 → 0.4.3、`versionNumber` 0x301 → 0x403）与 `JuceLibraryCode/JucePluginDefines.h`（`JucePlugin_Version` 0.3.4 → 0.4.3、`JucePlugin_VersionCode` 0x304 → 0x403、`JucePlugin_VersionString` 与 ARA archive ID 0.3.4 → 0.4.3）落账；修复「`.jucer` 已是 0.4.3 但生成物仍报 0.3.x」的漂移，Release x64 重建后 VST3 `moduleinfo.json` 的 `Version` 由 0.3.1 → 0.4.3。
 
 ## [0.4.2] - 2026-10-11
 
