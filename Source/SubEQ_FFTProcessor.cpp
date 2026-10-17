@@ -249,9 +249,39 @@ void FFTProcessor::run()
 
         auto magnitude = [&](double w) { return designEngine.getMagnitudeLinear(w); };
         if (mode == EQMode::LinearPhase)
+        {
             newState->coeffs = designLinearPhaseFIR(magnitude, firLength, newState->groupDelay);
+        }
         else
-            newState->coeffs = designMinimumPhaseFIR(magnitude, firLength, newState->groupDelay);
+        {
+            // 解析统计设计目标的 DC / Nyquist 传输零点阶数，供最小相位设计
+            // 剥离奇点：高通在 DC、低通在 Nyquist 各 2 阶，带通各 1 阶，其余
+            // 类型无传输零点。旁路时 magnitude 回调恒为 1.0（无零点），
+            // 因此零点计数也归零——否则解析路径会凭空剥离不存在的因子。
+            int dcZeroOrder = 0;
+            int nyquistZeroOrder = 0;
+            if (!designEngine.isBypassed())
+            {
+                for (int i = 0; i < EQEngine::MaxNodes; ++i)
+                {
+                    const auto& node = designEngine.getNode(i);
+                    if (!node.isEnabled())
+                        continue;
+
+                    switch (node.getType())
+                    {
+                        case FilterType::HighPass: dcZeroOrder += 2;      break;
+                        case FilterType::LowPass:  nyquistZeroOrder += 2; break;
+                        case FilterType::BandPass: ++dcZeroOrder;
+                                                   ++nyquistZeroOrder;    break;
+                        default: break;
+                    }
+                }
+            }
+
+            newState->coeffs = designMinimumPhaseFIR(magnitude, firLength, newState->groupDelay,
+                                                     dcZeroOrder, nyquistZeroOrder);
+        }
 
         // Pre-compute the frequency-domain filter for overlap-add convolution
         newState->convFFTSize = convolutionFftSize(firLength, ConvBlockLen);

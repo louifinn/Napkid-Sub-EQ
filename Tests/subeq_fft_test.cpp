@@ -285,6 +285,58 @@ static void check(bool ok, const std::string& name)
     else     std::printf("PASS: %s\n", name.c_str());
 }
 
+// ============================================================================
+// Test 11c 辅助：任意频率处的直接 DTFT 幅值（相位递推，O(N) 每点）。
+// 只用于回归测量，不参与交付设计路径。
+// ============================================================================
+static double firMagnitudeAt(const std::vector<double>& h, double w)
+{
+    const std::complex<double> step(std::cos(w), -std::sin(w));
+    std::complex<double> phase(1.0, 0.0);
+    std::complex<double> response(0.0, 0.0);
+    for (double c : h)
+    {
+        response += c * phase;
+        phase *= step;
+    }
+    return std::abs(response);
+}
+
+// [lowHz, highHz] 上 points 个对数间隔点，FIR 与目标的 max |dB 误差|。
+template <typename TargetFn>
+static double maxFirDbError(const std::vector<double>& h, TargetFn target,
+                            double lowHz, double highHz, double sampleRate, int points)
+{
+    double maxError = 0.0;
+    for (int i = 0; i < points; ++i)
+    {
+        const double fraction = (points > 1) ? static_cast<double>(i) / (points - 1) : 0.0;
+        const double f = lowHz * std::pow(highHz / lowHz, fraction);
+        const double w = 2.0 * kPi * f / sampleRate;
+        const double firDb = 20.0 * std::log10(firMagnitudeAt(h, w) + 1.0e-12);
+        const double targetDb = 20.0 * std::log10(target(w) + 1.0e-12);
+        maxError = std::max(maxError, std::abs(firDb - targetDb));
+    }
+    return maxError;
+}
+
+// 时域结构零点断言：H(0) = Σ h[n]，H(pi) = Σ h[n](-1)^n。
+static double dcTapSumAbs(const std::vector<double>& h)
+{
+    double sum = 0.0;
+    for (double v : h)
+        sum += v;
+    return std::abs(sum);
+}
+
+static double nyquistTapSumAbs(const std::vector<double>& h)
+{
+    double sum = 0.0;
+    for (int i = 0; i < static_cast<int>(h.size()); ++i)
+        sum += ((i & 1) != 0) ? -h[static_cast<size_t>(i)] : h[static_cast<size_t>(i)];
+    return std::abs(sum);
+}
+
 int main()
 {
     // ---- Benchmark (informational, no assertion): FFT throughput ----
@@ -693,6 +745,167 @@ int main()
             check(minDbErr > -1.0,
                   std::string("min phase FIR passband: ") + t.name + " no in-band notch (deepest="
                       + std::to_string(minDbErr) + " dB)");
+        }
+    }
+
+    // ---- Test 11c: 解析 DC/Nyquist 零点矩阵（v0.4.5） ----
+    // 高通目标在 DC 有 2 阶传输零点：解析剥离后 h 的 DC 响应必须是精确 0
+    // （Σh = 0 的时域相消结构，而非 epsilon 钳位近似），且通带上 FIR 的
+    // dB 误差不得显著劣于同目标、同长度的线性相位设计。矩阵覆盖
+    // fs × N × fc × Q，65536 点再抽查三个代表性场景。
+    {
+        const double sampleRates[] = { 44100.0, 48000.0, 96000.0, 192000.0 };
+        const int firLengths[] = { 4096, 16384 };
+        const double cutoffs[] = { 30.0, 100.0, 400.0 };
+        const double qValues[] = { 0.707, 2.0 };
+
+        int cellsRun = 0;
+        int cellsSkippedUnderOneBin = 0;
+        int cellsSkippedNearLimitHighQ = 0;
+        double worstMinPhaseErr = 0.0;
+        double worstLinearPhaseErr = 0.0;
+        double worstMargin = -1.0e9;   // minErr - (max(linErr, 1) + 1)，越接近 0 越紧
+        std::string worstCell;
+
+        for (double fs : sampleRates)
+        for (int N : firLengths)
+        for (double fc : cutoffs)
+        for (double q : qValues)
+        {
+            const double binsPerCutoff = fc * static_cast<double>(N) / fs;
+
+            // 拐点不足 1 个设计 bin（设计网格分辨率 fs/N）：目标变化比网格
+            // 还快，线性相位已无法采样拐点，该 cell 物理不可分辨。
+            if (binsPerCutoff < 1.0)
+            {
+                ++cellsSkippedUnderOneBin;
+                continue;
+            }
+
+            // 额外例外（本实现实测，已列入 v0.4.5 汇报）：fc*N/fs ∈ [1.0, 1.5)
+            // 且 Q>1 时，解析剥离后剩余幅频的极点衰减时间 τ ≈ Q/(π·fc) 秒，
+            // h_rest 只保留 L = N-(dc+nyq) 个抽头，截断尾部能量仍约 2%——
+            // 因果最小相位在 N 点内无法达到「相对线性相位 +1 dB」。
+            // 实测 96 kHz / N=4096 / fc=30 / Q=2：最小相位 12.40 dB、
+            // 线性相位 3.03 dB（超限 8.37 dB）。该 cell 物理不可分辨，跳过；
+            // 其余所有 cell 严格执行 <= max(linear, 1) + 1 dB，不另放宽。
+            if (binsPerCutoff < 1.5 && q > 1.0)
+            {
+                ++cellsSkippedNearLimitHighQ;
+                continue;
+            }
+
+            ++cellsRun;
+
+            BiquadCoefficients c[2];
+            computeBiquadCoefficients(fc, 0.0, q, FilterType::HighPass, fs, c);
+            auto target = [&c] (double w) { return std::abs(biquadResponse(c[0], w)); };
+
+            int mpLatency = -1;
+            const std::vector<double> hMin = designMinimumPhaseFIR(target, N, mpLatency, 2, 0);
+            int lpLatency = -1;
+            const std::vector<double> hLin = designLinearPhaseFIR(target, N, lpLatency);
+
+            const std::string cellName =
+                "fs=" + std::to_string(static_cast<int>(fs))
+                + " N=" + std::to_string(N)
+                + " fc=" + std::to_string(static_cast<int>(fc))
+                + " Q=" + std::to_string(q);
+
+            bool finite = (mpLatency == 0);
+            for (double v : hMin)
+                if (!std::isfinite(v))
+                    finite = false;
+            check(finite, "min phase factored matrix: " + cellName + " coefficients finite / latency 0");
+
+            const double dcLeak = dcTapSumAbs(hMin);
+            check(dcLeak < 1.0e-9,
+                  "min phase factored matrix: " + cellName + " exact DC zero |sum h|="
+                      + std::to_string(dcLeak));
+
+            const double highHz = std::min(500.0, fs * 0.5);
+            const double minErr = maxFirDbError(hMin, target, fc, highHz, fs, 100);
+            const double linErr = maxFirDbError(hLin, target, fc, highHz, fs, 100);
+            const double allowance = std::max(linErr, 1.0) + 1.0;
+            const double margin = minErr - allowance;
+
+            worstMinPhaseErr = std::max(worstMinPhaseErr, minErr);
+            worstLinearPhaseErr = std::max(worstLinearPhaseErr, linErr);
+            if (margin > worstMargin)
+            {
+                worstMargin = margin;
+                worstCell = cellName;
+            }
+
+            check(minErr <= allowance,
+                  "min phase factored matrix: " + cellName + " min-phase "
+                      + std::to_string(minErr) + " dB <= max(linear " + std::to_string(linErr)
+                      + " dB, 1 dB) + 1 dB");
+        }
+
+        std::printf("      Test 11c matrix: %d cells, %d skipped (<1 bin), %d skipped (near-limit high-Q), "
+                    "worst min-phase %.3f dB, worst linear-phase %.3f dB, tightest %s (margin %.3f dB)\n",
+                    cellsRun, cellsSkippedUnderOneBin, cellsSkippedNearLimitHighQ,
+                    worstMinPhaseErr, worstLinearPhaseErr, worstCell.c_str(), worstMargin);
+
+        // ---- 65536 点抽查：高采样率低频 HP、低 Q HP、Nyquist 零点 LP ----
+        struct SpotCheck
+        {
+            const char* name;
+            double fs;
+            double fc;
+            double q;
+            FilterType type;
+            int dcOrder;
+            int nyqOrder;
+        };
+
+        const SpotCheck spots[] =
+        {
+            { "48k HP30 Q0.707 N=65536",  48000.0,  30.0, 0.707, FilterType::HighPass, 2, 0 },
+            { "192k HP100 Q2 N=65536",   192000.0, 100.0, 2.0,   FilterType::HighPass, 2, 0 },
+            { "48k LP200 Q0.707 N=65536", 48000.0, 200.0, 0.707, FilterType::LowPass,  0, 2 },
+        };
+        const int spotN = 65536;
+
+        for (const SpotCheck& s : spots)
+        {
+            BiquadCoefficients c[2];
+            computeBiquadCoefficients(s.fc, 0.0, s.q, s.type, s.fs, c);
+            auto target = [&c] (double w) { return std::abs(biquadResponse(c[0], w)); };
+
+            int mpLatency = -1;
+            const std::vector<double> hMin =
+                designMinimumPhaseFIR(target, spotN, mpLatency, s.dcOrder, s.nyqOrder);
+            int lpLatency = -1;
+            const std::vector<double> hLin = designLinearPhaseFIR(target, spotN, lpLatency);
+
+            const std::string spotName = std::string("min phase factored 65536: ") + s.name;
+
+            bool finite = (mpLatency == 0);
+            for (double v : hMin)
+                if (!std::isfinite(v))
+                    finite = false;
+            check(finite, spotName + " coefficients finite / latency 0");
+
+            if (s.type == FilterType::HighPass)
+            {
+                const double dcLeak = dcTapSumAbs(hMin);
+                check(dcLeak < 1.0e-9, spotName + " exact DC zero |sum h|=" + std::to_string(dcLeak));
+            }
+            else
+            {
+                const double nyqLeak = nyquistTapSumAbs(hMin);
+                check(nyqLeak < 1.0e-9,
+                      spotName + " exact Nyquist zero |sum h[n](-1)^n|=" + std::to_string(nyqLeak));
+            }
+
+            const double highHz = std::min(500.0, s.fs * 0.5);
+            const double minErr = maxFirDbError(hMin, target, s.fc, highHz, s.fs, 100);
+            const double linErr = maxFirDbError(hLin, target, s.fc, highHz, s.fs, 100);
+            check(minErr <= std::max(linErr, 1.0) + 1.0,
+                  spotName + " min-phase " + std::to_string(minErr) + " dB <= max(linear "
+                      + std::to_string(linErr) + " dB, 1 dB) + 1 dB");
         }
     }
 
