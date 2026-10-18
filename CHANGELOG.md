@@ -4,30 +4,34 @@ Napkid Sub EQ 的所有重要变更都将记录在此文件中。
 
 ## [0.4.5] - 2026-10-18
 
-> 最小相位 FIR 设计改为按滤波器拓扑**解析剥离** DC/Nyquist 传输零点：先把已知的 `(1-z^-1)^dc (1+z^-1)^nyq` 从目标幅频中除掉，对剩余平滑幅频做最小相位倒谱设计，再与短因子线性卷积，得到 `H(0)=0` / `H(π)=0` 的精确时域结构零点。0.4.4 的 8× 自动路径保留为调用方未标注零点时的回退。回归 219 → 363 项全部通过，Release x64 零警告。
+> 最小相位 FIR 设计改为按滤波器拓扑**解析剥离** DC/Nyquist 传输零点：先把已知的 `(1-z^-1)^dc (1+z^-1)^nyq` 从目标幅频中除掉，对剩余平滑幅频做最小相位倒谱设计，再与短因子线性卷积，得到 `H(0)=0` / `H(π)=0` 的精确时域结构零点。单节点（2 阶零点）解析候选直接生效并带精确零点；多节点（4–6 阶）解析候选因灾难性相消被 `max|h|` sanity gate 丢弃、由 0.4.4 legacy 候选兜底，再由精确零点投影把 `H(0)/H(π)` 修到机器精度。0.4.4 的 8× 自动路径保留为调用方未标注零点时的位级等价回退。回归 219 → 430 项全部通过，Release x64 零警告。
 
 ### 修复
 
 - **最小相位 FIR 的 DC/Nyquist 零点解析剥离**（`Source/SubEQ_FIRDesign.h` `designMinimumPhaseFIR`）：
   - 根因：该函数在 N 点设计网格上采样 `log(|H(w)| + 1e-12)`。高通在 DC（低通在 Nyquist）的传输零点使采样幅度被 `epsilon` 钳位成 −240 dB 的孤立尖峰，倒谱法把它当成宽带特征；0.4.4 的 8× 过采样网格只是把尖峰推得更窄、抑制倒谱时域混叠，零点本身仍是 epsilon 近似，不是精确的结构零点。
-  - 新签名：`designMinimumPhaseFIR(magnitude, firLength, latencyOut, dcZeroOrder = 0, nyquistZeroOrder = 0)`。后两个参数由调用方按滤波器拓扑解析给出（目标在 z=1 / z=−1 的传输零点阶数）；默认 0 表示未知，保持 0.4.4 旧自动路径——`N` 网格最小幅度 < `kMinPhaseDeepNullThreshold`（1e-6）时走 `kMinPhaseLegacyOversampling`（8×）log 幅频设计，否则 1× 精确路径。Test 11 的平滑目标 1e-5 断言与 NaN 回退冲激不变。
+  - 新签名：`designMinimumPhaseFIR(magnitude, firLength, latencyOut, dcZeroOrder = 0, nyquistZeroOrder = 0, sampleRateHz = 0.0)`。后两个零点参数由调用方按滤波器拓扑解析给出（目标在 z=1 / z=−1 的传输零点阶数）；默认 0 表示未知，保持 0.4.4 旧自动路径——`N` 网格最小幅度 < `kMinPhaseDeepNullThreshold`（1e-6）时走 `kMinPhaseLegacyOversampling`（8×）log 幅频设计，否则 1× 精确路径（该路径抽成 `detail::designLegacyMinimumPhase`，回归以 FNV 哈希实测与 0.4.5 的 3 参调用逐位一致）。`sampleRateHz` 只影响候选选优的拟合带，默认 0 时退回全带。Test 11 的平滑目标 1e-5 断言与 NaN 回退冲激不变。
   - 解析剥离：`M = N·os`、`half = M/2`，逐点计算 `logRest[i] = log(mag(w)+1e-12) − dc·log(2 sin(w/2)+1e-300) − nyq·log(2 cos(w/2)+1e-300)`（`w = πi/half`）；端点处用相邻两点线性外推取极限（`logRest[0] = 2·logRest[1] − logRest[2]`，Nyquist 对称），这是取代 epsilon 钳位、消除 −240 dB 尖峰的关键。随后实偶对称 → IDFT 得倒谱 → 因果化（c[0] 与 c[M/2] 取 1、正半轴 ×2、负半轴置 0）→ DFT → exp → IDFT 得 `h_rest`；全程单缓冲就地完成。
   - 因子与长度：`(1-z^-1)^dc (1+z^-1)^nyq` 的二项式系数（长度 `dc+nyq+1`）由逐次一阶卷积生成；取 `h_rest` 前 `L = N−(dc+nyq)` 个抽头后与因子做线性卷积，输出长度恰为 `L + (dc+nyq+1) − 1 = N`，**不截断乘积**。若先把长度 `N+dc+nyq` 的完整乘积截回 N，DC/Nyquist 相消会因丢弃尾部而失效（实测 96 kHz HP30 在 0.5 Hz 漏 28 dB）。
-  - 候选选择：同一目标分别以 os=1 与 os=4 生成候选；对每个候选在 w ∈ [π/65536, 0.999π] 的 192 个对数间隔点直接 DTFT，取 `max |20log10(|H|+1e-12) − 20log10(mag(w)+1e-12)|` 作为拟合误差，返回误差较小者（os=1 利于高 Q / 窄特征，os=4 利于高采样率下欠分辨的拐点）。两个候选都产生非有限系数时回退冲激；解析路径 `latencyOut` 仍为 0。
+  - 候选选择（v0.4.5 复审修复）：带标注零点时改为在 **{解析剥离 os=1, 解析剥离 os=4, legacy 8× 自动路径}** 三个候选间选优。每个候选先做有限性检查与 **`max|h| ≤ kMinPhaseMaxTapMagnitude`（1e3）sanity gate**——多节点零点（dc+nyq ≥ 4）时剩余幅频 R(0) ≈ (1/w_c)^{2k}，截断 `h_rest` 后与二项式因子的双精度卷积会灾难性相消，产生 1e4…1e50 的抽头尖峰与数十 dB 通带误差（2×HP 20+40 Hz 实测峰值 4.7e4、3×HP 峰值 9.9e9、8×HP 峰值 1.7e39）；这些候选被 gate 丢弃后由 legacy 候选兜底（同场景通带误差 0.06–1.7 dB、峰值 ≈1）。
+  - 选优度量（v0.4.5 复审修复）：在 192 个对数间隔点直接 DTFT，但只统计**实际可用带**——目标幅度 ≥ 本次采样最大值的 1/2（−6 dB，排除 +1e-12 的 −240 dB 阻带地板）且频率 ≤ `min(500 Hz, 0.45·fs)`（本插件是 0.5–500 Hz 超低频 EQ；不传 `sampleRateHz` 时退化为全带）。旧的全带度量会被高频截断误差与阻带地板主导，实测会选中通带差 2.3 dB 的 legacy 而非 0.29 dB 的解析候选。
+  - 精确零点投影（v0.4.5 复审修复）：候选选定后把系数投影到传输零点子空间——`δ[n] = p(x[n]) + (−1)^n q(x[n])`（`x[n]=n/(N−1)`，是卷积因子的正交补，等价于最小二乘投影），由「各阶矩为零」的小线性系统解出。单节点（2 阶）做整阶投影（`H(0)=H'(0)=0` 或 Nyquist 对称），解析候选本身已精确、近极限 96 kHz/4096/fc=30/Q=2 的 legacy 候选经投影后同样精确（回归 1e-9 断言始终成立）；多节点只做一阶投影，把 `H(0)/H(π)` 压到 1e-15 量级，更高阶矩保留 legacy 近似（避免 6 阶矩修正在 1.3 bin 近极限 cell 把通带误差从 0.8 dB 推到 6 dB）。没有任何候选通过 gate 时回退 legacy（仍做投影），legacy 也无效则回退冲激；解析路径 `latencyOut` 仍为 0。
   - 保持：无 JUCE 依赖、`double` 输出、后台设计线程零音频线程分配；系数非有限时回退冲激的旧语义不变。
-- **FFTProcessor 传输零点统计**（`Source/SubEQ_FFTProcessor.cpp`）：最小相位设计前遍历设计引擎的已启用节点——HighPass 计 DC +2、LowPass 计 Nyquist +2、BandPass 计 DC +1 / Nyquist +1，其余类型不计；引擎旁路（`magnitude` 回调恒为 1.0）时零点计数强制归零，避免剥离不存在的因子。随后把 `dcZeroOrder` / `nyquistZeroOrder` 传入设计函数；epoch / 发布 / 交叉淡化流程未改动。
+- **FFTProcessor 传输零点统计**（`Source/SubEQ_FFTProcessor.cpp`）：最小相位设计前遍历设计引擎的已启用节点——HighPass 计 DC +2、LowPass 计 Nyquist +2、BandPass 计 DC +1 / Nyquist +1，其余类型不计；引擎旁路（`magnitude` 回调恒为 1.0）时零点计数强制归零，避免剥离不存在的因子。随后把 `dcZeroOrder` / `nyquistZeroOrder` 与采样率 `sr` 传入设计函数（后者只用于把候选选优的拟合带限制在 `min(500 Hz, 0.45·fs)`）；epoch / 发布 / 交叉淡化流程与零点统计语义未改动。
 
 ### 测试
 
-- `Tests/subeq_fft_test.cpp` 新增 **Test 11c：解析零点矩阵**——fs ∈ {44100, 48000, 96000, 192000} × N ∈ {4096, 16384} × fc ∈ {30, 100, 400} × Q ∈ {0.707, 2.0} 高通目标，`fc·N/fs < 1.0` 跳过（拐点不足 1 个设计 bin，物理不可分辨，2 个 cell）；每个 cell 断言系数有限 / latency 0、`|Σh[n]| < 1e-9` 精确 DC 零点、通带 [fc, min(500, fs/2)] 100 个对数点上 `minPhaseErr <= max(linearPhaseErr, 1.0) + 1.0 dB`。额外 65536 点抽查 48 kHz HP30 Q0.707、192 kHz HP100 Q2、48 kHz LP200 Q0.707（LP 用 nyq=2 并断言 `|Σh[n]·(−1)^n| < 1e-9`）。
-  - 实测：45 个 cell 全部通过，最差最小相位误差 **1.444 dB**（44.1 kHz / N=4096 / fc=30 / Q=2；同 cell 线性相位 0.714 dB，规则上限 2.0 dB），最差线性相位 1.130 dB；65536 抽查三个场景最大误差 < 1e-5 dB。精确零点断言全部通过（双精度结构相消）。
-  - 诚实记录一个矩阵例外：`fc·N/fs ∈ [1.0, 1.5)` 且 Q>1 时，解析剥离后剩余幅频的极点衰减时间 τ≈Q/(π·fc)，`h_rest` 只保留 L 个抽头时尾部能量仍约 2%，因果最小相位在 N 点内达不到「相对线性相位 +1 dB」。实测 96 kHz / N=4096 / fc=30 / Q=2：最小相位 12.40 dB、线性相位 3.03 dB；该 cell 按物理不可分辨跳过（已在测试注释与交付汇报中列明），其余 cell 不放宽阈值。
-- 回归：`cl /nologo /EHsc /std:c++17 /O2 /utf-8` 重新编译，`Tests/subeq_fft_test.exe` 实跑 **363 项全部 PASS**（原 219 + 新增 144：45 cell × 3 断言 + 3 抽查 × 3 断言）、`ALL TESTS PASSED`、exit 0（约 2.1 s）。
-- 代价（后台设计线程实测，48 kHz HP30 Q0.707 带零点目标）：N=4096 约 **4.1 ms**、N=16384 约 **16.7 ms**、N=65536 约 **74.5 ms**（os=1 与 os=4 两个候选 + 192 点拟合误差）；同长度良性平滑目标旧路径约 0.16 / 0.72 / 3.15 ms。设计仍在后台 `juce::Thread` 上，音频线程零分配 / 无锁路径不变。
+- `Tests/subeq_fft_test.cpp` 扩展 **Test 11c：解析零点矩阵**：
+  - 单节点：fs ∈ {44100, 48000, 96000, 192000} × N ∈ {4096, 16384} × fc ∈ {30, 100, 400} × Q ∈ {0.707, 2.0} 高通目标，仅 `fc·N/fs < 1.0` 跳过（拐点不足 1 个设计 bin，物理不可分辨，2 个 cell）；46 个 cell 每个断言系数有限 / latency 0、`|Σh[n]| < 1e-9` 精确 DC 零点、通带 [fc, min(500, fs/2)] 100 个对数点上 `minPhaseErr <= max(linearPhaseErr, 1.0) + 1.0 dB`。**已删除**上一版 `fc·N/fs ∈ [1.0, 1.5) 且 Q>1` 的 bespoke 跳过——96 kHz/N=4096/fc=30/Q=2 由 legacy 候选 + 零点投影通过（实测 3.658 dB ≤ 4.031 dB 上限），不再掩盖近极限回归。
+  - 多节点（新增）：{2×HP(20+40 Hz, dc=4), 3×HP30 (dc=6), 2×LP200 (nyq=4), HP30+BP100 (dc=3, nyq=1)} × fs ∈ {48000, 96000} × N ∈ {4096, 16384}；仅最小拐点 <1 bin 的 2×HP 20 Hz @ 96 kHz/N=4096 跳过（15 个 cell）。每个 cell 断言系数有限 / latency 0、`max|h| < 1e3`、对应传输零点 `|H(0)|` 或 `|H(π)| < 1e-3`（legacy 近似判据；投影后实测 1e-17…1e-15）、通带误差 `<= max(linear, 1) + 1 dB`（复审允许多节点放宽到 +1.5 dB，实测最差 0.923 dB 故仍按 +1 dB 断言）。
+  - 65536 点抽查：48 kHz HP30 Q0.707、192 kHz HP100 Q2、48 kHz LP200 Q0.707（LP 用 nyq=2 并断言 `|Σh[n]·(−1)^n| < 1e-9`）。
+  - 实测：单节点 46 cell 全过，最差最小相位 **3.658 dB**（96 kHz/N=4096/fc=30/Q=2；同 cell 线性相位 3.031 dB，规则上限 4.031 dB），最差线性相位 3.031 dB；多节点 15 cell 全过，最差最小相位 **0.923 dB**（3×HP30 96 kHz/N=4096，上限 2.597 dB），最差线性相位 1.597 dB，最大抽头 6.14e1（HP30+BP100 96 kHz/N=4096）；多节点零点实测 1e-17…1e-15；65536 抽查最大误差 < 1e-5 dB。
+- 回归：`cl /nologo /EHsc /std:c++17 /O2 /utf-8` 重新编译，`Tests/subeq_fft_test.exe` 实跑 **430 项全部 PASS**（原 219 + 新增 211：单节点 46 cell × 3 断言 + 多节点 64 断言 + 3 抽查 × 3 断言）、`ALL TESTS PASSED`、exit 0。
+- 代价（后台设计线程实测，48 kHz HP30 Q0.707 带零点目标）：N=4096 约 **4.7 ms**、N=16384 约 **20.6 ms**、N=65536 约 **113.1 ms**（解析 os=1 + os=4 + legacy 8× 三个候选 + 可用带拟合误差 + 零点投影）；同长度良性平滑目标旧路径约 0.16 / 0.98 / 3.22 ms。设计仍在后台 `juce::Thread` 上，音频线程零分配 / 无锁路径不变。
 
 ### 工程
 
-- 版本号 0.4.4 → 0.4.5：`Napkid Sub EQ.jucer` 的 `version` 字段与 `AGENTS.md` 头部的「当前版本」行一并同步，回归计数 219 → 363。
+- 版本号 0.4.4 → 0.4.5：`Napkid Sub EQ.jucer` 的 `version` 字段与 `AGENTS.md` 头部的「当前版本」行一并同步，回归计数 219 → 430。
 - Projucer CLI 无头重存 `Napkid Sub EQ.jucer`：`JuceLibraryCode/JuceHeader.h`（`versionString` 0.4.4 → 0.4.5、`versionNumber` 0x404 → 0x405）与 `JuceLibraryCode/JucePluginDefines.h`（`JucePlugin_Version` / `JucePlugin_VersionCode` / `JucePlugin_VersionString` / ARA archive ID 0.4.4 → 0.4.5）落账；`git diff -- JuceLibraryCode` 只有版本行。Projucer 同时把 `Builds/VisualStudio2022/*.vcxproj` 的预处理器版本宏与 moduleinfo helper 的 `-version` 重建为 0.4.5（构建产物目录不入库）。
 - Release：VS2022 `Release x64` 全量 Rebuild **0 warning、0 error、exit 0**；`Napkid Sub EQ.dll` / Standalone exe FileVersion/ProductVersion 均为 0.4.5，VST3 `moduleinfo.json` **4 处 `Version` 均为 0.4.5**。
 

@@ -22,6 +22,7 @@
 #include <cmath>
 #include <complex>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #include "SubEQ_DSPMath.h"
@@ -50,6 +51,20 @@ constexpr int kMinPhaseFactoredOversampling = 4;
 // 候选选优的拟合误差采样点数：在 w ∈ [pi/65536, 0.999*pi] 上对数间隔
 // 取点，直接 DTFT 与目标 dB 幅频比较（不插值、不加窗）。
 constexpr int kMinPhaseFitPoints = 192;
+
+// 候选的抽头峰值 sanity gate：多节点传输零点（dc+nyq ≥ 4）时解析剥离后
+// 剩余幅频 R(0) 的动态范围随阶数爆炸（≈ (1/w_c)^{2k}），截断 h_rest 再与
+// 二项式因子做双精度卷积会因灾难性相消把有效位全部丢失，产生 1e4…1e50
+// 的抽头尖峰。峰值超过该门限的候选一律丢弃（改由 legacy 候选兜底）；
+// 合法目标（EQ 单节点增益 ≤ ±24 dB，级联后亦远低于该门限）不会被误杀。
+constexpr double kMinPhaseMaxTapMagnitude = 1.0e3;
+
+// 精确零点投影的安全阶数上限：单节点（dc/nyq 合计 2 阶）投影完全稳定；
+// 多节点只做「H(0)/H(π) 一阶精确」修正（每个传输零点 1 条矩约束），阶数
+// 天然 ≤ 2。整阶多节点投影（3×HP 的 6 阶矩）在接近网格分辨率的 cell
+// （96k/N=4096/fc=30）会把通带误差从 0.8 dB 推到 6 dB——高阶矩修正侵入
+// 拐点——故多节点不追求整阶精确零点（测试判据本身也是 legacy 近似）。
+constexpr int kMaxExactZeroProjectionOrder = 2;
 
 // Linear Phase FIR (Type-II even-length): sample the magnitude over [0, pi]
 // with a linear phase term so the time-domain impulse is symmetric.
@@ -88,6 +103,90 @@ inline std::vector<double> designLinearPhaseFIR(MagnitudeFn magnitude, int firLe
 
 namespace detail
 {
+
+// 旧自动路径（0.4.4 行为）：无零点标注目标的完整倒谱最小相位设计。N 点网格
+// 上探测最小幅度，低于 kMinPhaseDeepNullThreshold 时改用
+// kMinPhaseLegacyOversampling 倍网格重做并截断回 firLength；良性目标走 1×。
+// 该函数是「三参 designMinimumPhaseFIR 调用」与「带标注目标的 legacy 候选」
+// 的唯一实现，行为与 0.4.4 位级一致（不产生精确 DC/Nyquist 结构零点）。
+template <typename MagnitudeFn>
+inline std::vector<double> designLegacyMinimumPhase(MagnitudeFn& magnitude, int firLength)
+{
+    const double epsilon = 1.0e-12;
+    std::vector<std::complex<double>> spectrum(firLength);   // 单缓冲：过采样时仅扩容一次
+
+    // Step 1: log magnitude spectrum（同时记录网格上的最小幅度）
+    double minMag = std::numeric_limits<double>::infinity();
+    auto fillLogSpectrum = [&] (int n)
+    {
+        minMag = std::numeric_limits<double>::infinity();
+        for (int i = 0; i <= n / 2; ++i)
+        {
+            const double w = kPi * i / (n / 2);
+            const double mag = magnitude(w);
+            // NaN 比较恒为假：NaN 目标不会命中过采样分支，仍走原回退路径
+            if (mag < minMag)
+                minMag = mag;
+            spectrum[i] = { std::log(mag + epsilon), 0.0 };
+        }
+        for (int i = n / 2 + 1; i < n; ++i)
+            spectrum[i] = { spectrum[n - i].real(), 0.0 };
+    };
+
+    int designLength = firLength;
+    fillLogSpectrum(designLength);
+
+    if (minMag < kMinPhaseDeepNullThreshold)
+    {
+        designLength = firLength * kMinPhaseLegacyOversampling;
+        spectrum.resize(static_cast<size_t>(designLength));
+        fillLogSpectrum(designLength);
+    }
+
+    // Step 2: IDFT -> cepstrum
+    ifftInPlace(spectrum.data(), designLength);
+
+    // Step 3: causalise the cepstrum
+    spectrum[0] = { spectrum[0].real(), 0.0 };
+    for (int i = 1; i < designLength / 2; ++i)
+        spectrum[i] = { spectrum[i].real() * 2.0, 0.0 };
+    spectrum[designLength / 2] = { spectrum[designLength / 2].real(), 0.0 };   // 折叠窗在 Nyquist 项取 1（保留）
+    for (int i = designLength / 2 + 1; i < designLength; ++i)
+        spectrum[i] = { 0.0, 0.0 };
+
+    // Step 4: DFT -> minimum-phase log spectrum
+    fftInPlace(spectrum.data(), designLength);
+
+    // Step 5: exp() -> minimum-phase complex spectrum
+    for (int i = 0; i < designLength; ++i)
+    {
+        const double re = spectrum[i].real();
+        const double im = spectrum[i].imag();
+        spectrum[i] = { std::exp(re) * std::cos(im), std::exp(re) * std::sin(im) };
+    }
+
+    // Step 6: IDFT -> minimum-phase FIR coefficients（过采样网格取前 firLength 个抽头）
+    ifftInPlace(spectrum.data(), designLength);
+
+    std::vector<double> coeffsOut(firLength);   // double 抽头：与 DSP 精度约定一致
+    bool hasInvalid = false;
+    for (int i = 0; i < firLength; ++i)
+    {
+        const double val = spectrum[i].real();
+        if (std::isnan(val) || std::isinf(val))
+            hasInvalid = true;
+        coeffsOut[i] = val;
+    }
+
+    // Fallback to impulse if the cepstral method produced invalid coefficients
+    if (hasInvalid)
+    {
+        std::fill(coeffsOut.begin(), coeffsOut.end(), 0.0);
+        coeffsOut[0] = 1.0;
+    }
+
+    return coeffsOut;
+}
 
 // 解析剥离 DC/Nyquist 零点后的单候选设计。
 //
@@ -210,19 +309,208 @@ inline std::vector<double> designFactoredMinimumPhase(MagnitudeFn& magnitude, in
     return coeffsOut;
 }
 
-// 候选拟合误差：在 kMinPhaseFitPoints 个对数间隔角频率上直接 DTFT，
-// 取 FIR 与目标 dB 幅频差的最大绝对值。用相位递推（复步长连乘）代替
-// 每个抽头的 cos/sin，误差仅 ~1e-14 rad/65536 抽头，远低于 dB 判据。
+// 带部分主元的高斯消元，解 order×order 小线性系统（order ≤
+// kMaxExactZeroProjectionOrder = 2）。就地改写 matrix / rhs，rhs 返回解向量；
+// 奇异或非有限时返回 false。
+inline bool solveSmallLinearSystem(std::vector<double>& matrix, std::vector<double>& rhs, int order)
+{
+    for (int col = 0; col < order; ++col)
+    {
+        int pivot = col;
+        double best = std::abs(matrix[col * order + col]);
+        for (int row = col + 1; row < order; ++row)
+        {
+            const double value = std::abs(matrix[row * order + col]);
+            if (value > best)
+            {
+                best = value;
+                pivot = row;
+            }
+        }
+        if (!(best > 0.0) || !std::isfinite(best))
+            return false;
+
+        if (pivot != col)
+        {
+            for (int c = 0; c < order; ++c)
+                std::swap(matrix[col * order + c], matrix[pivot * order + c]);
+            std::swap(rhs[col], rhs[pivot]);
+        }
+
+        const double diagonal = matrix[col * order + col];
+        for (int row = col + 1; row < order; ++row)
+        {
+            const double factor = matrix[row * order + col] / diagonal;
+            if (factor == 0.0)
+                continue;
+            for (int c = col; c < order; ++c)
+                matrix[row * order + c] -= factor * matrix[col * order + c];
+            rhs[row] -= factor * rhs[col];
+        }
+    }
+
+    for (int row = order - 1; row >= 0; --row)
+    {
+        double sum = rhs[row];
+        for (int c = row + 1; c < order; ++c)
+            sum -= matrix[row * order + c] * rhs[c];
+        const double diagonal = matrix[row * order + row];
+        if (!(std::abs(diagonal) > 0.0) || !std::isfinite(diagonal))
+            return false;
+        rhs[row] = sum / diagonal;
+        if (!std::isfinite(rhs[row]))
+            return false;
+    }
+    return true;
+}
+
+// 把候选系数精确投影到「DC 点若干阶矩 + Nyquist 点若干阶矩为零」的子空间：
+// 最小范数修正 δ[n] = p(x[n]) + (-1)^n q(x[n])，x[n] = n/(N-1)，p/q 是
+// (dcMoments-1) / (nyqMoments-1) 次多项式（该子空间正是卷积因子的正交补，
+// 等价于最小二乘投影）。修正量由「修正后各阶矩为零」的小线性系统解出：
+//   Σ h[n]·x^k = 0 (k<dcMoments)，Σ h[n]·(-1)^n·x^k = 0 (k<nyqMoments)。
+// 传入 (dc, nyq) 即整阶结构零点；传入 (1, 1) 只保证 H(0)/H(π) 精确为零
+// （多节点 legacy 候选的近似零点修正用）。
+// 注意：cos 端点外推只保证幅频端的有限性，真正的结构零点（H(1)=0 等）
+// 由这组矩约束给出；legacy 候选（近似零点）经此投影后与解析候选同精度。
+inline bool enforceMinimumPhaseTransmissionZeros(std::vector<double>& coeffs,
+                                                 int dcMoments, int nyqMoments)
+{
+    const int order = dcMoments + nyqMoments;
+    if (order <= 0 || order > kMaxExactZeroProjectionOrder)
+        return false;
+
+    const int length = static_cast<int>(coeffs.size());
+    if (length <= order)
+        return false;
+
+    const double invLast = 1.0 / static_cast<double>(length - 1);
+    auto dcBasis = [&] (int k, int n)
+    {
+        double value = 1.0;
+        for (int q = 0; q < k; ++q)
+            value *= static_cast<double>(n) * invLast;
+        return value;
+    };
+    auto nyqBasis = [&] (int k, int n)
+    {
+        double value = ((n & 1) != 0) ? -1.0 : 1.0;
+        for (int q = 0; q < k; ++q)
+            value *= static_cast<double>(n) * invLast;
+        return value;
+    };
+
+    // 未知量：[a_0..a_{dc-1}, b_0..b_{nyq-1}]。
+    // 第 k 个 DC 行：Σ (h[n] + δ[n])·x^k = 0；第 k 个 Nyquist 行：
+    // Σ (h[n] + δ[n])·(-1)^n·x^k = 0。
+    std::vector<double> gram(static_cast<size_t>(order * order), 0.0);
+    std::vector<double> solution(static_cast<size_t>(order), 0.0);
+
+    for (int k = 0; k < dcMoments; ++k)
+    {
+        double moment = 0.0;
+        for (int n = 0; n < length; ++n)
+            moment += coeffs[static_cast<size_t>(n)] * dcBasis(k, n);
+        solution[static_cast<size_t>(k)] = -moment;
+
+        for (int j = 0; j < dcMoments; ++j)
+        {
+            double sum = 0.0;
+            for (int n = 0; n < length; ++n)
+                sum += dcBasis(j, n) * dcBasis(k, n);
+            gram[static_cast<size_t>(k * order + j)] = sum;
+        }
+        for (int j = 0; j < nyqMoments; ++j)
+        {
+            double sum = 0.0;
+            for (int n = 0; n < length; ++n)
+                sum += nyqBasis(j, n) * dcBasis(k, n);
+            gram[static_cast<size_t>(k * order + dcMoments + j)] = sum;
+        }
+    }
+
+    for (int k = 0; k < nyqMoments; ++k)
+    {
+        const int row = dcMoments + k;
+        double moment = 0.0;
+        for (int n = 0; n < length; ++n)
+            moment += coeffs[static_cast<size_t>(n)] * nyqBasis(k, n);
+        solution[static_cast<size_t>(row)] = -moment;
+
+        for (int j = 0; j < dcMoments; ++j)
+        {
+            double sum = 0.0;
+            for (int n = 0; n < length; ++n)
+                sum += dcBasis(j, n) * nyqBasis(k, n);
+            gram[static_cast<size_t>(row * order + j)] = sum;
+        }
+        for (int j = 0; j < nyqMoments; ++j)
+        {
+            double sum = 0.0;
+            for (int n = 0; n < length; ++n)
+                sum += nyqBasis(j, n) * nyqBasis(k, n);
+            gram[static_cast<size_t>(row * order + dcMoments + j)] = sum;
+        }
+    }
+
+    if (!solveSmallLinearSystem(gram, solution, order))
+        return false;
+
+    for (int n = 0; n < length; ++n)
+    {
+        double delta = 0.0;
+        for (int j = 0; j < dcMoments; ++j)
+            delta += solution[static_cast<size_t>(j)] * dcBasis(j, n);
+        for (int j = 0; j < nyqMoments; ++j)
+            delta += solution[static_cast<size_t>(dcMoments + j)] * nyqBasis(j, n);
+        coeffs[static_cast<size_t>(n)] += delta;
+    }
+    return true;
+}
+
+// 候选拟合误差：在 kMinPhaseFitPoints 个对数间隔角频率上直接 DTFT，取 FIR
+// 与目标 dB 幅频差的最大绝对值，但只统计「实际可用带」内的采样点：
+//   · 目标幅度不低于本次采样最大值的 1/2（−6 dB），排除阻带（+1e-12 的
+//     −240 dB 地板会让阻带点主导 dB 误差）；
+//   · 频率不超过 min(500 Hz, 0.45·fs)：本插件是 0.5–500 Hz 的超低频 EQ，
+//     500 Hz 以上目标恒为 1，而解析剥离候选在高频的截断误差与本任务无关，
+//     若纳入选优会压过真正的低通带精度（实测 96k 单 HP 会因此选中通带
+//     差 2.3 dB 的 legacy 而非 0.29 dB 的解析候选）。
+// sampleRateHz ≤ 0 时退回纯 −6 dB 门限（全带），供无采样率信息的调用方使用。
+// 用相位递推（复步长连乘）代替每个抽头的 cos/sin，误差仅 ~1e-14 rad/65536
+// 抽头，远低于 dB 判据。
 template <typename MagnitudeFn>
-inline double factoredFitError(const std::vector<double>& coeffs, MagnitudeFn& magnitude)
+inline double minimumPhaseFitError(const std::vector<double>& coeffs, MagnitudeFn& magnitude,
+                                   double sampleRateHz)
 {
     const double start = kPi / 65536.0;
-    const double end = 0.999 * kPi;
+    double end = 0.999 * kPi;
+    if (sampleRateHz > 0.0)
+    {
+        const double highHz = std::min(500.0, 0.45 * sampleRateHz);
+        const double bandEnd = 2.0 * kPi * highHz / sampleRateHz;
+        if (bandEnd > start)
+            end = std::min(end, bandEnd);
+    }
     const double ratio = end / start;
 
+    double targetMag[kMinPhaseFitPoints];
+    double maxTarget = 0.0;
+    for (int k = 0; k < kMinPhaseFitPoints; ++k)
+    {
+        const double w = start * std::pow(ratio, static_cast<double>(k) / (kMinPhaseFitPoints - 1));
+        targetMag[k] = magnitude(w);
+        if (targetMag[k] > maxTarget)
+            maxTarget = targetMag[k];
+    }
+
+    const double passbandThreshold = 0.5 * maxTarget;   // −6 dB
     double maxError = 0.0;
     for (int k = 0; k < kMinPhaseFitPoints; ++k)
     {
+        if (!(targetMag[k] >= passbandThreshold))
+            continue;
+
         const double w = start * std::pow(ratio, static_cast<double>(k) / (kMinPhaseFitPoints - 1));
         const std::complex<double> step(std::cos(w), -std::sin(w));
         std::complex<double> phase(1.0, 0.0);
@@ -234,7 +522,7 @@ inline double factoredFitError(const std::vector<double>& coeffs, MagnitudeFn& m
         }
 
         const double firDb = 20.0 * std::log10(std::abs(response) + 1.0e-12);
-        const double targetDb = 20.0 * std::log10(magnitude(w) + 1.0e-12);
+        const double targetDb = 20.0 * std::log10(targetMag[k] + 1.0e-12);
         maxError = std::max(maxError, std::abs(firDb - targetDb));
     }
     return maxError;
@@ -248,21 +536,27 @@ inline double factoredFitError(const std::vector<double>& coeffs, MagnitudeFn& m
 //
 // 两条路径：
 //   · dcZeroOrder == nyquistZeroOrder == 0（调用方未标注零点）：保持 0.4.4
-//     旧自动路径。深零点目标（高通 / 带通在 DC 或 Nyquist 的传输零点）在
-//     N 点网格上被 epsilon 钳位成 -240 dB 的孤立尖峰，N 点倒谱把它当成
-//     宽带特征做时域混叠，会在通带内造出假陷波（v0.4.3 实测 HP30 Q0.9
-//     N=4096 通带最深 -31 dB）。故先探测网格最小幅度，低于
-//     kMinPhaseDeepNullThreshold 时按 kMinPhaseLegacyOversampling 倍网格
-//     重做同一倒谱法并截断回 firLength；良性目标仍走 1× 路径。
+//     旧自动路径（detail::designLegacyMinimumPhase，与旧 3 参调用位级一致）。
 //   · 调用方按滤波器拓扑给出精确零点阶数（高通 DC=2、低通 Nyquist=2、
-//     带通各 1）：走解析剥离路径。旧 8× 只是抑制混叠、并未真正消除
-//     DC/Nyquist 奇点；解析剥离把已知因子从幅频中除掉，对剩余平滑幅频
-//     做倒谱设计，再与短因子卷积——因子的零点在时域是精确的相消结构，
-//     DC 处 Σh=0、Nyquist 处 Σh(-1)^n=0，不依赖 epsilon 钳位。
-//     候选 os=1 与 os=4 各设计一次，用 detail::factoredFitError 选优。
+//     带通各 1、级联累加）：在三个候选间选优——
+//       ① 解析剥离 os=1，② 解析剥离 os=4，③ legacy 自动路径（0.4.4）。
+//     每个候选先做有限性检查与 max|h| ≤ kMinPhaseMaxTapMagnitude 的 sanity
+//     gate（多节点零点时解析剥离会灾难性相消、产生 1e4…1e50 尖峰），通过
+//     gate 后再做精确零点投影，最后用「可用带对齐」的拟合误差选最优。
+//     · 单节点（dc+nyq == 2）：投影整阶结构零点（H(0)=H'(0)=0 或 Nyquist
+//       对称），解析候选本身已精确、legacy 候选（近极限 cell）经投影后同样
+//       精确——回归测试的 1e-9 断言对单节点始终成立。
+//     · 多节点（dc+nyq ≥ 4）：解析候选被 gate 丢弃，legacy 候选兜底（实测
+//       通带误差 0.01–3.7 dB）；只把每个传输零点的 H(0)/H(π) 修正到精确
+//       零（一阶投影），更高阶矩保留 legacy 近似（测试判据本身即 <1e-3）。
+//     没有任何可用候选时回退 legacy，legacy 仍无效则回退冲激。
+//     sampleRateHz > 0 时把候选选优的拟合带限制在 min(500 Hz, 0.45·fs) 内
+//     （本插件是 0.5–500 Hz 超低频 EQ；不传则用全带，行为退化为 0.4.5）。
+//     解析路径的 latencyOut 仍为 0。
 template <typename MagnitudeFn>
 inline std::vector<double> designMinimumPhaseFIR(MagnitudeFn magnitude, int firLength, int& latencyOut,
-                                                 int dcZeroOrder = 0, int nyquistZeroOrder = 0)
+                                                 int dcZeroOrder = 0, int nyquistZeroOrder = 0,
+                                                 double sampleRateHz = 0.0)
 {
     latencyOut = 0;
 
@@ -272,125 +566,82 @@ inline std::vector<double> designMinimumPhaseFIR(MagnitudeFn magnitude, int firL
         dcZeroOrder = 0;
     if (nyquistZeroOrder < 0)
         nyquistZeroOrder = 0;
-    const bool hasAnnotatedZeros = (dcZeroOrder > 0 || nyquistZeroOrder > 0)
-                                   && (dcZeroOrder + nyquistZeroOrder < firLength);
+    const int zeroOrder = dcZeroOrder + nyquistZeroOrder;
+    const bool hasAnnotatedZeros = zeroOrder > 0 && zeroOrder < firLength;
 
-    if (hasAnnotatedZeros)
+    if (!hasAnnotatedZeros)
+        return detail::designLegacyMinimumPhase(magnitude, firLength);
+
+    // 单节点追求整阶精确零点；多节点只做一阶（H(0)/H(π) = 0）修正。
+    const bool singleNode = (zeroOrder <= 2);
+    const int dcMoments = singleNode ? dcZeroOrder : (dcZeroOrder > 0 ? 1 : 0);
+    const int nyqMoments = singleNode ? nyquistZeroOrder : (nyquistZeroOrder > 0 ? 1 : 0);
+
+    auto applyZeroProjection = [&] (std::vector<double>& coeffs)
     {
-        std::vector<double> best;
-        double bestFitError = std::numeric_limits<double>::infinity();
-        const int candidates[2] = { 1, kMinPhaseFactoredOversampling };
-
-        for (int oversampling : candidates)
-        {
-            std::vector<double> h = detail::designFactoredMinimumPhase(
-                magnitude, firLength, dcZeroOrder, nyquistZeroOrder, oversampling);
-
-            bool finite = true;
-            for (double v : h)
-            {
-                if (std::isnan(v) || std::isinf(v))
-                {
-                    finite = false;
-                    break;
-                }
-            }
-            if (!finite)
-                continue;
-
-            const double fitError = detail::factoredFitError(h, magnitude);
-            if (fitError < bestFitError)
-            {
-                bestFitError = fitError;
-                best = h;
-            }
-        }
-
-        if (!best.empty())
-            return best;
-
-        // 两个候选都产生非有限系数：回退冲激（与旧路径一致），
-        // 不让 NaN/Inf 进入卷积。
-        std::vector<double> impulse(static_cast<size_t>(firLength), 0.0);
-        impulse[0] = 1.0;
-        return impulse;
-    }
-
-    const double epsilon = 1.0e-12;
-    std::vector<std::complex<double>> spectrum(firLength);   // 单缓冲：过采样时仅扩容一次
-
-    // Step 1: log magnitude spectrum（同时记录网格上的最小幅度）
-    double minMag = std::numeric_limits<double>::infinity();
-    auto fillLogSpectrum = [&] (int n)
-    {
-        minMag = std::numeric_limits<double>::infinity();
-        for (int i = 0; i <= n / 2; ++i)
-        {
-            const double w = kPi * i / (n / 2);
-            const double mag = magnitude(w);
-            // NaN 比较恒为假：NaN 目标不会命中过采样分支，仍走原回退路径
-            if (mag < minMag)
-                minMag = mag;
-            spectrum[i] = { std::log(mag + epsilon), 0.0 };
-        }
-        for (int i = n / 2 + 1; i < n; ++i)
-            spectrum[i] = { spectrum[n - i].real(), 0.0 };
+        // 投影失败（小系统奇异）时保留候选的近似零点，不因此丢弃候选。
+        detail::enforceMinimumPhaseTransmissionZeros(coeffs, dcMoments, nyqMoments);
+        for (double value : coeffs)
+            if (!std::isfinite(value))
+                return false;
+        return true;
     };
 
-    int designLength = firLength;
-    fillLogSpectrum(designLength);
+    std::vector<double> best;
+    double bestFitError = std::numeric_limits<double>::infinity();
 
-    if (minMag < kMinPhaseDeepNullThreshold)
+    auto consider = [&] (std::vector<double> coeffs)
     {
-        designLength = firLength * kMinPhaseLegacyOversampling;
-        spectrum.resize(static_cast<size_t>(designLength));
-        fillLogSpectrum(designLength);
-    }
+        if (static_cast<int>(coeffs.size()) != firLength)
+            return;
 
-    // Step 2: IDFT -> cepstrum
-    ifftInPlace(spectrum.data(), designLength);
+        // 有限性 + 抽头峰值 sanity gate：丢弃灾难性相消的解析候选。
+        double peak = 0.0;
+        for (double value : coeffs)
+        {
+            if (!std::isfinite(value))
+                return;
+            peak = std::max(peak, std::abs(value));
+        }
+        if (peak > kMinPhaseMaxTapMagnitude)
+            return;
 
-    // Step 3: causalise the cepstrum
-    spectrum[0] = { spectrum[0].real(), 0.0 };
-    for (int i = 1; i < designLength / 2; ++i)
-        spectrum[i] = { spectrum[i].real() * 2.0, 0.0 };
-    spectrum[designLength / 2] = { spectrum[designLength / 2].real(), 0.0 };   // 折叠窗在 Nyquist 项取 1（保留）
-    for (int i = designLength / 2 + 1; i < designLength; ++i)
-        spectrum[i] = { 0.0, 0.0 };
+        // 精确零点投影（阶数 ≤ kMaxExactZeroProjectionOrder；对已经精确的
+        // 解析候选是 1e-15 量级的无操作修正）。
+        if (!applyZeroProjection(coeffs))
+            return;
 
-    // Step 4: DFT -> minimum-phase log spectrum
-    fftInPlace(spectrum.data(), designLength);
+        const double fitError = detail::minimumPhaseFitError(coeffs, magnitude, sampleRateHz);
+        if (fitError < bestFitError)
+        {
+            bestFitError = fitError;
+            best = std::move(coeffs);
+        }
+    };
 
-    // Step 5: exp() -> minimum-phase complex spectrum
-    for (int i = 0; i < designLength; ++i)
-    {
-        const double re = spectrum[i].real();
-        const double im = spectrum[i].imag();
-        spectrum[i] = { std::exp(re) * std::cos(im), std::exp(re) * std::sin(im) };
-    }
+    const int factoredOversamplings[2] = { 1, kMinPhaseFactoredOversampling };
+    for (int oversampling : factoredOversamplings)
+        consider(detail::designFactoredMinimumPhase(magnitude, firLength, dcZeroOrder,
+                                                    nyquistZeroOrder, oversampling));
 
-    // Step 6: IDFT -> minimum-phase FIR coefficients（过采样网格取前 firLength 个抽头）
-    ifftInPlace(spectrum.data(), designLength);
+    std::vector<double> legacy = detail::designLegacyMinimumPhase(magnitude, firLength);
+    consider(legacy);
 
-    std::vector<double> coeffsOut(firLength);   // double 抽头：与 DSP 精度约定一致
-    bool hasInvalid = false;
-    for (int i = 0; i < firLength; ++i)
-    {
-        const double val = spectrum[i].real();
-        if (std::isnan(val) || std::isinf(val))
-            hasInvalid = true;
-        coeffsOut[i] = val;
-    }
+    if (!best.empty())
+        return best;
 
-    // Fallback to impulse if the cepstral method produced invalid coefficients
-    if (hasInvalid)
-    {
-        std::fill(coeffsOut.begin(), coeffsOut.end(), 0.0);
-        coeffsOut[0] = 1.0;
-    }
+    // 三个候选都被 sanity gate 拒绝：回退 legacy（允许近似零点），仍无效则冲激。
+    bool legacyUsable = static_cast<int>(legacy.size()) == firLength;
+    for (double value : legacy)
+        if (!std::isfinite(value))
+            legacyUsable = false;
 
-    latencyOut = 0;
-    return coeffsOut;
+    if (legacyUsable && applyZeroProjection(legacy))
+        return legacy;
+
+    std::vector<double> impulse(static_cast<size_t>(firLength), 0.0);
+    impulse[0] = 1.0;
+    return impulse;
 }
 
 } // namespace SubEQ

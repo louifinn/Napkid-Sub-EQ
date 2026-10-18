@@ -337,6 +337,15 @@ static double nyquistTapSumAbs(const std::vector<double>& h)
     return std::abs(sum);
 }
 
+// 抽头峰值：多节点候选的 sanity gate（灾难性相消会产生 1e4…1e50 尖峰）。
+static double maxTapMagnitude(const std::vector<double>& h)
+{
+    double peak = 0.0;
+    for (double v : h)
+        peak = std::max(peak, std::abs(v));
+    return peak;
+}
+
 int main()
 {
     // ---- Benchmark (informational, no assertion): FFT throughput ----
@@ -749,10 +758,12 @@ int main()
     }
 
     // ---- Test 11c: 解析 DC/Nyquist 零点矩阵（v0.4.5） ----
-    // 高通目标在 DC 有 2 阶传输零点：解析剥离后 h 的 DC 响应必须是精确 0
-    // （Σh = 0 的时域相消结构，而非 epsilon 钳位近似），且通带上 FIR 的
-    // dB 误差不得显著劣于同目标、同长度的线性相位设计。矩阵覆盖
-    // fs × N × fc × Q，65536 点再抽查三个代表性场景。
+    // 单节点：高通目标在 DC 有 2 阶传输零点，候选选优 / 精确零点投影后 h 的
+    // DC 响应必须是精确 0（Σh = 0 的时域相消结构，而非 epsilon 钳位近似），
+    // 且通带上 FIR 的 dB 误差不得显著劣于同目标、同长度的线性相位设计。
+    // 矩阵覆盖 fs × N × fc × Q（含 96 kHz/N=4096/fc=30/Q=2 近极限 cell，
+    // 由 legacy 候选 + 零点投影通过，不再跳过），65536 点再抽查三个场景。
+    // 多节点矩阵（级联 4–6 阶零点）见下方独立子块。
     {
         const double sampleRates[] = { 44100.0, 48000.0, 96000.0, 192000.0 };
         const int firLengths[] = { 4096, 16384 };
@@ -761,7 +772,6 @@ int main()
 
         int cellsRun = 0;
         int cellsSkippedUnderOneBin = 0;
-        int cellsSkippedNearLimitHighQ = 0;
         double worstMinPhaseErr = 0.0;
         double worstLinearPhaseErr = 0.0;
         double worstMargin = -1.0e9;   // minErr - (max(linErr, 1) + 1)，越接近 0 越紧
@@ -782,19 +792,6 @@ int main()
                 continue;
             }
 
-            // 额外例外（本实现实测，已列入 v0.4.5 汇报）：fc*N/fs ∈ [1.0, 1.5)
-            // 且 Q>1 时，解析剥离后剩余幅频的极点衰减时间 τ ≈ Q/(π·fc) 秒，
-            // h_rest 只保留 L = N-(dc+nyq) 个抽头，截断尾部能量仍约 2%——
-            // 因果最小相位在 N 点内无法达到「相对线性相位 +1 dB」。
-            // 实测 96 kHz / N=4096 / fc=30 / Q=2：最小相位 12.40 dB、
-            // 线性相位 3.03 dB（超限 8.37 dB）。该 cell 物理不可分辨，跳过；
-            // 其余所有 cell 严格执行 <= max(linear, 1) + 1 dB，不另放宽。
-            if (binsPerCutoff < 1.5 && q > 1.0)
-            {
-                ++cellsSkippedNearLimitHighQ;
-                continue;
-            }
-
             ++cellsRun;
 
             BiquadCoefficients c[2];
@@ -802,7 +799,7 @@ int main()
             auto target = [&c] (double w) { return std::abs(biquadResponse(c[0], w)); };
 
             int mpLatency = -1;
-            const std::vector<double> hMin = designMinimumPhaseFIR(target, N, mpLatency, 2, 0);
+            const std::vector<double> hMin = designMinimumPhaseFIR(target, N, mpLatency, 2, 0, fs);
             int lpLatency = -1;
             const std::vector<double> hLin = designLinearPhaseFIR(target, N, lpLatency);
 
@@ -843,10 +840,154 @@ int main()
                       + " dB, 1 dB) + 1 dB");
         }
 
-        std::printf("      Test 11c matrix: %d cells, %d skipped (<1 bin), %d skipped (near-limit high-Q), "
+        std::printf("      Test 11c single-node matrix: %d cells, %d skipped (<1 bin), "
                     "worst min-phase %.3f dB, worst linear-phase %.3f dB, tightest %s (margin %.3f dB)\n",
-                    cellsRun, cellsSkippedUnderOneBin, cellsSkippedNearLimitHighQ,
+                    cellsRun, cellsSkippedUnderOneBin,
                     worstMinPhaseErr, worstLinearPhaseErr, worstCell.c_str(), worstMargin);
+
+        // ---- Test 11c 多节点矩阵：级联传输零点（dc+nyq ≥ 4） ----
+        // 多个 HP / LP / BP 节点把 DC/Nyquist 零点推到 4–6 阶。该阶数下解析
+        // 剥离的剩余幅频动态范围 ~(1/w_c)^{2k}，截断 h_rest 后与二项式因子
+        // 的双精度卷积会灾难性相消（抽头 1e4…1e50，通带误差数十 dB），候选被
+        // 设计的 max|h| sanity gate 丢弃、由 legacy 候选兜底。因此这里的零点
+        // 断言按 legacy 近似放宽到 |H(0)| / |H(π)| < 1e-3（设计内一阶投影已把
+        // 这两个值修到 1e-15 量级），通带阈值允许放宽到 +1.5 dB——实测最差
+        // 0.93 dB，故仍按 +1 dB 断言。矩阵覆盖 {2×HP(20+40), 3×HP30, 2×LP200,
+        // HP30+BP100(dc=3,nyq=1)} × fs{48k, 96k} × N{4096, 16384}。
+        {
+            struct MultiNodeStage { double cutoffHz; double q; FilterType type; };
+            struct MultiNodeSpec
+            {
+                const char* name;
+                const MultiNodeStage* stages;
+                int stageCount;
+                int dcOrder;
+                int nyqOrder;
+                double passLowHz;
+                double passHighHz;
+                double minCutoffHz;
+            };
+
+            const MultiNodeStage hp20plus40[] =
+            {
+                { 20.0, 0.707, FilterType::HighPass },
+                { 40.0, 0.707, FilterType::HighPass },
+            };
+            const MultiNodeStage hp30x3[] =
+            {
+                { 30.0, 0.707, FilterType::HighPass },
+                { 30.0, 0.707, FilterType::HighPass },
+                { 30.0, 0.707, FilterType::HighPass },
+            };
+            const MultiNodeStage lp200x2[] =
+            {
+                { 200.0, 0.707, FilterType::LowPass },
+                { 200.0, 0.707, FilterType::LowPass },
+            };
+            const MultiNodeStage hp30bp100[] =
+            {
+                { 30.0, 0.707, FilterType::HighPass },
+                { 100.0, 2.0,   FilterType::BandPass },
+            };
+
+            const MultiNodeSpec multiSpecs[] =
+            {
+                { "2xHP20+40",  hp20plus40, 2, 4, 0,  40.0, 500.0, 20.0 },
+                { "3xHP30",     hp30x3,     3, 6, 0,  30.0, 500.0, 30.0 },
+                { "2xLP200",    lp200x2,    2, 0, 4,  20.0, 200.0, 200.0 },
+                { "HP30+BP100", hp30bp100, 2, 3, 1,  50.0, 200.0, 30.0 },
+            };
+
+            const double multiRates[] = { 48000.0, 96000.0 };
+            const int multiLengths[] = { 4096, 16384 };
+
+            int multiRun = 0;
+            int multiSkipped = 0;
+            double worstMultiErr = 0.0;
+            double worstMultiLinErr = 0.0;
+            double worstMultiPeak = 0.0;
+
+            for (const MultiNodeSpec& spec : multiSpecs)
+            for (double fs : multiRates)
+            for (int N : multiLengths)
+            {
+                // 与单节点一致的分辨率门限：最小拐点不足 1 个设计 bin 时
+                // 目标变化比设计网格还快，物理不可分辨（仅 2×HP 20 Hz @
+                // 96 kHz/N=4096 命中，bins ≈ 0.85）。
+                const double binsPerCutoff = spec.minCutoffHz * static_cast<double>(N) / fs;
+                if (binsPerCutoff < 1.0)
+                {
+                    ++multiSkipped;
+                    continue;
+                }
+                ++multiRun;
+
+                BiquadCoefficients stages[3];
+                for (int i = 0; i < spec.stageCount; ++i)
+                {
+                    BiquadCoefficients c[2];
+                    computeBiquadCoefficients(spec.stages[i].cutoffHz, 0.0, spec.stages[i].q,
+                                              spec.stages[i].type, fs, c);
+                    stages[i] = c[0];
+                }
+                auto target = [&stages, &spec] (double w)
+                {
+                    double mag = 1.0;
+                    for (int i = 0; i < spec.stageCount; ++i)
+                        mag *= std::abs(biquadResponse(stages[i], w));
+                    return mag;
+                };
+
+                int mpLatency = -1;
+                const std::vector<double> hMin =
+                    designMinimumPhaseFIR(target, N, mpLatency, spec.dcOrder, spec.nyqOrder, fs);
+                int lpLatency = -1;
+                const std::vector<double> hLin = designLinearPhaseFIR(target, N, lpLatency);
+
+                const std::string cellName =
+                    std::string("min phase multi-node matrix: ") + spec.name
+                    + " fs=" + std::to_string(static_cast<int>(fs))
+                    + " N=" + std::to_string(N);
+
+                bool finite = (mpLatency == 0);
+                for (double v : hMin)
+                    if (!std::isfinite(v))
+                        finite = false;
+                check(finite, cellName + " coefficients finite / latency 0");
+
+                const double peak = maxTapMagnitude(hMin);
+                worstMultiPeak = std::max(worstMultiPeak, peak);
+                check(peak < 1.0e3, cellName + " max|h| < 1e3 (peak=" + std::to_string(peak) + ")");
+
+                if (spec.dcOrder > 0)
+                {
+                    const double dcLeak = dcTapSumAbs(hMin);
+                    check(dcLeak < 1.0e-3,
+                          cellName + " DC zero |sum h| < 1e-3 (" + std::to_string(dcLeak) + ")");
+                }
+                if (spec.nyqOrder > 0)
+                {
+                    const double nyqLeak = nyquistTapSumAbs(hMin);
+                    check(nyqLeak < 1.0e-3,
+                          cellName + " Nyquist zero |sum h(-1)^n| < 1e-3 ("
+                              + std::to_string(nyqLeak) + ")");
+                }
+
+                const double highHz = std::min(spec.passHighHz, fs * 0.5);
+                const double minErr = maxFirDbError(hMin, target, spec.passLowHz, highHz, fs, 100);
+                const double linErr = maxFirDbError(hLin, target, spec.passLowHz, highHz, fs, 100);
+                const double allowance = std::max(linErr, 1.0) + 1.0;
+                worstMultiErr = std::max(worstMultiErr, minErr);
+                worstMultiLinErr = std::max(worstMultiLinErr, linErr);
+                check(minErr <= allowance,
+                      cellName + " min-phase " + std::to_string(minErr) + " dB <= max(linear "
+                          + std::to_string(linErr) + " dB, 1 dB) + 1 dB");
+            }
+
+            std::printf("      Test 11c multi-node matrix: %d cells, %d skipped (<1 bin), "
+                        "worst min-phase %.3f dB, worst linear-phase %.3f dB, worst peak %.3e\n",
+                        multiRun, multiSkipped, worstMultiErr, worstMultiLinErr, worstMultiPeak);
+        }
 
         // ---- 65536 点抽查：高采样率低频 HP、低 Q HP、Nyquist 零点 LP ----
         struct SpotCheck
@@ -876,7 +1017,7 @@ int main()
 
             int mpLatency = -1;
             const std::vector<double> hMin =
-                designMinimumPhaseFIR(target, spotN, mpLatency, s.dcOrder, s.nyqOrder);
+                designMinimumPhaseFIR(target, spotN, mpLatency, s.dcOrder, s.nyqOrder, s.fs);
             int lpLatency = -1;
             const std::vector<double> hLin = designLinearPhaseFIR(target, spotN, lpLatency);
 

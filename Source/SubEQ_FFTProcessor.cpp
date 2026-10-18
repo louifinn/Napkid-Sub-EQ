@@ -279,8 +279,10 @@ void FFTProcessor::run()
                 }
             }
 
+            // 传入采样率：候选选优的拟合带限制在本插件的可用带
+            // min(500 Hz, 0.45·fs) 内，避免高频截断误差压过低通带精度。
             newState->coeffs = designMinimumPhaseFIR(magnitude, firLength, newState->groupDelay,
-                                                     dcZeroOrder, nyquistZeroOrder);
+                                                     dcZeroOrder, nyquistZeroOrder, sr);
         }
 
         // Pre-compute the frequency-domain filter for overlap-add convolution
