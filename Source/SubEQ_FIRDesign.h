@@ -48,9 +48,22 @@ constexpr int kMinPhaseLegacyOversampling = 8;
 // 的拐点（低 fc 相对 fs）更稳健，二者各有用武之地。
 constexpr int kMinPhaseFactoredOversampling = 4;
 
-// 候选选优的拟合误差采样点数：在 w ∈ [pi/65536, 0.999*pi] 上对数间隔
-// 取点，直接 DTFT 与目标 dB 幅频比较（不插值、不加窗）。
+// 候选选优的带内拟合误差采样点数：在可用带（目标 ≥ -6 dB 且
+// f ≤ min(500 Hz, 0.45·fs)）上对数间隔取点，直接 DTFT 与目标 dB 幅频比较
+// （不插值、不加窗）。该度量只用于在「全带合格」的候选之间排序，
+// 不承担全带正确性（见 kMinPhaseEligibilityPoints）。
 constexpr int kMinPhaseFitPoints = 192;
+
+// 候选全带 eligibility（与带内拟合独立）：在 w ∈ [pi/65536, 0.999*pi] 上
+// 128 个对数间隔点直接 DTFT，对 target ≥ -80 dB 的点要求 |fir - target| ≤
+// 6 dB，且候选峰值不得超过目标峰值 3 dB。它专门剔除解析剥离候选在高频
+// （>500 Hz 至 Nyquist）的截断振铃：h_rest 截断 + 因子卷积会在高频产生
+// 28–97 dB 偏差（96 kHz/N=4096/HP30 Q0.707 @15 kHz −20 dB、
+// HP30+BP100 @20 kHz +22 dB），而带内拟合对这些点完全不可见。
+constexpr int kMinPhaseEligibilityPoints = 128;
+constexpr double kMinPhaseEligibilityMaxErrorDb = 6.0;
+constexpr double kMinPhaseEligibilityMaxPeakOvershootDb = 3.0;
+constexpr double kMinPhaseEligibilityTargetFloorDb = -80.0;
 
 // 候选的抽头峰值 sanity gate：多节点传输零点（dc+nyq ≥ 4）时解析剥离后
 // 剩余幅频 R(0) 的动态范围随阶数爆炸（≈ (1/w_c)^{2k}），截断 h_rest 再与
@@ -468,14 +481,65 @@ inline bool enforceMinimumPhaseTransmissionZeros(std::vector<double>& coeffs,
     return true;
 }
 
-// 候选拟合误差：在 kMinPhaseFitPoints 个对数间隔角频率上直接 DTFT，取 FIR
-// 与目标 dB 幅频差的最大绝对值，但只统计「实际可用带」内的采样点：
+// 候选的全带 eligibility：在 kMinPhaseEligibilityPoints 个对数间隔角频率
+// w ∈ [pi/65536, 0.999*pi] 上直接 DTFT，返回 false（不合格）当：
+//   · 任一 target ≥ -80 dB 的点满足 |firDb - targetDb| > 6.0 dB；或
+//   · fir 峰值 dB > target 峰值 dB + 3.0 dB（候选在目标之上振铃 / 过冲）。
+// 这两个判据与带内拟合完全独立，是「高频截断振铃」的唯一防线：解析剥离
+// 候选的 h_rest 截断 + 因子卷积在高频（>500 Hz 至 Nyquist）产生 28–97 dB
+// 偏差，带内拟合（≤500 Hz）看不到；提高过采样倍率也不能修（h_rest 的
+// 剩余幅频 R = target / factor 在低频端有 ~(fs/fc)^{2k} 的巨大动态范围，
+// 截断误差在高频被放大）。
+// 用相位递推（复步长连乘）代替每抽头的 cos/sin，误差仅 ~1e-14 rad/65536
+// 抽头，远低于 6 dB 判据。
+template <typename MagnitudeFn>
+inline bool minimumPhaseFullBandEligible(const std::vector<double>& coeffs,
+                                         MagnitudeFn& magnitude)
+{
+    const double start = kPi / 65536.0;
+    const double end = 0.999 * kPi;
+    const double ratio = end / start;
+
+    double firPeakDb = -std::numeric_limits<double>::infinity();
+    double targetPeakDb = -std::numeric_limits<double>::infinity();
+    bool eligible = true;
+
+    for (int k = 0; k < kMinPhaseEligibilityPoints; ++k)
+    {
+        const double w = start * std::pow(ratio, static_cast<double>(k) / (kMinPhaseEligibilityPoints - 1));
+        const std::complex<double> step(std::cos(w), -std::sin(w));
+        std::complex<double> phase(1.0, 0.0);
+        std::complex<double> response(0.0, 0.0);
+        for (double c : coeffs)
+        {
+            response += c * phase;
+            phase *= step;
+        }
+
+        const double firDb = 20.0 * std::log10(std::abs(response) + 1.0e-12);
+        const double targetDb = 20.0 * std::log10(magnitude(w) + 1.0e-12);
+        firPeakDb = std::max(firPeakDb, firDb);
+        targetPeakDb = std::max(targetPeakDb, targetDb);
+
+        if (targetDb >= kMinPhaseEligibilityTargetFloorDb
+            && std::abs(firDb - targetDb) > kMinPhaseEligibilityMaxErrorDb)
+            eligible = false;
+    }
+
+    if (firPeakDb > targetPeakDb + kMinPhaseEligibilityMaxPeakOvershootDb)
+        eligible = false;
+
+    return eligible;
+}
+
+// 候选带内拟合误差：在 kMinPhaseFitPoints 个对数间隔角频率上直接 DTFT，
+// 取 FIR 与目标 dB 幅频差的最大绝对值，但只统计「实际可用带」内的采样点：
 //   · 目标幅度不低于本次采样最大值的 1/2（−6 dB），排除阻带（+1e-12 的
 //     −240 dB 地板会让阻带点主导 dB 误差）；
-//   · 频率不超过 min(500 Hz, 0.45·fs)：本插件是 0.5–500 Hz 的超低频 EQ，
-//     500 Hz 以上目标恒为 1，而解析剥离候选在高频的截断误差与本任务无关，
-//     若纳入选优会压过真正的低通带精度（实测 96k 单 HP 会因此选中通带
-//     差 2.3 dB 的 legacy 而非 0.29 dB 的解析候选）。
+//   · 频率不超过 min(500 Hz, 0.45·fs)：本插件是 0.5–500 Hz 的超低频 EQ。
+// 注意：该度量只负责在「已通过全带 eligibility 的候选」之间挑出带内最准
+// 的一个；高频截断振铃由 minimumPhaseFullBandEligible 负责，不能只看本
+// 度量（0.4.5 复审 P1 的根因正是只按带内拟合选优）。
 // sampleRateHz ≤ 0 时退回纯 −6 dB 门限（全带），供无采样率信息的调用方使用。
 // 用相位递推（复步长连乘）代替每个抽头的 cos/sin，误差仅 ~1e-14 rad/65536
 // 抽头，远低于 dB 判据。
@@ -540,19 +604,32 @@ inline double minimumPhaseFitError(const std::vector<double>& coeffs, MagnitudeF
 //   · 调用方按滤波器拓扑给出精确零点阶数（高通 DC=2、低通 Nyquist=2、
 //     带通各 1、级联累加）：在三个候选间选优——
 //       ① 解析剥离 os=1，② 解析剥离 os=4，③ legacy 自动路径（0.4.4）。
-//     每个候选先做有限性检查与 max|h| ≤ kMinPhaseMaxTapMagnitude 的 sanity
-//     gate（多节点零点时解析剥离会灾难性相消、产生 1e4…1e50 尖峰），通过
-//     gate 后再做精确零点投影，最后用「可用带对齐」的拟合误差选最优。
+//     每个候选先做有限性检查、max|h| ≤ kMinPhaseMaxTapMagnitude 的 sanity
+//     gate（多节点零点时解析剥离会灾难性相消、产生 1e4…1e50 尖峰）与精确
+//     零点投影，然后分两步筛选：
+//       1) 全带 eligibility（detail::minimumPhaseFullBandEligible）：128 点
+//          直接 DTFT，target ≥ -80 dB 处 |ΔdB| ≤ 6 dB 且峰值不过冲 3 dB。
+//          它剔除解析候选在高频（>500 Hz 至 Nyquist）的截断振铃——带内拟合
+//          完全看不到这些点（0.4.5 复审 P1 根因：96 kHz/N=4096/HP30 Q0.707
+//          在 15 kHz 偏 −20 dB、HP30+BP100 在 20 kHz 偏 +22 dB，同 cell
+//          0.4.4 legacy ≤0.04 dB）。
+//       2) 只在通过 eligibility 的候选之间，用「可用带对齐」的带内拟合误差
+//          （f ≤ min(500 Hz, 0.45·fs)，target ≥ -6 dB）选最优。
 //     · 单节点（dc+nyq == 2）：投影整阶结构零点（H(0)=H'(0)=0 或 Nyquist
 //       对称），解析候选本身已精确、legacy 候选（近极限 cell）经投影后同样
 //       精确——回归测试的 1e-9 断言对单节点始终成立。
-//     · 多节点（dc+nyq ≥ 4）：解析候选被 gate 丢弃，legacy 候选兜底（实测
-//       通带误差 0.01–3.7 dB）；只把每个传输零点的 H(0)/H(π) 修正到精确
-//       零（一阶投影），更高阶矩保留 legacy 近似（测试判据本身即 <1e-3）。
-//     没有任何可用候选时回退 legacy，legacy 仍无效则回退冲激。
-//     sampleRateHz > 0 时把候选选优的拟合带限制在 min(500 Hz, 0.45·fs) 内
-//     （本插件是 0.5–500 Hz 超低频 EQ；不传则用全带，行为退化为 0.4.5）。
-//     解析路径的 latencyOut 仍为 0。
+//     · 多节点（dc+nyq ≥ 4）：解析候选通常被 sanity gate 或全带 eligibility
+//       丢弃（少数（如 HP30+BP100）能过 max|h| gate 但高频偏差 50 dB+，由
+//       eligibility 剔除），legacy 候选兜底；只把每个传输零点的 H(0)/H(π)
+//       修正到精确零（一阶投影），更高阶矩保留 legacy 近似。
+//     若所有候选都不合格，回退 legacy（即使 legacy 也不合格：它仍是 0.4.4
+//     验证过的安全基线，且新矩阵在低采样 bin 以下的深衰减目标上物理不可
+//     分辨——实测连「理想 IIR 截断」都有 47 dB 偏差）；legacy 非有限时回退
+//     冲激。候选合格性与 legacy 回退都不依赖带内拟合，故高频不再可能因
+//     带内指标占优而被选中。
+//     sampleRateHz > 0 时把候选**带内拟合**的带宽限制在 min(500 Hz, 0.45·fs)
+//     内（本插件是 0.5–500 Hz 超低频 EQ）；全带 eligibility 始终覆盖
+//     [π/65536, 0.999π]，与 sampleRateHz 无关。解析路径的 latencyOut 仍为 0。
 template <typename MagnitudeFn>
 inline std::vector<double> designMinimumPhaseFIR(MagnitudeFn magnitude, int firLength, int& latencyOut,
                                                  int dcZeroOrder = 0, int nyquistZeroOrder = 0,
@@ -577,9 +654,26 @@ inline std::vector<double> designMinimumPhaseFIR(MagnitudeFn magnitude, int firL
     const int dcMoments = singleNode ? dcZeroOrder : (dcZeroOrder > 0 ? 1 : 0);
     const int nyqMoments = singleNode ? nyquistZeroOrder : (nyquistZeroOrder > 0 ? 1 : 0);
 
-    auto applyZeroProjection = [&] (std::vector<double>& coeffs)
+    // 候选预处理：长度 / 有限性 / max|h| sanity gate / 精确零点投影。
+    // 返回 false 表示候选不可用。
+    auto prepareCandidate = [&] (std::vector<double>& coeffs)
     {
-        // 投影失败（小系统奇异）时保留候选的近似零点，不因此丢弃候选。
+        if (static_cast<int>(coeffs.size()) != firLength)
+            return false;
+
+        double peak = 0.0;
+        for (double value : coeffs)
+        {
+            if (!std::isfinite(value))
+                return false;
+            peak = std::max(peak, std::abs(value));
+        }
+        if (peak > kMinPhaseMaxTapMagnitude)
+            return false;
+
+        // 精确零点投影（阶数 ≤ kMaxExactZeroProjectionOrder；对已经精确的
+        // 解析候选是 1e-15 量级的无操作修正）。投影失败（小系统奇异）时
+        // 保留候选的近似零点，不因此丢弃候选；只拒绝非有限结果。
         detail::enforceMinimumPhaseTransmissionZeros(coeffs, dcMoments, nyqMoments);
         for (double value : coeffs)
             if (!std::isfinite(value))
@@ -587,57 +681,52 @@ inline std::vector<double> designMinimumPhaseFIR(MagnitudeFn magnitude, int firL
         return true;
     };
 
-    std::vector<double> best;
+    std::vector<double> bestEligible;
     double bestFitError = std::numeric_limits<double>::infinity();
+    std::vector<double> legacyFallback;
+    bool legacyUsable = false;
 
-    auto consider = [&] (std::vector<double> coeffs)
+    auto consider = [&] (std::vector<double> coeffs, bool isLegacy)
     {
-        if (static_cast<int>(coeffs.size()) != firLength)
+        if (!prepareCandidate(coeffs))
             return;
 
-        // 有限性 + 抽头峰值 sanity gate：丢弃灾难性相消的解析候选。
-        double peak = 0.0;
-        for (double value : coeffs)
+        // legacy 候选单独留一份（无论是否合格），作为「全部不合格」时的
+        // 安全基线：它是不带解析剥离的 0.4.4 路径，不会有高频截断振铃。
+        if (isLegacy)
         {
-            if (!std::isfinite(value))
-                return;
-            peak = std::max(peak, std::abs(value));
+            legacyFallback = coeffs;
+            legacyUsable = true;
         }
-        if (peak > kMinPhaseMaxTapMagnitude)
-            return;
 
-        // 精确零点投影（阶数 ≤ kMaxExactZeroProjectionOrder；对已经精确的
-        // 解析候选是 1e-15 量级的无操作修正）。
-        if (!applyZeroProjection(coeffs))
+        // 全带 eligibility 是硬门：不合格的候选连排序都不参与。
+        if (!detail::minimumPhaseFullBandEligible(coeffs, magnitude))
             return;
 
         const double fitError = detail::minimumPhaseFitError(coeffs, magnitude, sampleRateHz);
         if (fitError < bestFitError)
         {
             bestFitError = fitError;
-            best = std::move(coeffs);
+            bestEligible = std::move(coeffs);
         }
     };
 
     const int factoredOversamplings[2] = { 1, kMinPhaseFactoredOversampling };
     for (int oversampling : factoredOversamplings)
         consider(detail::designFactoredMinimumPhase(magnitude, firLength, dcZeroOrder,
-                                                    nyquistZeroOrder, oversampling));
+                                                    nyquistZeroOrder, oversampling),
+                 false);
 
-    std::vector<double> legacy = detail::designLegacyMinimumPhase(magnitude, firLength);
-    consider(legacy);
+    consider(detail::designLegacyMinimumPhase(magnitude, firLength), true);
 
-    if (!best.empty())
-        return best;
+    if (!bestEligible.empty())
+        return bestEligible;
 
-    // 三个候选都被 sanity gate 拒绝：回退 legacy（允许近似零点），仍无效则冲激。
-    bool legacyUsable = static_cast<int>(legacy.size()) == firLength;
-    for (double value : legacy)
-        if (!std::isfinite(value))
-            legacyUsable = false;
-
-    if (legacyUsable && applyZeroProjection(legacy))
-        return legacy;
+    // 三个候选全部不合格（或都被 sanity gate 拒绝）：回退 legacy 作为安全
+    // 基线——兼容 0.4.4 的近似零点 + 本文的精确零点投影。legacy 也不可用
+    // （非有限）时回退冲激。
+    if (legacyUsable)
+        return legacyFallback;
 
     std::vector<double> impulse(static_cast<size_t>(firLength), 0.0);
     impulse[0] = 1.0;

@@ -279,8 +279,10 @@ void FFTProcessor::run()
                 }
             }
 
-            // 传入采样率：候选选优的拟合带限制在本插件的可用带
-            // min(500 Hz, 0.45·fs) 内，避免高频截断误差压过低通带精度。
+            // 传入采样率：带内拟合排序限制在本插件的可用带
+            // min(500 Hz, 0.45·fs) 内；候选在 >500 Hz 至 Nyquist 的正确性由
+            // 设计函数的全带 eligibility 独立把关，不合格候选不会因为带内
+            // 指标占优而被选中（0.4.5 复审 P1 根因）。
             newState->coeffs = designMinimumPhaseFIR(magnitude, firLength, newState->groupDelay,
                                                      dcZeroOrder, nyquistZeroOrder, sr);
         }

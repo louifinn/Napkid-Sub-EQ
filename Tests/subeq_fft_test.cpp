@@ -320,6 +320,46 @@ static double maxFirDbError(const std::vector<double>& h, TargetFn target,
     return maxError;
 }
 
+// 全带幅频误差（v0.4.5 复审 P1 锁定）：与 maxFirDbError 相同，但只统计
+// targetDb >= floorDb 的点——深阻带（-240 dB 地板）的 dB 误差没有物理意义。
+// 用于锁定解析候选在 500 Hz 以上至 Nyquist 的高频截断振铃：带内拟合看不到
+// 这些点，0.4.5 复审实测偏差 28–97 dB。
+template <typename TargetFn>
+static double maxFirDbErrorAboveFloor(const std::vector<double>& h, TargetFn target,
+                                      double lowHz, double highHz, double sampleRate,
+                                      int points, double floorDb)
+{
+    double maxError = 0.0;
+    for (int i = 0; i < points; ++i)
+    {
+        const double fraction = (points > 1) ? static_cast<double>(i) / (points - 1) : 0.0;
+        const double f = lowHz * std::pow(highHz / lowHz, fraction);
+        const double w = 2.0 * kPi * f / sampleRate;
+        const double targetDb = 20.0 * std::log10(target(w) + 1.0e-12);
+        if (targetDb < floorDb)
+            continue;
+        const double firDb = 20.0 * std::log10(firMagnitudeAt(h, w) + 1.0e-12);
+        maxError = std::max(maxError, std::abs(firDb - targetDb));
+    }
+    return maxError;
+}
+
+// 全带断言的物理带宽：上限 0.45·fs（Nyquist 安全上界）；下限取 0.5 Hz 与
+// 一个设计 bin（fs/N）的较大者——低于 1 bin 时目标形状（拐点/深衰减的 dB
+// 斜率）比设计网格还快，任何 N 抽头 FIR 都无法复现：对 3×HP30
+// 96 kHz/N=4096 连「理想 IIR 截断」在 6.5 Hz 都有 47 dB 偏差（矩阵里该
+// cell 的拐点本身只有 1.28 bin）。这与矩阵 cell 的「拐点 <1 bin」跳过是
+// 同一物理判据，不是新增的 bespoke cell 跳过。
+static double fullBandLowHz(double sampleRate, int firLength)
+{
+    return std::max(0.5, sampleRate / static_cast<double>(firLength));
+}
+
+static double fullBandHighHz(double sampleRate)
+{
+    return 0.45 * sampleRate;
+}
+
 // 时域结构零点断言：H(0) = Σ h[n]，H(pi) = Σ h[n](-1)^n。
 static double dcTapSumAbs(const std::vector<double>& h)
 {
@@ -759,11 +799,22 @@ int main()
 
     // ---- Test 11c: 解析 DC/Nyquist 零点矩阵（v0.4.5） ----
     // 单节点：高通目标在 DC 有 2 阶传输零点，候选选优 / 精确零点投影后 h 的
-    // DC 响应必须是精确 0（Σh = 0 的时域相消结构，而非 epsilon 钳位近似），
-    // 且通带上 FIR 的 dB 误差不得显著劣于同目标、同长度的线性相位设计。
+    // DC 响应必须是精确 0（Σh = 0 的时域相消结构，而非 epsilon 钳位近似）。
+    // 三条断言（每个 cell）：
+    //   1) 精确结构零点 |Σh| < 1e-9（LP 用 |Σh(-1)^n|，BP 两者）；
+    //   2) 带内 [fc, min(500, fs/2)] 相对 baseline：selectedErr ≤
+    //      max(linearErr, legacyErr, 1.0) + 0.5 dB。legacyErr 用 3 参
+    //      designMinimumPhaseFIR（= 0.4.4 自动路径）同目标实测，因此既不允许
+    //      比 0.4.4 差，也不需要任何 bespoke bins / Q 跳过；
+    //   3) 全带 [max(0.5, fs/N), 0.45·fs] 200 个对数点，target ≥ -80 dB 的
+    //      点 max |dB 误差| ≤ 6.0 dB（v0.4.5 复审 P1 锁定：解析候选 h_rest
+    //      截断在 >500 Hz 至 Nyquist 产生 28–97 dB 偏差，带内拟合看不到）。
+    //      下限取一个设计 bin：低于 1 bin 的目标形状物理不可分辨（与 cell 的
+    //      「拐点 <1 bin」跳过同一判据；3×HP30 96 kHz/4096 连理想 IIR 截断
+    //      在 6.5 Hz 都有 47 dB 偏差）。
     // 矩阵覆盖 fs × N × fc × Q（含 96 kHz/N=4096/fc=30/Q=2 近极限 cell，
     // 由 legacy 候选 + 零点投影通过，不再跳过），65536 点再抽查三个场景。
-    // 多节点矩阵（级联 4–6 阶零点）见下方独立子块。
+    // 多节点矩阵（级联 4–6 阶零点）与单节点 LP/BP 见下方独立子块。
     {
         const double sampleRates[] = { 44100.0, 48000.0, 96000.0, 192000.0 };
         const int firLengths[] = { 4096, 16384 };
@@ -774,8 +825,11 @@ int main()
         int cellsSkippedUnderOneBin = 0;
         double worstMinPhaseErr = 0.0;
         double worstLinearPhaseErr = 0.0;
-        double worstMargin = -1.0e9;   // minErr - (max(linErr, 1) + 1)，越接近 0 越紧
+        double worstLegacyErr = 0.0;
+        double worstFullBandErr = 0.0;
+        double worstMargin = -1.0e9;   // minErr - (max(linErr, legacyErr, 1) + 0.5)
         std::string worstCell;
+        std::string worstFullCell;
 
         for (double fs : sampleRates)
         for (int N : firLengths)
@@ -802,6 +856,9 @@ int main()
             const std::vector<double> hMin = designMinimumPhaseFIR(target, N, mpLatency, 2, 0, fs);
             int lpLatency = -1;
             const std::vector<double> hLin = designLinearPhaseFIR(target, N, lpLatency);
+            int legacyLatency = -1;
+            // 3 参调用 = 0.4.4 自动路径（无零点标注），作为回归 baseline。
+            const std::vector<double> hLegacy = designMinimumPhaseFIR(target, N, legacyLatency);
 
             const std::string cellName =
                 "fs=" + std::to_string(static_cast<int>(fs))
@@ -823,11 +880,13 @@ int main()
             const double highHz = std::min(500.0, fs * 0.5);
             const double minErr = maxFirDbError(hMin, target, fc, highHz, fs, 100);
             const double linErr = maxFirDbError(hLin, target, fc, highHz, fs, 100);
-            const double allowance = std::max(linErr, 1.0) + 1.0;
+            const double legacyErr = maxFirDbError(hLegacy, target, fc, highHz, fs, 100);
+            const double allowance = std::max(std::max(linErr, legacyErr), 1.0) + 0.5;
             const double margin = minErr - allowance;
 
             worstMinPhaseErr = std::max(worstMinPhaseErr, minErr);
             worstLinearPhaseErr = std::max(worstLinearPhaseErr, linErr);
+            worstLegacyErr = std::max(worstLegacyErr, legacyErr);
             if (margin > worstMargin)
             {
                 worstMargin = margin;
@@ -837,23 +896,146 @@ int main()
             check(minErr <= allowance,
                   "min phase factored matrix: " + cellName + " min-phase "
                       + std::to_string(minErr) + " dB <= max(linear " + std::to_string(linErr)
-                      + " dB, 1 dB) + 1 dB");
+                      + " dB, legacy " + std::to_string(legacyErr) + " dB, 1 dB) + 0.5 dB");
+
+            // 全带（>500 Hz 至 0.45·fs，target ≥ -80 dB 的点）。
+            const double fullLowHz = fullBandLowHz(fs, N);
+            const double fullErr =
+                maxFirDbErrorAboveFloor(hMin, target, fullLowHz, fullBandHighHz(fs), fs, 200, -80.0);
+            worstFullBandErr = std::max(worstFullBandErr, fullErr);
+            if (fullErr > 6.0)
+                worstFullCell = cellName;
+            check(fullErr <= 6.0,
+                  "min phase factored matrix: " + cellName + " full-band max |dB err| "
+                      + std::to_string(fullErr) + " dB <= 6 dB [" + std::to_string(fullLowHz)
+                      + " Hz, " + std::to_string(fullBandHighHz(fs)) + " Hz]");
         }
 
         std::printf("      Test 11c single-node matrix: %d cells, %d skipped (<1 bin), "
-                    "worst min-phase %.3f dB, worst linear-phase %.3f dB, tightest %s (margin %.3f dB)\n",
+                    "worst min-phase %.3f dB, worst linear-phase %.3f dB, worst legacy %.3f dB, "
+                    "worst full-band %.3f dB, tightest %s (margin %.3f dB)\n",
                     cellsRun, cellsSkippedUnderOneBin,
-                    worstMinPhaseErr, worstLinearPhaseErr, worstCell.c_str(), worstMargin);
+                    worstMinPhaseErr, worstLinearPhaseErr, worstLegacyErr,
+                    worstFullBandErr, worstCell.c_str(), worstMargin);
+        if (!worstFullCell.empty())
+            std::printf("      Test 11c single-node: full-band >6 dB cells (last) %s\n",
+                        worstFullCell.c_str());
+
+        // ---- Test 11c 单节点 LP / BP 矩阵：Nyquist 与 DC+Nyquist 零点 ----
+        // 补齐高通之外的拓扑：LowPass 在 Nyquist 有 2 阶传输零点；BandPass
+        // 在 DC 与 Nyquist 各 1 阶（合计 2 阶，仍按整阶精确投影）。断言与
+        // HP 单节点相同（精确零点 1e-9 / 带内相对 baseline / 全带 6 dB），
+        // 覆盖 fs{48k,96k} × N{4096,16384}。
+        {
+            struct SingleNodeSpec
+            {
+                const char* name;
+                double cutoffHz;
+                double q;
+                FilterType type;
+                int dcOrder;
+                int nyqOrder;
+            };
+            const SingleNodeSpec singleSpecs[] =
+            {
+                { "LP200 Q0.707", 200.0, 0.707, FilterType::LowPass,  0, 2 },
+                { "BP100 Q2",     100.0, 2.0,   FilterType::BandPass, 1, 1 },
+            };
+
+            int singleRun = 0;
+            int singleSkipped = 0;
+            double worstSingleIn = 0.0;
+            double worstSingleLin = 0.0;
+            double worstSingleLegacy = 0.0;
+            double worstSingleFull = 0.0;
+
+            for (const SingleNodeSpec& spec : singleSpecs)
+            for (double fs : { 48000.0, 96000.0 })
+            for (int N : { 4096, 16384 })
+            {
+                if (spec.cutoffHz * static_cast<double>(N) / fs < 1.0)
+                {
+                    ++singleSkipped;
+                    continue;
+                }
+                ++singleRun;
+
+                BiquadCoefficients c[2];
+                computeBiquadCoefficients(spec.cutoffHz, 0.0, spec.q, spec.type, fs, c);
+                auto target = [&c] (double w) { return std::abs(biquadResponse(c[0], w)); };
+
+                int mpLatency = -1;
+                const std::vector<double> hMin =
+                    designMinimumPhaseFIR(target, N, mpLatency, spec.dcOrder, spec.nyqOrder, fs);
+                int lpLatency = -1;
+                const std::vector<double> hLin = designLinearPhaseFIR(target, N, lpLatency);
+                int legacyLatency = -1;
+                const std::vector<double> hLegacy = designMinimumPhaseFIR(target, N, legacyLatency);
+
+                const std::string cellName =
+                    std::string("min phase single-node ") + spec.name
+                    + " fs=" + std::to_string(static_cast<int>(fs))
+                    + " N=" + std::to_string(N);
+
+                bool finite = (mpLatency == 0);
+                for (double v : hMin)
+                    if (!std::isfinite(v))
+                        finite = false;
+                check(finite, cellName + " coefficients finite / latency 0");
+
+                if (spec.dcOrder > 0)
+                {
+                    const double dcLeak = dcTapSumAbs(hMin);
+                    check(dcLeak < 1.0e-9,
+                          cellName + " exact DC zero |sum h|=" + std::to_string(dcLeak));
+                }
+                if (spec.nyqOrder > 0)
+                {
+                    const double nyqLeak = nyquistTapSumAbs(hMin);
+                    check(nyqLeak < 1.0e-9,
+                          cellName + " exact Nyquist zero |sum h(-1)^n|=" + std::to_string(nyqLeak));
+                }
+
+                const double highHz = std::min(500.0, fs * 0.5);
+                const double minErr = maxFirDbError(hMin, target, spec.cutoffHz, highHz, fs, 100);
+                const double linErr = maxFirDbError(hLin, target, spec.cutoffHz, highHz, fs, 100);
+                const double legacyErr = maxFirDbError(hLegacy, target, spec.cutoffHz, highHz, fs, 100);
+                const double allowance = std::max(std::max(linErr, legacyErr), 1.0) + 0.5;
+                worstSingleIn = std::max(worstSingleIn, minErr);
+                worstSingleLin = std::max(worstSingleLin, linErr);
+                worstSingleLegacy = std::max(worstSingleLegacy, legacyErr);
+                check(minErr <= allowance,
+                      cellName + " min-phase " + std::to_string(minErr) + " dB <= max(linear "
+                          + std::to_string(linErr) + " dB, legacy " + std::to_string(legacyErr)
+                          + " dB, 1 dB) + 0.5 dB");
+
+                const double fullErr = maxFirDbErrorAboveFloor(
+                    hMin, target, fullBandLowHz(fs, N), fullBandHighHz(fs), fs, 200, -80.0);
+                worstSingleFull = std::max(worstSingleFull, fullErr);
+                check(fullErr <= 6.0,
+                      cellName + " full-band max |dB err| " + std::to_string(fullErr) + " dB <= 6 dB");
+            }
+
+            std::printf("      Test 11c single-node LP/BP matrix: %d cells, %d skipped (<1 bin), "
+                        "worst min-phase %.3f dB, worst linear-phase %.3f dB, worst legacy %.3f dB, "
+                        "worst full-band %.3f dB\n",
+                        singleRun, singleSkipped, worstSingleIn, worstSingleLin,
+                        worstSingleLegacy, worstSingleFull);
+        }
 
         // ---- Test 11c 多节点矩阵：级联传输零点（dc+nyq ≥ 4） ----
-        // 多个 HP / LP / BP 节点把 DC/Nyquist 零点推到 4–6 阶。该阶数下解析
-        // 剥离的剩余幅频动态范围 ~(1/w_c)^{2k}，截断 h_rest 后与二项式因子
-        // 的双精度卷积会灾难性相消（抽头 1e4…1e50，通带误差数十 dB），候选被
-        // 设计的 max|h| sanity gate 丢弃、由 legacy 候选兜底。因此这里的零点
-        // 断言按 legacy 近似放宽到 |H(0)| / |H(π)| < 1e-3（设计内一阶投影已把
-        // 这两个值修到 1e-15 量级），通带阈值允许放宽到 +1.5 dB——实测最差
-        // 0.93 dB，故仍按 +1 dB 断言。矩阵覆盖 {2×HP(20+40), 3×HP30, 2×LP200,
-        // HP30+BP100(dc=3,nyq=1)} × fs{48k, 96k} × N{4096, 16384}。
+        // 多个 HP / LP / BP 节点把 DC/Nyquist 零点推到 4–6 阶。解析剥离的
+        // 剩余幅频 R = target/factor 在该阶数下动态范围 ~(1/w_c)^{2k}，截断
+        // h_rest 后与二项式因子卷积的截断误差被放大：实测多节点候选要么被
+        // max|h| sanity gate 丢弃，要么（HP30+BP100）在高频偏 50–109 dB。
+        // v0.4.5 复审 P1 修复后，候选先过全带 eligibility（6 dB / 峰值过冲
+        // 3 dB）再按带内 fit 选优，全部不合格时回退 legacy——因此这里不再
+        // 为 legacy 近似放宽判据：零点断言收紧到 |H(0)| / |H(π)| < 1e-9
+        // （一阶投影实测 1e-17…1e-15），带内与单节点相同用相对 baseline
+        // （legacyErr 由 3 参调用实测，故不会比 0.4.4 差），并新增全带
+        // [max(0.5, fs/N), 0.45·fs] 的 6 dB 断言。矩阵覆盖
+        // {2×HP(20+40), 3×HP30, 2×LP200, HP30+BP100(dc=3,nyq=1)}
+        // × fs{48k, 96k} × N{4096, 16384}。
         {
             struct MultiNodeStage { double cutoffHz; double q; FilterType type; };
             struct MultiNodeSpec
@@ -905,6 +1087,8 @@ int main()
             int multiSkipped = 0;
             double worstMultiErr = 0.0;
             double worstMultiLinErr = 0.0;
+            double worstMultiLegacyErr = 0.0;
+            double worstMultiFullErr = 0.0;
             double worstMultiPeak = 0.0;
 
             for (const MultiNodeSpec& spec : multiSpecs)
@@ -943,6 +1127,8 @@ int main()
                     designMinimumPhaseFIR(target, N, mpLatency, spec.dcOrder, spec.nyqOrder, fs);
                 int lpLatency = -1;
                 const std::vector<double> hLin = designLinearPhaseFIR(target, N, lpLatency);
+                int legacyLatency = -1;
+                const std::vector<double> hLegacy = designMinimumPhaseFIR(target, N, legacyLatency);
 
                 const std::string cellName =
                     std::string("min phase multi-node matrix: ") + spec.name
@@ -962,31 +1148,42 @@ int main()
                 if (spec.dcOrder > 0)
                 {
                     const double dcLeak = dcTapSumAbs(hMin);
-                    check(dcLeak < 1.0e-3,
-                          cellName + " DC zero |sum h| < 1e-3 (" + std::to_string(dcLeak) + ")");
+                    check(dcLeak < 1.0e-9,
+                          cellName + " DC zero |sum h| < 1e-9 (" + std::to_string(dcLeak) + ")");
                 }
                 if (spec.nyqOrder > 0)
                 {
                     const double nyqLeak = nyquistTapSumAbs(hMin);
-                    check(nyqLeak < 1.0e-3,
-                          cellName + " Nyquist zero |sum h(-1)^n| < 1e-3 ("
+                    check(nyqLeak < 1.0e-9,
+                          cellName + " Nyquist zero |sum h(-1)^n| < 1e-9 ("
                               + std::to_string(nyqLeak) + ")");
                 }
 
                 const double highHz = std::min(spec.passHighHz, fs * 0.5);
                 const double minErr = maxFirDbError(hMin, target, spec.passLowHz, highHz, fs, 100);
                 const double linErr = maxFirDbError(hLin, target, spec.passLowHz, highHz, fs, 100);
-                const double allowance = std::max(linErr, 1.0) + 1.0;
+                const double legacyErr = maxFirDbError(hLegacy, target, spec.passLowHz, highHz, fs, 100);
+                const double allowance = std::max(std::max(linErr, legacyErr), 1.0) + 0.5;
                 worstMultiErr = std::max(worstMultiErr, minErr);
                 worstMultiLinErr = std::max(worstMultiLinErr, linErr);
+                worstMultiLegacyErr = std::max(worstMultiLegacyErr, legacyErr);
                 check(minErr <= allowance,
                       cellName + " min-phase " + std::to_string(minErr) + " dB <= max(linear "
-                          + std::to_string(linErr) + " dB, 1 dB) + 1 dB");
+                          + std::to_string(linErr) + " dB, legacy " + std::to_string(legacyErr)
+                          + " dB, 1 dB) + 0.5 dB");
+
+                const double fullErr = maxFirDbErrorAboveFloor(
+                    hMin, target, fullBandLowHz(fs, N), fullBandHighHz(fs), fs, 200, -80.0);
+                worstMultiFullErr = std::max(worstMultiFullErr, fullErr);
+                check(fullErr <= 6.0,
+                      cellName + " full-band max |dB err| " + std::to_string(fullErr) + " dB <= 6 dB");
             }
 
             std::printf("      Test 11c multi-node matrix: %d cells, %d skipped (<1 bin), "
-                        "worst min-phase %.3f dB, worst linear-phase %.3f dB, worst peak %.3e\n",
-                        multiRun, multiSkipped, worstMultiErr, worstMultiLinErr, worstMultiPeak);
+                        "worst min-phase %.3f dB, worst linear-phase %.3f dB, worst legacy %.3f dB, "
+                        "worst full-band %.3f dB, worst peak %.3e\n",
+                        multiRun, multiSkipped, worstMultiErr, worstMultiLinErr,
+                        worstMultiLegacyErr, worstMultiFullErr, worstMultiPeak);
         }
 
         // ---- 65536 点抽查：高采样率低频 HP、低 Q HP、Nyquist 零点 LP ----
@@ -1020,6 +1217,8 @@ int main()
                 designMinimumPhaseFIR(target, spotN, mpLatency, s.dcOrder, s.nyqOrder, s.fs);
             int lpLatency = -1;
             const std::vector<double> hLin = designLinearPhaseFIR(target, spotN, lpLatency);
+            int legacyLatency = -1;
+            const std::vector<double> hLegacy = designMinimumPhaseFIR(target, spotN, legacyLatency);
 
             const std::string spotName = std::string("min phase factored 65536: ") + s.name;
 
@@ -1044,9 +1243,17 @@ int main()
             const double highHz = std::min(500.0, s.fs * 0.5);
             const double minErr = maxFirDbError(hMin, target, s.fc, highHz, s.fs, 100);
             const double linErr = maxFirDbError(hLin, target, s.fc, highHz, s.fs, 100);
-            check(minErr <= std::max(linErr, 1.0) + 1.0,
+            const double legacyErr = maxFirDbError(hLegacy, target, s.fc, highHz, s.fs, 100);
+            const double allowance = std::max(std::max(linErr, legacyErr), 1.0) + 0.5;
+            check(minErr <= allowance,
                   spotName + " min-phase " + std::to_string(minErr) + " dB <= max(linear "
-                      + std::to_string(linErr) + " dB, 1 dB) + 1 dB");
+                      + std::to_string(linErr) + " dB, legacy " + std::to_string(legacyErr)
+                      + " dB, 1 dB) + 0.5 dB");
+
+            const double fullErr = maxFirDbErrorAboveFloor(
+                hMin, target, fullBandLowHz(s.fs, spotN), fullBandHighHz(s.fs), s.fs, 200, -80.0);
+            check(fullErr <= 6.0,
+                  spotName + " full-band max |dB err| " + std::to_string(fullErr) + " dB <= 6 dB");
         }
     }
 
