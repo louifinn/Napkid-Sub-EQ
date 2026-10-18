@@ -1257,6 +1257,95 @@ int main()
         }
     }
 
+    // ---- Test 11d: 合法高增益目标不得被 max|h| sanity gate 误杀 ----
+    // 回归 v0.4.5 round 3 复审 P2：`max|h| ≤ 1e3` 的 sanity gate 本意是探
+    // 测多节点解析剥离的灾难性相消，却同时作用到 legacy 兜底候选——一个
+    // 合法的高增益级联（HP30 + 2×LowShelf(+24@200) + 2×HighShelf(+24@200)
+    // + master +24，通带 +72 dB ⇒ 峰值 ≈4e3）会让三个候选全被拒绝，最终
+    // 返回单位冲激：peak=1、Σh=1（HP 的 DC 零点丢失）、100 Hz/1 kHz 偏 −72 dB。
+    // 0.4.4 三参路径同目标返回 peak≈3966.86、误差 −0.08/0.00 dB。
+    // 修复后 legacy 兜底候选不受峰值 gate 约束（它是 0.4.4 安全基线），且
+    // factored 候选不合格时直接返回它。
+    {
+        const double fs = 48000.0;
+        const int N = 4096;
+
+        BiquadCoefficients hp[2];
+        computeBiquadCoefficients(30.0, 0.0, 0.707, FilterType::HighPass, fs, hp);
+        BiquadCoefficients lowShelf[2];
+        computeBiquadCoefficients(200.0, 24.0, 0.707, FilterType::LowShelf, fs, lowShelf);
+        BiquadCoefficients highShelf[2];
+        computeBiquadCoefficients(200.0, 24.0, 0.707, FilterType::HighShelf, fs, highShelf);
+        const double masterGain = dbToGain(24.0);   // +24 dB master
+
+        // HP30 × LowShelf(+24)² × HighShelf(+24)² × master(+24) = 合法 +72 dB 级联。
+        auto target = [&] (double w)
+        {
+            double mag = std::abs(biquadResponse(hp[0], w));
+            mag *= std::abs(biquadResponse(lowShelf[0], w));
+            mag *= std::abs(biquadResponse(lowShelf[0], w));
+            mag *= std::abs(biquadResponse(highShelf[0], w));
+            mag *= std::abs(biquadResponse(highShelf[0], w));
+            return mag * masterGain;
+        };
+
+        int mpLatency = -1;
+        const std::vector<double> hMin = designMinimumPhaseFIR(target, N, mpLatency, 2, 0, fs);
+        int legacyLatency = -1;
+        // 3 参调用 = 0.4.4 自动路径（无零点标注），作为高增益兜底 baseline。
+        const std::vector<double> hLegacy = designMinimumPhaseFIR(target, N, legacyLatency);
+        int lpLatency = -1;
+        const std::vector<double> hLin = designLinearPhaseFIR(target, N, lpLatency);
+
+        const std::string cellName = "min phase high-gain +72 dB: fs=48000 N=4096 dc=2";
+
+        bool finite = (mpLatency == 0);
+        bool hasInf = false;
+        for (double v : hMin)
+        {
+            if (!std::isfinite(v))
+                finite = false;
+            if (std::isinf(v))
+                hasInf = true;
+        }
+        check(finite && !hasInf, cellName + " coefficients finite (no NaN/Inf) / latency 0");
+
+        const double peak = maxTapMagnitude(hMin);
+        check(peak > 1.0,
+              cellName + " not a unit impulse (max|h|=" + std::to_string(peak) + " > 1)");
+
+        // h[0] 冲激判据的显式复核：单位冲激 h = [1,0,0,...]（修复前实测）。
+        bool impulseLike = std::abs(hMin[0] - 1.0) < 1e-12;
+        for (int i = 1; i < N && impulseLike; ++i)
+            if (std::abs(hMin[static_cast<size_t>(i)]) > 1e-12)
+                impulseLike = false;
+        check(!impulseLike, cellName + " h[0] does not satisfy the unit-impulse criterion");
+
+        // HP 的 DC 传输零点：结构相消必须精确（修复前 h 是冲激，Σh = 1）。
+        const double dcLeak = dcTapSumAbs(hMin);
+        check(dcLeak < 1.0e-6,
+              cellName + " exact DC zero |sum h|=" + std::to_string(dcLeak) + " < 1e-6");
+
+        // 通带 [fc, 500 Hz]：相对线性相位 / 3 参 legacy 的 max + 0.5 dB，且
+        // 绝对不超过 2 dB（高增益目标不应因兜底而损失通带精度）。
+        const double highHz = std::min(500.0, fs * 0.5);
+        const double minErr = maxFirDbError(hMin, target, 30.0, highHz, fs, 100);
+        const double linErr = maxFirDbError(hLin, target, 30.0, highHz, fs, 100);
+        const double legacyErr = maxFirDbError(hLegacy, target, 30.0, highHz, fs, 100);
+        const double allowance = std::max(linErr, legacyErr) + 0.5;
+
+        std::printf("      Test 11d high-gain +72 dB: peak %.6f, |sum h| %.3e, "
+                    "passband err %.4f dB (linear %.4f, legacy %.4f)\n",
+                    peak, dcLeak, minErr, linErr, legacyErr);
+
+        check(minErr <= allowance,
+              cellName + " passband " + std::to_string(minErr) + " dB <= max(linear "
+                  + std::to_string(linErr) + ", legacy " + std::to_string(legacyErr)
+                  + ") + 0.5 dB");
+        check(minErr <= 2.0,
+              cellName + " passband " + std::to_string(minErr) + " dB <= 2 dB");
+    }
+
     // ---- Test 12: convolutionFftSize / nextPowerOfTwo extra cases ----
     {
         check(nextPowerOfTwo(1) == 1, "nextPow2(1) == 1");
