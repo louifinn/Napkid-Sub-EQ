@@ -249,9 +249,43 @@ void FFTProcessor::run()
 
         auto magnitude = [&](double w) { return designEngine.getMagnitudeLinear(w); };
         if (mode == EQMode::LinearPhase)
+        {
             newState->coeffs = designLinearPhaseFIR(magnitude, firLength, newState->groupDelay);
+        }
         else
-            newState->coeffs = designMinimumPhaseFIR(magnitude, firLength, newState->groupDelay);
+        {
+            // 解析统计设计目标的 DC / Nyquist 传输零点阶数，供最小相位设计
+            // 剥离奇点：高通在 DC、低通在 Nyquist 各 2 阶，带通各 1 阶，其余
+            // 类型无传输零点。旁路时 magnitude 回调恒为 1.0（无零点），
+            // 因此零点计数也归零——否则解析路径会凭空剥离不存在的因子。
+            int dcZeroOrder = 0;
+            int nyquistZeroOrder = 0;
+            if (!designEngine.isBypassed())
+            {
+                for (int i = 0; i < EQEngine::MaxNodes; ++i)
+                {
+                    const auto& node = designEngine.getNode(i);
+                    if (!node.isEnabled())
+                        continue;
+
+                    switch (node.getType())
+                    {
+                        case FilterType::HighPass: dcZeroOrder += 2;      break;
+                        case FilterType::LowPass:  nyquistZeroOrder += 2; break;
+                        case FilterType::BandPass: ++dcZeroOrder;
+                                                   ++nyquistZeroOrder;    break;
+                        default: break;
+                    }
+                }
+            }
+
+            // 传入采样率：带内拟合排序限制在本插件的可用带
+            // min(500 Hz, 0.45·fs) 内；候选在 >500 Hz 至 Nyquist 的正确性由
+            // 设计函数的全带 eligibility 独立把关，不合格候选不会因为带内
+            // 指标占优而被选中（0.4.5 复审 P1 根因）。
+            newState->coeffs = designMinimumPhaseFIR(magnitude, firLength, newState->groupDelay,
+                                                     dcZeroOrder, nyquistZeroOrder, sr);
+        }
 
         // Pre-compute the frequency-domain filter for overlap-add convolution
         newState->convFFTSize = convolutionFftSize(firLength, ConvBlockLen);
