@@ -554,6 +554,37 @@ int main()
         check(finite2, "overlap-add recovers after NaN poisoning");
     }
 
+    // ---- Test 5c: F6——有限但超出输出类型范围的卷积值不得变成 float inf ----
+    {
+        const int M = 512, L = 1024;
+        OlaChannelState st;
+        st.inputBlock.assign(M, { 0.0, 0.0 });
+        st.pos = 0;
+        st.overlap.assign(L, 0.0);
+        st.outQueue.reserve(M * 2);
+        st.outRead = 0;
+
+        std::vector<std::complex<double>> h(L, { 0.0, 0.0 });
+        h[0] = { 1.0e39, 0.0 };   // 有限 double，但远超 float 上限
+        std::vector<std::complex<double>> scratch(L);
+        std::vector<float> in(static_cast<size_t>(M * 2), 1.0f);
+        std::vector<float> out(static_cast<size_t>(M * 2), 0.0f);
+
+        processOlaChannel(st, in.data(), out.data(), M * 2, M, L, h.data(), scratch);
+
+        bool finite = true;
+        bool allZero = true;
+        for (float v : out)
+        {
+            if (!std::isfinite(v))
+                finite = false;
+            if (v != 0.0f)
+                allZero = false;
+        }
+        check(finite, "F6: finite over-range convolution output is contained (no float inf)");
+        check(allZero, "F6: over-range block output is zeroed and accumulator flushed");
+    }
+
     // ---- Test 6: overlap-add with long FIR (N=16384) ----
     {
         std::mt19937 rng(5);

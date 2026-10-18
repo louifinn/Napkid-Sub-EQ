@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <limits>
 #include <vector>
 
 #include "SubEQ_DSPMath.h"
@@ -76,10 +77,15 @@ inline void processOlaChannel(OlaChannelState& st,
             ifftInPlace(scratch.data(), L);
 
             bool poisoned = false;
+            // F6：卷积累加始终是 double；即使结果有限，也可能超出输出类型
+            // T（音频路径为 float）的可表示范围——此时 static_cast<T> 会变成
+            // ±inf。输出类型无法表示的有限值按污染处理（该块输出置零并冲刷
+            // 累加器），与 NaN/Inf 同一路径，保证音频输出永不为 inf。
+            const double maxRepresentable = static_cast<double>(std::numeric_limits<T>::max());
             for (int i = 0; i < M; ++i)
             {
                 double y = scratch[i].real() + st.overlap[i];
-                if (std::isnan(y) || std::isinf(y))
+                if (!std::isfinite(y) || std::abs(y) > maxRepresentable)
                 {
                     y = 0.0;
                     poisoned = true;
