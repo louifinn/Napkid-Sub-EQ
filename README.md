@@ -40,7 +40,8 @@ Napkid Sub EQ 是一款专为低频信号处理设计的参量均衡器插件。
 - **实时延迟显示**：底部面板实时显示当前模式的延迟量（ms / samples）
 - **实时相位响应曲线**：在三种处理模式都显示，与幅频曲线同步。Zero Latency 模式为 IIR 相位；Minimum / Linear Phase 模式为扣除 FIR 群延迟后的剩余相位（excess phase），Linear Phase 因此近似平坦 0°；后台发布新设计后曲线自动刷新
 - **实时频谱分析（v0.4.0 起为多采样率 VQT 引擎）**：输入/输出双频谱曲线，0.5~500 Hz 全十倍频程独立估计（旧 FFT 引擎在 ~6 Hz 以下由 bin 插值伪造）；1/6 或 1/12 倍频程密度、三档分辨率、四种分析窗（Hann/Blackman/B-Harris/Nuttall）、15/30/60 Hz 刷新率均可选
-- **频谱显示平滑（v0.4.1）**：频域段间平滑（功率域 Hann 权重核，Off / 1/6 / 1/3 / 2/3 倍频程可选，默认 1/6）；时间包络在功率域运行并按各分析层真实间隔归一化——全频段统一 ~180 dB/s 匀速下落，修复底部频谱释放拖尾
+- **频谱显示平滑（v0.4.1）**：频域段间平滑（功率域 Hann 权重核，Off / 1/6 / 1/3 / 2/3 倍频程可选，v0.5.0 起默认 Off）；时间包络在功率域运行并按各分析层真实间隔归一化——全频段统一 ~180 dB/s 匀速下落，修复底部频谱释放拖尾
+- **频谱纵轴 24/60 dB（v0.5.0）**：默认 60 dB 全动态范围；图例区 chip 可切到 24 dB 与 EQ 网格对齐的放大视图
 - **便捷交互**：点击创建、拖拽移动、右击删除、滚轮调 Q（HP/LP/Notch/BP 上下拖动调 Q）
 - **双击重置**：Bell/Shelf/Tilt 双击归零增益和 Q，HP/LP/Notch/BP 双击仅重置 Q
 - **ASIO 支持**：低延迟音频接口兼容
@@ -55,16 +56,17 @@ Napkid Sub EQ 是一款专为低频信号处理设计的参量均衡器插件。
 | 增益范围 | -24 dB ~ +24 dB |
 | Q 值范围 | 0.1 ~ 10.0 |
 | 节点数量 | 8 个（独立开关） |
-| 参数数量 | 50（8 节点 × 5 + 主增益 / 旁路 / 模式 / FIR 长度 + 6 个频谱参数） |
+| 参数数量 | 51（8 节点 × 5 + 主增益 / 旁路 / 模式 / FIR 长度 + 7 个频谱参数） |
 | 滤波器精度 | double (64-bit) |
 | 频谱分辨率 | 1/6 倍频程（61 频段，默认）或 1/12 倍频程（121 频段） |
-| 频谱分析引擎 | 多采样率 VQT 滤波器组（10 倍频程层，帧长 2 s 封顶） |
+| 频谱分析引擎 | 多采样率 VQT 滤波器组（10 倍频程层，底部帧长 ≥2 s 的 2 的幂；48 kHz 约 2.73 s） |
 | 频谱分辨率档 | Fast / Balanced / Fine（核长尺度 0.7/1.0/1.5，默认 Balanced） |
 | 频谱分析窗 | Hann / Blackman / B-Harris / Nuttall（默认 B-Harris，-92 dB 旁瓣） |
 | 频谱更新率 | 15 / 30 / 60 Hz 可选（默认 30 Hz） |
 | 频谱分析跳步 | 512 / 1024 / 2048 样本（默认 512，顶层步距、全层实时锁步） |
-| 频谱平滑 | Off / 1/6 / 1/3 / 2/3 oct（默认 1/6，功率域段间平滑） |
-| FIR 长度 | 4096 / 16384 / 65536 点（Linear / Minimum Phase 模式可选） |
+| 频谱平滑 | Off / 1/6 / 1/3 / 2/3 oct（默认 Off，功率域段间平滑） |
+| 频谱纵轴 | 24 dB / 60 dB（默认 60，图例 chip 切换） |
+| FIR 长度 | 标称 4096 / 16384 / 65536 点（Linear 模式内部为 Type-I 4095 / 16383 / 65535 抽头） |
 | 处理模式 | Zero Latency / Linear Phase / Minimum Phase |
 | 处理延迟 | 0 ~ 32767 + 511 样本块延迟（依模式与 FIR 长度而定） |
 | 支持格式 | VST3, Standalone |
@@ -79,7 +81,7 @@ Napkid Sub EQ 是一款专为低频信号处理设计的参量均衡器插件。
 - **DAW**：任何支持 VST3 的宿主
 - **编译器**：Visual Studio 2022 或更高（Projucer 导出目标为 VS2022）
 - **依赖**：JUCE 7.x 框架
-- **可选**：ASIO SDK（用于 standalone 版本的 ASIO 支持）
+- **必需（当前工程配置）**：ASIO SDK（`.jucer` 默认 `JUCE_ASIO=1` 并引用 `D:/Program Files/JUCE/modules/juce_audio_devices/native/asio`）
 
 ---
 
@@ -89,7 +91,7 @@ Napkid Sub EQ 是一款专为低频信号处理设计的参量均衡器插件。
 
 1. 安装 [JUCE](https://juce.com/)（推荐 7.x 版本）
 2. 安装 Visual Studio 2022（包含 C++ 桌面开发工作负载）
-3. （可选）下载 [Steinberg ASIO SDK](https://www.steinberg.net/developers/) 并放置到项目引用路径
+3. 下载 [Steinberg ASIO SDK](https://www.steinberg.net/developers/) 并放置到 `.jucer` 引用的路径（当前为 `D:/Program Files/JUCE/modules/juce_audio_devices/native/asio`，换机需同步修改）
 
 ### 构建步骤
 
@@ -176,13 +178,17 @@ Sub EQ/
 │   ├── SubEQ_NodeInteraction.h      # 增益敏感类型/切换重置/对数 Q 步进（共享纯计算）
 │   ├── SubEQ_Spring.h               # 二阶弹簧积分器（共享纯计算）
 │   ├── SubEQ_FilterType.h           # FilterType 枚举 + int↔枚举映射（共享纯计算）
+│   ├── SubEQ_OutputStage.h          # 后置主增益 ramp / 延迟补偿旁路（共享纯计算）
+│   ├── SubEQ_FIRHistory.h           # T2 输入历史环
+│   ├── SubEQ_FIRSwitchState.h       # warm 边界 / 交叉淡化纯策略
+│   ├── SubEQ_FirResolution.h        # FIR 分辨率评估
 │   └── SubEQ_Editor/
 │       ├── SubEQLookAndFeel.h       # 窗口/节点/网格布局常量（遗留颜色已删除）
 │       ├── FrequencyResponse.h/.cpp # 频响曲线绘制和节点交互
 │       ├── MasterGainSlider.h/.cpp  # 总增益推子
 │       ├── ModeSelector.h/.cpp      # 底部模式选择面板（v0.2.0 新增）
 │       └── DesignSystem/            # 液态玻璃设计系统（颜色/字体/动画/玻璃效果/LookAndFeel）
-│   └── Fonts/                       # 内嵌字体（Avenir.ttf，经 jucer 资源编入 BinaryData）
+│   └── Fonts/                       # 内嵌 Inter Regular/Bold（SIL OFL 1.1，经 jucer 资源编入 BinaryData）
 ├── Builds/VisualStudio2022/         # VS 项目生成目录（gitignored）
 ├── Napkid Sub EQ.jucer              # Projucer 项目文件
 └── README.md                        # 本文件
@@ -228,7 +234,7 @@ Sub EQ/
 ## 已知限制
 
 - **GUI 仅限 Windows**：当前使用 Projucer 的 VS2022 导出目标
-- **频谱极低频段（0.5~1 Hz）的显示摆动**：v0.4.0 起 VQT 引擎在约 4~16 Hz 以上（随窗型/分辨率档）恢复满倍频程分辨；2 s 分析窗封顶下，0.5 Hz 段窗内不足一个完整周期，读数存在 ±2~3 dB 的慢速相位摆动（物理约束，已加镜像抑制缓解；v0.4.1 功率域包络诚实跟随每帧读数，摆动以 ~6 Hz 慢速起伏形式可见）。详见 `Documentation/SubEQ_VQT_Feasibility.md` §8
+- **频谱极低频段（0.5~1 Hz）的显示摆动**：v0.4.0 起 VQT 引擎在约 4~16 Hz 以上（随窗型/分辨率档）恢复满倍频程分辨；v0.5.0 把底部帧长从“≤2 s 的 2 的幂”改为“≥2 s 的 2 的幂”（48 kHz 约 2.73 s），0.5 Hz 段的周期覆盖改善，但窗内仍不足两个完整周期，读数存在慢速相位摆动（物理约束；底部支撑截断与包络平滑只能部分缓解）。详见 `Documentation/SubEQ_VQT_Feasibility.md` §8
 - **频谱噪声底口径**：VQT 段能量按窗 ENBW × 层带宽聚合（层间 2 倍阶梯），噪声底形状与旧"单 bin 取样"不同——更平（每倍频程恒定带宽比例），属预期行为
 - **44.1 kHz 下频谱 CPU 偏高**：2 的幂抽取整除约束使顶层过采样比偏高（约 2 倍于 48 kHz），成本回到旧引擎量级；48/96/192 kHz 不受影响
 - **频谱平滑的峰展宽（v0.4.1）**：段间平滑在驯服噪声起伏的同时会展宽孤立纯音峰——最坏情形（高频孤立单音）1/6 档约 -4.8 dB、1/3 档 -7.0 dB、2/3 档 -9.5 dB；低频段因分析核本就跨段重叠，损失显著更小。需要逐段精确读数时选 Off
@@ -255,7 +261,7 @@ Sub EQ/
   - VST3 SDK: [Apache License 2.0](https://github.com/steinbergmedia/vst3sdk)
   - 官方网站: https://www.steinberg.net/vst3
 
-- **ASIO**（可选，仅 Standalone 版本需要 ASIO 支持）
+- **ASIO**（Standalone 版本使用；当前 `.jucer` 默认开启，构建需要 ASIO SDK）
   - Copyright (c) Steinberg Media Technologies GmbH
   - 专有许可：ASIO SDK License Agreement
   - 官方网站: https://www.steinberg.net/developers/

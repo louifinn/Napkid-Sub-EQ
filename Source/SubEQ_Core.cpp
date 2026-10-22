@@ -68,9 +68,12 @@ void EQNode::update(double freqHz, double gain, double qValue, FilterType type)
     BiquadCoefficients prev[2] = { coeffs[0], coeffs[1] };
 
     numBiquads = computeBiquadCoefficients(freqHz, gainDb, q, type, sampleRate, coeffs);
-    // Safety: force coefficients stable (critical for 0.5Hz + low Q)
+    // Safety: reject non-finite results, then force stability (critical for
+    // 0.5 Hz + low Q). sanitize() is required because NaN comparisons make
+    // isStable()/forceStable() ineffective.
     for (int i = 0; i < numBiquads; ++i)
     {
+        coeffs[i].sanitize();
         if (!coeffs[i].isStable())
             coeffs[i].forceStable();
     }
@@ -94,6 +97,14 @@ void EQNode::update(double freqHz, double gain, double qValue, FilterType type)
     {
         smoothStart[1] = plan.startFromCurrent ? prev[1] : BiquadCoefficients{};
         targetCoeffs[1] = coeffs[1];
+
+        // A biquad starting from identity must not inject stale z1/z2 from a
+        // previous Tilt session into the first samples.
+        if (!plan.startFromCurrent)
+        {
+            for (int ch = 0; ch < MaxChannels; ++ch)
+                states[ch][1].reset();
+        }
     }
     else if (extraBiquadFadeOut)
     {
@@ -128,7 +139,7 @@ std::complex<double> EQNode::getResponse(double w) const noexcept
         return std::complex<double>(1.0, 0.0);
 
     std::complex<double> response = biquadResponse(coeffs[0], w);
-    if (numBiquads > 1)
+    if (numBiquads > 1 || extraBiquadFadeOut)
         response *= biquadResponse(coeffs[1], w);
 
     return response;
@@ -138,19 +149,12 @@ std::complex<double> EQNode::getResponse(double w) const noexcept
 // EQEngine
 //==============================================================================
 
-void EQEngine::prepare(double sr, int maxBlockSize)
+void EQEngine::prepare(double sr)
 {
-    sampleRate = sr;
-    bypassFadeStepPerSample = 1.0 / std::max(sr * 0.015, 1.0);   // ~15 ms bypass fade
-
-    if (tempBufferSize < maxBlockSize)
-    {
-        tempBuffer.malloc(maxBlockSize);
-        tempBufferSize = maxBlockSize;
-    }
+    sampleRate = (std::isfinite(sr) && sr > 0.0) ? sr : 48000.0;
 
     for (int i = 0; i < MaxNodes; ++i)
-        nodes[i].prepare(sr);
+        nodes[i].prepare(sampleRate);
 }
 
 void EQEngine::reset()
@@ -161,69 +165,57 @@ void EQEngine::reset()
 
 void EQEngine::processChannel(const float* input, float* output, int numSamples, int channel)
 {
-    if (numSamples <= 0)
+    if (numSamples <= 0 || output == nullptr)
         return;
 
-    if (tempBufferSize <= 0)
-    {
-        // 未 prepare（宿主异常路径）：直通兜底。
-        // 注意 bypass 不再走瞬时直通——旁路/解除经 ~15 ms 湿/干交叉淡化
-        // （F-008），切换过程中节点链保持处理（热旁路）。
-        std::memcpy(output, input, static_cast<size_t>(numSamples) * sizeof(float));
+    if (input != output && input != nullptr)
+        std::copy(input, input + numSamples, output);
+
+    if (channel < 0 || channel >= EQNode::MaxChannels)
         return;
-    }
 
-    const double masterGainLinear = dbToGain(masterGain);
-
-    // Process in tempBuffer-sized chunks: samplesPerBlock is a contractual
-    // upper bound, but a host that violates it must not overflow the buffer
-    // (heap corruption) — chunking costs nothing in the compliant case.
-    for (int offset = 0; offset < numSamples; offset += tempBufferSize)
-    {
-        const int chunk = std::min(tempBufferSize, numSamples - offset);
-        processChunk(input + offset, output + offset, chunk, channel, masterGainLinear);
-    }
-}
-
-void EQEngine::processChunk(const float* input, float* output, int numSamples, int channel,
-                            double masterGainLinear)
-{
-    // Convert input to double precision
-    for (int i = 0; i < numSamples; ++i)
-        tempBuffer[i] = static_cast<double>(input[i]);
-
-    // Process through each active node in series (enabled or fading out)
-    bool hasNaN = false;
+    // Process each active node over the whole sub-block. No temporary buffer:
+    // the node chain is in-place and a host block of any size is safe.
     for (int n = 0; n < MaxNodes; ++n)
     {
         if (!nodes[n].isActive())
             continue;
 
+        bool hasNaN = false;
         for (int i = 0; i < numSamples; ++i)
         {
-            tempBuffer[i] = nodes[n].process(tempBuffer[i], channel);
-            if (std::isnan(tempBuffer[i]) || std::isinf(tempBuffer[i]))
+            double y = nodes[n].process(static_cast<double>(output[i]), channel);
+            if (!std::isfinite(y))
             {
                 hasNaN = true;
-                tempBuffer[i] = 0.0;
+                y = 0.0;
             }
+            output[i] = static_cast<float>(y);
         }
 
         if (hasNaN)
-        {
             nodes[n].reset(channel);
-            hasNaN = false;
-        }
     }
+}
 
-    // Apply master gain + bypass dry/wet mix, convert back to float (full
-    // dynamic range; no hard clipping here — the host/output stage handles
-    // headroom). 旁路期间 bypassFadeGain 向 0 渐降，输出平滑回到直通。
-    const double dryGain = 1.0 - bypassFadeGain;
-    for (int i = 0; i < numSamples; ++i)
+void EQEngine::processChannels(float* const* channels, int numChannels, int numSamples)
+{
+    if (channels == nullptr || numSamples <= 0)
+        return;
+
+    const int nch = std::min(numChannels, EQNode::MaxChannels);
+
+    for (int offset = 0; offset < numSamples; offset += SmoothingSubBlock)
     {
-        const double wet = tempBuffer[i] * masterGainLinear;
-        output[i] = static_cast<float>(input[i] * dryGain + wet * bypassFadeGain);
+        const int n = std::min(SmoothingSubBlock, numSamples - offset);
+        advanceSmoothing(n);
+
+        for (int ch = 0; ch < nch; ++ch)
+        {
+            if (channels[ch] == nullptr)
+                continue;
+            processChannel(channels[ch] + offset, channels[ch] + offset, n, ch);
+        }
     }
 }
 
@@ -237,6 +229,11 @@ double EQEngine::getMagnitudeLinear(double w) const noexcept
     if (bypass)
         return 1.0;
 
+    return getNodesMagnitudeLinear(w) * dbToGain(masterGain);
+}
+
+double EQEngine::getNodesMagnitudeLinear(double w) const noexcept
+{
     std::complex<double> response(1.0, 0.0);
 
     for (int i = 0; i < MaxNodes; ++i)
@@ -245,11 +242,13 @@ double EQEngine::getMagnitudeLinear(double w) const noexcept
             response *= nodes[i].getResponse(w);
     }
 
-    double mag = std::abs(response) * dbToGain(masterGain);
-    // Clamp to prevent Inf/NaN from propagating into FIR design
-    if (std::isnan(mag) || std::isinf(mag))
+    double mag = std::abs(response);
+    // Clamp to prevent Inf/NaN from propagating into FIR design. The upper
+    // bound must stay above the legal maximum (8 nodes * +24 dB + +24 dB
+    // master = +216 dB ~ 6.3e10).
+    if (!std::isfinite(mag))
         mag = 1.0;
-    return std::clamp(mag, 1.0e-12, 1.0e9);
+    return std::clamp(mag, 1.0e-12, 1.0e13);
 }
 
 double EQEngine::getResponsePhaseDegrees(double w) const noexcept

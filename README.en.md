@@ -42,7 +42,8 @@ It is particularly well suited to:
 - **Real-time latency display**: the bottom panel shows the current mode's latency in ms / samples
 - **Real-time phase response curve**: displayed in all three processing modes, synchronised with the magnitude curve. In Zero Latency mode it is the IIR phase; in Minimum Phase and Linear Phase modes it is the **excess phase** with the FIR bulk (group) delay removed — i.e. the phase deviation left by the FIR's pure delay. Linear Phase therefore reads approximately flat at 0°. The curve refreshes automatically once a new FIR design is published
 - **Real-time spectrum analysis (multi-rate VQT engine since v0.4.0)**: dual input/output spectrum curves, independently estimated over the full ten-octave range from 0.5 to 500 Hz (the old FFT engine faked bins by interpolation below ~6 Hz); 1/6- or 1/12-octave density, three resolution tiers, four analysis windows (Hann/Blackman/B-Harris/Nuttall) and 15/30/60 Hz refresh rate are all selectable
-- **Spectrum display smoothing (v0.4.1)**: frequency-domain inter-band smoothing (power-domain Hann-weighted kernel; Off / 1/6 / 1/3 / 2/3 octave, default 1/6); the time envelope runs in the power domain and is normalised by each analysis tier's true interval — a uniform ~180 dB/s fall rate across the whole band, fixing the slow release tail at the bottom of the spectrum
+- **Spectrum display smoothing (v0.4.1)**: frequency-domain inter-band smoothing (power-domain Hann-weighted kernel; Off / 1/6 / 1/3 / 2/3 octave, default Off since v0.5.0); the time envelope runs in the power domain and is normalised by each analysis tier's true interval — a uniform ~180 dB/s fall rate across the whole band, fixing the slow release tail at the bottom of the spectrum
+- **24/60 dB spectrum axis (v0.5.0)**: 60 dB full range by default; the legend chip switches to a 24 dB zoom aligned with the EQ grid
 - **Convenient interaction**: click to create, drag to move, right-click to delete, scroll wheel to adjust Q (drag vertically to adjust Q for HP/LP/Notch/BP)
 - **Double-click reset**: Bell/Shelf/Tilt reset gain and Q to zero on double-click; HP/LP/Notch/BP only reset Q
 - **ASIO support**: low-latency audio interface compatibility
@@ -57,16 +58,17 @@ It is particularly well suited to:
 | Gain range | -24 dB – +24 dB |
 | Q range | 0.1 – 10.0 |
 | Number of nodes | 8 (independently switchable) |
-| Number of parameters | 50 (8 nodes × 5 + master gain, bypass, EQ mode, FIR length and 6 spectrum parameters) |
+| Number of parameters | 51 (8 nodes × 5 + master gain, bypass, EQ mode, FIR length and 7 spectrum parameters) |
 | Filter precision | double (64-bit) |
 | Spectrum resolution | 1/6 octave (61 bands, default) or 1/12 octave (121 bands) |
-| Spectrum analysis engine | Multi-rate VQT filter bank (10 octave layers, frame length capped at 2 s) |
+| Spectrum analysis engine | Multi-rate VQT filter bank (10 octave layers, bottom-tier frame length = smallest power of two ≥2 s; ~2.73 s @48 kHz) |
 | Spectrum resolution tier | Fast / Balanced / Fine (kernel-length scale 0.7/1.0/1.5, default Balanced) |
 | Spectrum analysis window | Hann / Blackman / B-Harris / Nuttall (default B-Harris, -92 dB sidelobes) |
 | Spectrum update rate | 15 / 30 / 60 Hz selectable (default 30 Hz) |
 | Spectrum analysis hop | 512 / 1024 / 2048 samples (default 512; top-tier stride, all tiers locked in step in real time) |
-| Spectrum smoothing | Off / 1/6 / 1/3 / 2/3 oct (default 1/6, power-domain inter-band smoothing) |
-| FIR length | 4096 / 16384 / 65536 points (selectable in Linear / Minimum Phase modes) |
+| Spectrum smoothing | Off / 1/6 / 1/3 / 2/3 oct (default Off, power-domain inter-band smoothing) |
+| Spectrum axis | 24 dB / 60 dB (default 60; toggle via the legend chip) |
+| FIR length | nominal 4096 / 16384 / 65536 points (Linear mode internally uses Type-I 4095 / 16383 / 65535 taps) |
 | Processing modes | Zero Latency / Linear Phase / Minimum Phase |
 | Processing latency | 0 – 32767 + 511-sample block latency (depending on mode and FIR length) |
 | Supported formats | VST3, Standalone |
@@ -81,7 +83,7 @@ It is particularly well suited to:
 - **DAW**: any VST3-compatible host
 - **Compiler**: Visual Studio 2022 or newer (the Projucer export targets VS2022)
 - **Dependency**: JUCE 7.x framework
-- **Optional**: ASIO SDK (for ASIO support in the standalone build)
+- **Required with the current project config**: ASIO SDK (`.jucer` sets `JUCE_ASIO=1` and references `D:/Program Files/JUCE/modules/juce_audio_devices/native/asio`)
 
 ---
 
@@ -91,7 +93,7 @@ It is particularly well suited to:
 
 1. Install [JUCE](https://juce.com/) (7.x recommended)
 2. Install Visual Studio 2022 (with the Desktop development with C++ workload)
-3. (Optional) Download the [Steinberg ASIO SDK](https://www.steinberg.net/developers/) and place it on the project's reference path
+3. Download the [Steinberg ASIO SDK](https://www.steinberg.net/developers/) into the path referenced by `.jucer` (currently `D:/Program Files/JUCE/modules/juce_audio_devices/native/asio`; update it when moving machines)
 
 ### Build Steps
 
@@ -184,7 +186,7 @@ Sub EQ/
 │       ├── MasterGainSlider.h/.cpp  # master gain fader
 │       ├── ModeSelector.h/.cpp      # bottom mode-selection panel (new in v0.2.0)
 │       └── DesignSystem/            # liquid-glass design system (colours/fonts/animation/glass effects/LookAndFeel)
-│   └── Fonts/                       # embedded fonts (Avenir.ttf, compiled into BinaryData via the jucer resources)
+│   └── Fonts/                       # embedded Inter Regular/Bold (SIL OFL 1.1, compiled into BinaryData via the jucer resources)
 ├── Builds/VisualStudio2022/         # VS project output directory (gitignored)
 ├── Napkid Sub EQ.jucer              # Projucer project file
 └── README.md                        # Chinese README (this file is its English translation, README.en.md)
@@ -231,7 +233,7 @@ One of the design goals of this plugin is processing near-DC control signals. At
 ## Known Limitations
 
 - **GUI is Windows-only**: currently uses the Projucer VS2022 export target
-- **Display wobble in the extreme low-frequency spectrum (0.5–1 Hz)**: since v0.4.0 the VQT engine restores full octave resolution above roughly 4–16 Hz (depending on window/resolution tier); with the 2 s analysis window cap, the 0.5 Hz band contains less than one full cycle within the window, so readings exhibit a slow ±2–3 dB phase wobble (a physical constraint; image rejection has been added to mitigate it; since v0.4.1 the power-domain envelope honestly follows each frame's reading, and the wobble appears as a slow ~6 Hz undulation). See `Documentation/SubEQ_VQT_Feasibility.md` §8
+- **Display wobble in the extreme low-frequency spectrum (0.5–1 Hz)**: since v0.4.0 the VQT engine restores full octave resolution above roughly 4–16 Hz (depending on window/resolution tier); v0.5.0 changes the bottom-tier window from “largest power of two ≤2 s” to “smallest power of two ≥2 s” (~2.73 s @48 kHz), improving cycle coverage, but the 0.5 Hz band still contains fewer than two full cycles, so readings exhibit a slow phase wobble (a physical constraint; image rejection has been added to mitigate it). See `Documentation/SubEQ_VQT_Feasibility.md` §8
 - **Spectrum noise-floor definition**: VQT band energy is aggregated by window ENBW × tier bandwidth (2× steps between tiers), so the noise-floor shape differs from the old "single-bin sampling" — it is flatter (constant bandwidth ratio per octave), which is expected behaviour
 - **Relatively high spectrum CPU at 44.1 kHz**: the power-of-two decimation divisibility constraint makes the top-tier oversampling ratio high (about 2× that at 48 kHz), bringing the cost back to the order of the old engine; 48/96/192 kHz are unaffected
 - **Peak broadening from spectrum smoothing (v0.4.1)**: inter-band smoothing tames noise fluctuation but broadens isolated pure-tone peaks — in the worst case (an isolated high-frequency tone) about -4.8 dB at 1/6, -7.0 dB at 1/3 and -9.5 dB at 2/3; the low-frequency range loses significantly less because its analysis kernel already overlaps bands. Choose Off when precise per-band readings are needed
@@ -258,7 +260,7 @@ This project is built on the following third-party technology stack. The license
   - VST3 SDK: [Apache License 2.0](https://github.com/steinbergmedia/vst3sdk)
   - Official website: https://www.steinberg.net/vst3
 
-- **ASIO** (optional; only the standalone build needs ASIO support)
+- **ASIO** (used by the standalone build; the current `.jucer` enables it, so building requires the ASIO SDK)
   - Copyright (c) Steinberg Media Technologies GmbH
   - Proprietary license: ASIO SDK License Agreement
   - Official website: https://www.steinberg.net/developers/

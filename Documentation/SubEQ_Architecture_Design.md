@@ -1,5 +1,7 @@
 # Sub EQ — 超低频参量均衡器 架构设计方案
 
+> **历史文档说明（v0.5.0）**：本文主体写于 v0.3.x。当前架构以 `AGENTS.md` / `README.md` 为准：50→51 参数、VQT 频谱（非 8192 点 FFT）、窗口 1040×620、MasterGainSlider（非 juce::Slider）、旁路为后置延迟补偿 dry/wet、FIR 为 Type-I 奇数抽头 + T2 影子预热切换。下文涉及旧尺寸/旧参数数的段落保留为历史设计记录。
+
 ## 1. 项目概述
 
 ### 1.1 目标
@@ -90,7 +92,7 @@ struct BiquadState {
 
 ### 3.4 系数更新策略
 
-- **平滑插值（v0.3.0 起）**: 参数改变时系数在约 15ms 内线性过渡（block 级推进，所有通道共享同一进度；凸组合保证插值过程稳定）。设计引擎与 GUI 响应曲线引擎禁用平滑（必须立即显示精确目标系数）
+- **平滑插值（v0.5.0）**: 参数改变时系数在约 15ms 内线性过渡（32 样本子块推进，所有通道共享同一进度；凸组合保证插值过程稳定）。设计引擎与 GUI 响应曲线引擎禁用平滑（必须立即显示精确目标系数）
 - **线程安全**: 系数更新仅在音频线程（`processBlock` 中调用 `updateEQParameters()`）进行。GUI 线程通过 APVTS 修改参数值，但系数计算延迟到下一次音频回调；GUI 使用独立引擎副本（`responseEngine`）绘制响应曲线，引擎仅由音频线程写入
 - **浮点抖动过滤**: 使用 epsilon 容差（0.001）比较参数值，避免 APVTS 原子值的微小抖动触发无意义的系数重算
 
@@ -103,9 +105,9 @@ struct BiquadState {
 | 参数 | 类型 | 范围 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | Master Gain | Float | -24.0 ~ +24.0 dB | 0.0 | 总输出增益（右侧边缘垂直Slider） |
-| Bypass | Bool | true/false | false | 硬旁路 |
+| Bypass | Bool | true/false | false | 后置延迟补偿 dry/wet（v0.5.0） |
 | EQ Mode | Choice | Zero Latency / Minimum Phase / Linear Phase | Zero Latency | 全局处理模式（v0.2.0） |
-| FIR Length | Choice | 4096 / 16384 / 65536 | 4096 | FIR 模式长度（v0.3.0） |
+| FIR Length | Choice | 4096 / 16384 / 65536 | 4096 | 标称长度；Linear 内部为 Type-I 4095/16383/65535 抽头 |
 
 ### 4.2 节点参数（每节点，共 8 个）
 
@@ -134,7 +136,7 @@ struct BiquadState {
 
 > 注：下方示意图保留早期暗色方案供参考；当前视觉采用「液态玻璃」Light 主题（暖白奶色 + #FF007B + 莫兰迪色板，见 §8 颜色主题）。
 
-窗口尺寸：**900 × 620 像素**
+窗口尺寸：**1040 × 620 像素**（v0.4.1 起；本文其余 900×620 段落为历史记录）
 
 ```
 ┌────────────────────────────────────────────────────┬──────────┐
@@ -185,7 +187,7 @@ struct BiquadState {
 
 ### 5.5 总体增益控制
 
-位于界面右侧边缘的垂直 Slider：
+位于界面右侧边缘的自定义 MasterGainSlider（非 juce::Slider）：
 - 范围: -24dB ~ +24dB
 - 默认: 0dB
 - 显示当前数值标签
@@ -205,15 +207,15 @@ Source/
 ├── PluginEditor.cpp         [修改] 实现编辑器布局
 ├── SubEQ_Core.h             [新增] 双精度 Biquad + 节点管理 + 系数平滑
 ├── SubEQ_Core.cpp           [新增] 系数计算 + 信号处理
-├── SubEQ_Parameters.h       [新增] 参数定义、APVTS 布局（48 参数）
+├── SubEQ_Parameters.h       [新增] 参数定义、APVTS 布局（v0.5.0：51 参数）
 ├── SubEQ_DSPMath.h          [修改] 共享 DSP 数学（模板 FFT/IDFT、nextPow2、convolutionFftSize）
 ├── SubEQ_FFTProcessor.h/.cpp [修改] FIR 设计（后台线程）+ overlap-add 卷积
-├── SubEQ_Spectrum.h/.cpp    [新增] 实时频谱分析器 (8192点 FFT)
+├── SubEQ_Spectrum.h/.cpp    [新增] 实时频谱分析器（v0.4.0 起为多采样率 VQT）
 ├── SubEQ_Biquad.h           [新增] 双精度 biquad 系数/状态/频响（共享纯计算，无 JUCE）
 ├── SubEQ_BiquadDesign.h     [新增] RBJ 系数设计（共享纯计算，无 JUCE）
 ├── SubEQ_FIRDesign.h        [新增] 线性/最小相位 FIR 设计（共享纯计算，无 JUCE）
 ├── SubEQ_FFTConvolver.h     [新增] overlap-add 卷积原语（共享纯计算，无 JUCE）
-├── SubEQ_SpectrumMath.h     [新增] octave 频段/Hann/16·N⁻² 校准（共享纯计算）
+├── SubEQ_SpectrumMath.h     [新增] octave 频段/显示平滑/包络（共享纯计算）
 ├── SubEQ_SpectrumConfig.h   [新增] 频谱 choice 下标→语义值解码（共享纯计算）
 ├── SubEQ_CoordinateMapper.h [新增] 频响图坐标映射（共享纯计算）
 ├── SubEQ_NodeInteraction.h  [新增] 增益敏感类型/切换重置/对数 Q 步进（共享纯计算）
@@ -258,7 +260,7 @@ Source/
 | GUI 风格 | **FabFilter Pro-Q2 风格**，左键新建/拖动，右键删除，滚轮调Q，单击选中 |
 | 通道支持 | **仅立体声**（2进2出） |
 | Interface 类 | **移除**，完全手写 GUI |
-| 窗口尺寸 | **900 × 620 像素**，右侧 60px 总增益 Slider，底部 60px 功能面板 |
+| 窗口尺寸 | **1040 × 620 像素**（v0.4.1 起），右侧总增益 MasterGainSlider，底部 60px 功能面板 |
 | 颜色主题 | **暖白奶色（Light 主题）+ 玫瑰粉主色 (#FF007B) + 莫兰迪色板**（液态玻璃设计系统，Dark 主题已移除） |
 | 节点外观 | **统一外径**：选中为白色实心圆，未选中为白色空心圆环（不随 Q 变化） |
 | 节点默认状态 | **全部禁用**（false），初始无活动节点 |
@@ -268,9 +270,9 @@ Source/
 | ASIO 支持 | **已添加**，Standalone 版本可用 |
 | 处理模式 | **三种全局模式**（Zero Latency / Minimum Phase / Linear Phase）+ FIR 长度可选（4096 / 16384 / 65536） |
 
-> **FIR 实现注记**：三种 FIR 长度均为偶数（Type-II 对称），Nyquist 处固有零点；线性相位群延迟 (N-1)/2 含 0.5 样本按整数截断（不可闻）。新设计发布时新旧滤波器经 1024 样本交叉淡化，参数编辑不再冲刷卷积尾（无输出阶跃）；最小相位 FIR 由倒谱法设计（保留 Nyquist 折叠项），双精度抽头。
+> **FIR 实现注记（v0.5.0）**：标称 4096 / 16384 / 65536 在 Linear Phase 内部对应 Type-I 奇数抽头 4095 / 16383 / 65535，群延迟为整数 (N-1)/2，Nyquist 不再被结构性强制为零。切换采用 T2 影子预热：设计 + warm 状态原子发布，音频在 OLA 块边界采纳；同 groupDelay 走 1024 样本交叉淡化（两侧均处理真实输入），异 groupDelay 经 PDC 握手后冲刷切换；warm 落后 ≤4 块时由音频线程追赶，首设计有超时兜底。最小相位 FIR 由倒谱/解析零点法设计，双精度抽头。默认平滑档为 Off，底部 VQT 帧长为“≥2 s 的 2 的幂”。
 
 ---
 
-*文档版本: v0.7*
-*最后更新: 2026-08-13*
+*文档版本: v0.8（v0.5.0 注记）*
+*最后更新: 2026-10-22*

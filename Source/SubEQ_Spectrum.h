@@ -9,7 +9,7 @@
     见 SubEQ_VQTDesign.h）：
       - 10 个倍频程层，顶层从全率降到 ~3 kHz，向下每层 ÷2（级联 ↓2 抗混叠）
       - 每层帧加窗（选定窗型）→ FFT → 每频段频域匹配核点积（分数 bin）
-      - 帧长 = 分辨率需求与 2 s 封顶（pow2 量化）之小者；底部层 gamma 化
+      - 帧长 = 分辨率需求与“≥2 s 的 2 的幂”之小者（48 kHz 底部约 2.73 s）；底部层 gamma 化
       - 满幅正弦落段中心 → 0 dB（与旧 FFT 分析器幅值约定一致）
 
     Runtime-configurable (no allocation on the audio thread):
@@ -73,11 +73,15 @@ public:
     void process(const float* samples, int numSamples);
 
     // Copy spectrum data to output buffer (called from GUI thread). Band
-    // count and data are read element-wise through atomics (no data race /
-    // UB), but they are separate atomics: a reconfiguration landing exactly
-    // inside the copy window can produce one frame of mixed old/new data
-    // (self-heals on the next refresh).
+    // count and data are read element-wise through atomics; a generation
+    // counter retries if a reconfiguration lands inside the copy window, so
+    // the GUI cannot observe a mixed old/new frame.
     int getSpectrum(float* outputBands) const;
+
+    // Clear ring/envelope/display state without changing the configuration.
+    // Called by the audio thread when an editor reopens so old low-frequency
+    // frames cannot be shown again.
+    void resetDisplayState() { resetRuntimeState(); }
 
 private:
     void pushTierSample(int tier, double sample);
@@ -89,7 +93,8 @@ private:
 
     // Runtime config (atomic: written by configure() on the audio thread,
     // read by the GUI thread via the getters)
-    std::atomic<int> numBands { 61 };   // 1/6 octave default
+    std::atomic<int> numBands { 61 };
+    std::atomic<uint32_t> generation { 0 };   // configuration/reset generation
     std::atomic<int> hopSize  { 512 };  // ~10.7 ms @48kHz（顶层步距）
 
     // 音频线程用的非原子镜像（与 configure() 同线程）
@@ -141,7 +146,7 @@ private:
     double bandPowers[MaxBands] {};   // 瞬时功率（满幅正弦落段中心 = 1.0；未分析前 = kDisplayFloorPower）
     double envPowers[MaxBands] {};    // 时间包络状态（复位为 kDisplayFloorPower ≈ -60 dB）
     double bandDbScratch[MaxBands] {}; // 显示 dB 暂存（共享管线的输出，随后收窄 float 发布到 bandData）
-    int smoothRadius = 1;            // 频域平滑核半径（段），configure() 换算
+    int smoothRadius = 0;            // 频域平滑核半径（段），configure() 换算
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(SpectrumAnalyzer)
 };

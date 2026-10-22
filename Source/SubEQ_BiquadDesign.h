@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 
 #include "SubEQ_Biquad.h"
@@ -63,6 +64,26 @@ inline int computeBiquadCoefficients(double freqHz, double gainDb, double qValue
                                      FilterType type, double sampleRate,
                                      BiquadCoefficients out[2])
 {
+    // Host/state boundary hardening: never let NaN or a degenerate sample rate
+    // reach the trigonometric formulas. Identity is the safe fallback.
+    if (out == nullptr)
+        return 1;
+
+    out[0] = BiquadCoefficients{};
+    out[1] = BiquadCoefficients{};
+
+    if (!std::isfinite(sampleRate) || sampleRate <= 0.0
+        || !std::isfinite(freqHz) || freqHz <= 0.0
+        || !std::isfinite(qValue) || qValue <= 0.0)
+        return 1;
+
+    if (!std::isfinite(gainDb))
+        gainDb = 0.0;
+
+    gainDb = std::clamp(gainDb, -120.0, 120.0);
+    qValue = std::clamp(qValue, 0.01, 100.0);
+    freqHz = std::clamp(freqHz, 0.01, sampleRate * 0.49);
+
     switch (type)
     {
         case FilterType::Bell:

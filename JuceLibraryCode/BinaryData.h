@@ -8,11 +8,14 @@
 
 namespace BinaryData
 {
-    extern const char*   Avenir_ttf;
-    const int            Avenir_ttfSize = 91016;
+    extern const char*   InterRegular_ttf;
+    const int            InterRegular_ttfSize = 411640;
+
+    extern const char*   InterBold_ttf;
+    const int            InterBold_ttfSize = 420428;
 
     // Number of elements in the namedResourceList and originalFileNames arrays.
-    const int namedResourceListSize = 1;
+    const int namedResourceListSize = 2;
 
     // Points to the start of a list of resource names.
     extern const char* namedResourceList[];

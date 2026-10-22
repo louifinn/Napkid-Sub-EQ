@@ -11,6 +11,7 @@
 #include <atomic>
 #include <JuceHeader.h>
 #include "SubEQ_Core.h"
+#include "SubEQ_OutputStage.h"
 #include "SubEQ_Parameters.h"
 #include "SubEQ_FFTProcessor.h"
 #include "SubEQ_Spectrum.h"
@@ -80,12 +81,14 @@ public:
 
     // Current EQ mode (atomic: written by audio thread, read by GUI thread)
     SubEQ::EQMode getCurrentMode() const { return static_cast<SubEQ::EQMode> (currentMode.load()); }
-    int getCurrentLatencySamples() const { return reportedLatency.load(); }
+    // Actual output-path latency (GUI chip). The host-facing PDC value is
+    // reportedLatency, which may be one handshake ahead of the active design.
+    int getCurrentLatencySamples() const { return fftProcessor.getLatencySamples(); }
 
-    // GUI 线程查询：已发布 FIR 设计的去群延迟相位响应（度，剩余相位/excess
-    // phase）。转发到 fftProcessor，返回 false 表示当前没有可用设计（未进入
-    // FIR 模式，或首份设计尚未异步发布）。仅供消息线程调用。
-    bool getFirPhaseResponseDegrees(double normalizedW, double& phaseDeg) const;
+    // GUI: one immutable FIR snapshot for magnitude+phase evaluation. Using a
+    // single snapshot avoids taking stateMutex once per pixel and guarantees
+    // both curves come from the same design version.
+    std::shared_ptr<const SubEQ::FFTProcessor::FIRState> getFirDesignSnapshot() const;
 
     // 已发布 FIR 设计的版本号：GUI 据此在后台设计异步发布后自动重绘相位曲线。
     int getFirDesignVersion() const;
@@ -93,17 +96,30 @@ public:
     // 频谱分析门控（GUI 线程计数、音频线程读取）：至少一个编辑器存在时才
     // 运行分析，避免无 GUI 时持续消耗音频线程 CPU；引用计数保证多编辑器
     // 并存时不会因其中一个关闭而误停分析。
-    void spectrumEditorOpened() noexcept { spectrumEditorCount.fetch_add (1); }
+    void spectrumEditorOpened() noexcept
+    {
+        if (spectrumEditorCount.fetch_add (1) == 0)
+            spectrumDisplayResetRequested.store (true, std::memory_order_release);
+    }
     void spectrumEditorClosed() noexcept { spectrumEditorCount.fetch_sub (1); }
 
 private:
-    // juce::Timer (message thread, 10 Hz): deferred latency (PDC) reporting.
+    // juce::Timer (message thread, 30 Hz): deferred latency (PDC) reporting.
     // setLatencySamples() -> updateHostDisplay() allocates and takes the
     // message queue lock, so the audio thread only sets latencyDirty and this
     // callback performs the actual host notification.
     void timerCallback() override;
+    void writeIirHistory(const juce::AudioBuffer<float>& buffer, int nch, int numSamples) noexcept;
 
     SubEQ::EQEngine eqEngine;
+    SubEQ::OutputStage outputStage;
+    juce::AudioBuffer<float> dryInput;   // pre-EQ input for latency-compensated bypass
+    juce::AudioBuffer<float> transitionBuffer;   // IIR path for the FIR entry crossfade
+    std::vector<float> iirHistory;       // IIR output history for time-aligned FIR entry
+    int iirHistoryWrite = 0;
+    int iirHistorySize = 0;
+    int iirHistoryChannels = 0;
+    int firEntryFadeRemaining = 0;
     // apvts must be declared BEFORE fftProcessor: members are destroyed in
     // reverse declaration order, and ~FFTProcessor joins its background
     // thread (which reads apvts via setParameterSource) — apvts must outlive
@@ -124,8 +140,6 @@ private:
     };
 
     NodeParamCache nodeCache[SubEQ::NumNodes];
-    float masterGainCache = 0.0f;
-    bool bypassCache = false;
     int eqModeCache = 0;
     int firLengthCache = 0;
 
@@ -137,7 +151,7 @@ private:
         int window = 2;       // 0=Hann, 1=Blackman, 2=B-Harris, 3=Nuttall
         int density = 0;      // 0=1/6 oct (61), 1=1/12 oct (121)
         int hop = 0;          // 0=512, 1=1024, 2=2048
-        int smoothing = 1;    // 0=Off, 1=1/6 oct, 2=1/3 oct, 3=2/3 oct（v0.4.1）
+        int smoothing = 0;    // 0=Off, 1=1/6 oct, 2=1/3 oct, 3=2/3 oct（v0.5.0 default Off）
 
         bool operator== (const SpectrumSettings& other) const noexcept
         {
@@ -150,7 +164,10 @@ private:
         bool operator!= (const SpectrumSettings& other) const noexcept { return ! (*this == other); }
     };
 
-    SpectrumSettings spectrumSettings;
+    // Sentinel: forces the first updateEQParameters() call to configure the
+    // analyzers with the real APVTS defaults (not the struct's convenience
+    // defaults, which previously left smoothRadius at 1 while the UI said Off).
+    SpectrumSettings spectrumSettings { -1, -1, -1, -1, -1 };
 
     // Cached atomic parameter pointers (avoid per-block string lookups).
     // Index order matches ParamID: Freq, Gain, Q, Type, Enabled.
@@ -165,9 +182,12 @@ private:
     std::atomic<float>* spectrumSmoothingParam = nullptr;  // spectrum_smoothing（v0.4.1）
     std::atomic<float>* nodeParams[SubEQ::NumNodes][5] = {};
     std::atomic<int> reportedLatency { 0 };
+    std::atomic<int> pendingLatencyVersion { 0 };
     std::atomic<int> currentMode { static_cast<int> (SubEQ::EQMode::ZeroLatency) };
     std::atomic<int> spectrumEditorCount { 0 };   // 存活的编辑器数
+    std::atomic<bool> spectrumDisplayResetRequested { false };
     std::atomic<bool> latencyDirty { false };   // audio thread -> timer: report PDC
+    int lastRequestedDesignVersion = -1;        // audio thread only
     bool modeChanged = false;
     bool eqParamsChanged = false;
 

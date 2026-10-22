@@ -9,15 +9,15 @@
         层内归一化坐标恒定——恒 Q 的尺度不变性）。
       - 帧长（= 核窗长）：分辨率需求 F_res = 分辨率倍率·filterScale·R/段间距，
         其中分辨率倍率 = 窗主瓣零点宽/2（Hann 1、Blackman 1.5、BH-4/Nuttall 2
-        ——低旁瓣窗的主瓣代价诚实计入）；底部用 2 s 封顶（最大 2 的幂 ≤ R·T_cap，
-        pow2 量化后严格不超）。封顶生效的层（约 4~16 Hz 以下，随窗型/档位）
-        等效带宽加宽——VQT 的 gamma 行为。
+        ——低旁瓣窗的主瓣代价诚实计入）；底部用 ≥2 s 的 2 的幂（48 kHz 约
+        2.73 s）。下限生效的层（约 4~16 Hz 以下，随窗型/档位）等效带宽加宽
+        ——VQT 的 gamma 行为。
       - 帧加窗 + 满帧匹配核：帧乘选定窗型（长度 = 帧长）后 FFT；每频段核 =
         同窗复指数的频谱，taps = conj(K)/Σ|K|²（分数 bin 匹配估计）。满幅正弦
         落段中心 → |r| = 1 → 功率 0 dB（与旧 FFT 分析器幅值约定一致）。帧加窗
         是支撑截断正确性的前提：未加窗帧的矩形谱裙（−13 dB）会淹没低旁瓣窗
         的泄漏抑制（v0.4.0 原型实测教训，见调研报告）。
-      - 辅助：↓2 抗混叠 4 阶 Butterworth 系数、0.05 Hz 直流阻断极点（底部
+      - 辅助：↓2 抗混叠 12 阶 Butterworth 系数、0.05 Hz 直流阻断极点（底部
         核主瓣覆盖直流，必须有 DC 阻断）。
 
     SubEQ_Spectrum.cpp（运行时分析器）与 Tests/subeq_fft_test.cpp（离线
@@ -45,7 +45,7 @@ namespace SubEQ
 //==============================================================================
 
 constexpr int    VQTNumTiers        = 10;     // 0.5 Hz 起 10 层倍频程 → 顶层 256~512 Hz
-constexpr double VQTTierCapSeconds  = 2.0;    // 底部核时域长度上限（用户决策）
+constexpr double VQTTierCapSeconds  = 2.0;    // 底部核时域长度下限（≥2 s 的 2 的幂）
 constexpr double VQTTopRateTargetHz = 3072.0; // 顶层目标采样率（~6× 过采样于 512 Hz）
 constexpr int    VQTMinTierFftSize  = 8;      // 极小帧防御下限
 constexpr double VQTDcBlockerHz     = 0.05;   // 直流阻断转折（0.5 Hz 处 −0.04 dB）
@@ -87,6 +87,20 @@ inline double vqtWindowResolutionMultiplier (WindowType type) noexcept
         case WindowType::Nuttall:        return 2.0;
     }
     return 2.0;   // 非法 WindowType：按最宽主瓣处理（保守帧长）
+}
+
+// 真实的主瓣零点半宽（bin）：Hann 2、Blackman 3、B-Harris/Nuttall 4。
+// 用于镜像保护；注意它不等于上面的“分辨率倍率”（后者是帧长设计参数）。
+inline double vqtWindowNullHalfBins (WindowType type) noexcept
+{
+    switch (type)
+    {
+        case WindowType::Hann:           return 2.0;
+        case WindowType::Blackman:       return 3.0;
+        case WindowType::BlackmanHarris: return 4.0;
+        case WindowType::Nuttall:        return 4.0;
+    }
+    return 4.0;
 }
 
 // 顶层降采样指数 d：R9 = fs/2^d 落在 ~3 kHz 附近（round），且 fs 必须被 2^d
@@ -141,11 +155,12 @@ inline VQTTier vqtTierLayout (int tier, double sampleRateHz, int numBands,
     const double resMult = vqtWindowResolutionMultiplier (win) * filterScale;
     const int fRes = nextPowerOfTwo (static_cast<int> (std::ceil (resMult * t.rateHz / spacingHz)) + 1);
 
-    // 2 s 封顶：不超过 R·T_cap 的最大 2 的幂（pow2 量化后严格 ≤ 封顶）
+    // 至少 2 s 的帧长：向上取到 2 的幂，避免“标称 2 s、实际 1.0–1.5 s”的
+    // 底部层 gamma 区量化损失。极低采样率下可能略超 2 s（例如 4 kHz 为
+    // 2.048 s），这是分辨率优先的显式取舍。
     const double capExact = t.rateHz * VQTTierCapSeconds;
-    int fCap = VQTMinTierFftSize;
-    while (fCap * 2 <= capExact)
-        fCap *= 2;
+    const int capPow2 = nextPowerOfTwo (std::max (1, static_cast<int> (std::ceil (capExact))));
+    const int fCap = std::max (VQTMinTierFftSize, capPow2);
 
     t.fftSize = std::max (VQTMinTierFftSize, std::min (fRes, fCap));
     t.windowSeconds = static_cast<double> (t.fftSize) / t.rateHz;
@@ -207,12 +222,13 @@ inline VQTKernel buildVQTKernel (double freqHz, double tierRateHz, int fftSize, 
     lo = std::max (0, lo - 1);
     hi = std::min (fftSize - 1, hi + 1);
 
-    // 镜像支撑下限保护：实信号正负频率镜像相距 2·b_k bin；当 b_k（峰位 bin，
-    // = f·F/R）小于主瓣零点半宽（nullBins/2）时镜像落进支撑，段读数出现与
-    // 相位相关的摆动（2 s 封顶下 0.5 Hz 段帧内不足一个整周期——gamma 区固有）。
-    // 把支撑下限抬到镜像主瓣之外：m ≥ ceil(nullBins/2 − b_k)，但不越过峰位。
+    // 镜像支撑下限保护（近似）：实信号正负频率镜像相距 2·b_k bin；当 b_k
+    // （峰位 bin，= f·F/R）小于主瓣零点半宽（nullBins/2）时镜像落进支撑，
+    // 段读数出现与相位相关的摆动（≥2 s 帧下 0.5 Hz 段帧内仍不足一个整周期
+    // ——gamma 区固有）。这里把支撑下限抬到镜像主瓣之外以缓解；底部 gamma 区
+    // 仍可能在 F−1 截断，不能替代更长的帧/更低采样率。
     const double bFloat = freqHz * static_cast<double> (fftSize) / tierRateHz;
-    const double nullHalfBins = vqtWindowResolutionMultiplier (win);   // = nullBins/2
+    const double nullHalfBins = vqtWindowNullHalfBins (win);   // 真实 nullBins/2
     const int mirrorGuard = static_cast<int> (std::ceil (nullHalfBins - bFloat));
     if (mirrorGuard > 0)
         lo = std::min (std::max (lo, mirrorGuard), pk);
@@ -299,25 +315,36 @@ inline VQTKernelSet buildVQTKernelSet (double sampleRateHz, int numBands,
 // 抽取链辅助
 //==============================================================================
 
-// 一级 ↓2 抗混叠低通：4 阶 Butterworth（两个二阶节级联），截止 0.35×输出率。
-// 折叠带（≥0.5×输出率）压制 ≤ −70 dB；频段内容最高 ~0.17×层率（顶层 512 Hz
-// @3000 Hz），通带无衰减。
-inline void vqtDecimatorCoefficients (double stageInputRateHz, BiquadCoefficients out[2]) noexcept
+// 一级 ↓2 抗混叠低通：12 阶 Butterworth（6 个二阶节级联），截止 0.28×输出率。
+// 折叠带（≥0.5×输出率）压制 ≥60 dB（0.55×输出率处 ≥70 dB）；频段内容最高
+// ~0.17×层率（顶层 512 Hz @3000 Hz），通带衰减可忽略。
+// 注意：更强抑制的代价是低频显示群延迟增大（0.5 Hz 附近整条链约 1.4 s），
+// 这是分析显示延迟，不影响音频处理路径。
+inline constexpr int kVqtDecimatorBiquads = 6;
+
+inline void vqtDecimatorCoefficients (double stageInputRateHz,
+                                      BiquadCoefficients out[kVqtDecimatorBiquads]) noexcept
 {
-    const double cutoffHz = 0.35 * stageInputRateHz * 0.5;
-    BiquadCoefficients tmp[2];
-    computeBiquadCoefficients (cutoffHz, 0.0, 0.54119610, FilterType::LowPass, stageInputRateHz, tmp);
-    out[0] = tmp[0];
-    computeBiquadCoefficients (cutoffHz, 0.0, 1.30656296, FilterType::LowPass, stageInputRateHz, tmp);
-    out[1] = tmp[0];
+    const double cutoffHz = 0.28 * stageInputRateHz * 0.5;
+
+    // 12th-order Butterworth pole Qs: Q_k = 1 / (2 cos((2k+1)π / 24)).
+    for (int k = 0; k < kVqtDecimatorBiquads; ++k)
+    {
+        const double angle = 3.14159265358979323846 * (2.0 * k + 1.0) / 24.0;
+        const double q = 1.0 / (2.0 * std::cos(angle));
+        BiquadCoefficients tmp[2];
+        computeBiquadCoefficients (cutoffHz, 0.0, q, FilterType::LowPass,
+                                   stageInputRateHz, tmp);
+        out[k] = tmp[0];
+    }
 }
 
 // 抽取链的一级状态：两个二阶节 + ↓2 相位计数。运行时分析器与离线原型共用
 // 同一布局（coeffs 在 prepare 路径写、state/phase 在音频线程写）。
 struct VQTDecimationStage
 {
-    BiquadCoefficients coeffs[2];
-    BiquadState state[2];
+    BiquadCoefficients coeffs[kVqtDecimatorBiquads];
+    BiquadState state[kVqtDecimatorBiquads];
     int phase = 0;
 };
 
@@ -341,8 +368,9 @@ inline void vqtDecimationStep (double input, VQTDecimationStage* stages, int num
     for (int k = 0; k < numStages; ++k)
     {
         VQTDecimationStage& st = stages[k];
-        double y = st.state[0].process (x, st.coeffs[0]);
-        y = st.state[1].process (y, st.coeffs[1]);
+        double y = x;
+        for (int b = 0; b < kVqtDecimatorBiquads; ++b)
+            y = st.state[b].process (y, st.coeffs[b]);
         if (++st.phase >= 2)
         {
             st.phase = 0;

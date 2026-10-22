@@ -52,6 +52,9 @@ SubEQAudioProcessorEditor::SubEQAudioProcessorEditor (SubEQAudioProcessor& p)
 
 SubEQAudioProcessorEditor::~SubEQAudioProcessorEditor()
 {
+    // Menus are independent desktop windows; close them before the editor's
+    // LookAndFeel/children disappear.
+    juce::PopupMenu::dismissAllActiveMenus();
     audioProcessor.spectrumEditorClosed();
 
    #if JucePlugin_IsStandalone

@@ -48,6 +48,7 @@ ModeSelector::ModeSelector (juce::AudioProcessorValueTreeState& apvtsRef)
     auto choices = SubEQ::FFTProcessor::getModeChoices();
     modeBox.addItemList (choices, 1); // IDs start at 1
     modeBox.setSelectedId (1, juce::dontSendNotification);
+    modeBox.setTooltip ("Processing mode: Zero Latency (IIR), Minimum Phase FIR or Linear Phase FIR");
 
     // Style ComboBox to match the warm ivory design system (the LookAndFeel
     // installed on the editor draws the body; these colours drive the rest)
@@ -147,22 +148,38 @@ void ModeSelector::attachChoice (const juce::String& parameterID, juce::ComboBox
     box.onChange = [this, parameterID, &box]
     {
         if (auto* p = apvts.getParameter (parameterID))
+        {
+            p->beginChangeGesture();
             p->setValueNotifyingHost (p->convertTo0to1 (static_cast<float> (box.getSelectedItemIndex())));
+            p->endChangeGesture();
+        }
     };
 }
 
 void ModeSelector::parameterChanged (const juce::String& parameterID, float newValue)
 {
-    // 该回调可能在音频线程执行（宿主自动化同步派发 APVTS 监听器）：ComboBox
-    // 更新必须推迟到消息线程执行。
-    juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<ModeSelector> (this), parameterID, newValue]
-    {
-        if (safe == nullptr)
-            return;
+    juce::ignoreUnused (parameterID, newValue);
+    // May run on the audio thread during host automation: defer the ComboBox
+    // update to the existing 10 Hz message-thread timer.
+    uiDirty.store (true, std::memory_order_release);
+}
 
-        if (auto* box = safe->boxForParameter (parameterID))
-            box->setSelectedItemIndex (juce::roundToInt (newValue), juce::dontSendNotification);
-    });
+void ModeSelector::syncChoiceBoxes()
+{
+    auto sync = [this] (juce::ComboBox& box, const juce::String& id)
+    {
+        if (auto* v = apvts.getRawParameterValue (id))
+            box.setSelectedItemIndex (juce::roundToInt (v->load()),
+                                      juce::dontSendNotification);
+    };
+
+    sync (modeBox, "eq_mode");
+    sync (firLengthBox, "fir_length");
+
+    int numControls = 0;
+    const SpectrumControl* controls = spectrumControlTable (numControls);
+    for (int i = 0; i < numControls; ++i)
+        sync (spectrumBox (controls[i]), controls[i].paramId);
 }
 
 juce::ComboBox* ModeSelector::boxForParameter (const juce::String& parameterID)
@@ -181,6 +198,9 @@ juce::ComboBox* ModeSelector::boxForParameter (const juce::String& parameterID)
 
 void ModeSelector::timerCallback()
 {
+    if (uiDirty.exchange (false, std::memory_order_acquire))
+        syncChoiceBoxes();
+
     refreshLatencyLabel();
 
     // FIR length only applies to the FIR-based modes (Minimum/Linear Phase);

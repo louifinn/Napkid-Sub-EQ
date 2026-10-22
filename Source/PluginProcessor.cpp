@@ -57,8 +57,9 @@ SubEQAudioProcessor::SubEQAudioProcessor()
         nodeParams[i][kParamEnabled] = apvts.getRawParameterValue (SubEQ::getNodeParamID (i, SubEQ::ParamID::Enabled));
     }
 
-    // Deferred PDC reporting poll (message thread) — see timerCallback
-    startTimerHz (10);
+    // Deferred PDC reporting poll (message thread) — see timerCallback.
+    // 30 Hz keeps the report→ack→guard handshake well below the old 100 ms.
+    startTimerHz (30);
 }
 
 void SubEQAudioProcessor::timerCallback()
@@ -67,7 +68,30 @@ void SubEQAudioProcessor::timerCallback()
     // directly: setLatencySamples -> updateHostDisplay allocates and takes the
     // message queue lock, which must not happen on the audio thread.
     if (latencyDirty.exchange (false))
-        setLatencySamples (reportedLatency.load());
+    {
+        const int desired = reportedLatency.load();
+        setLatencySamples (desired);
+        fftProcessor.acknowledgeLatency (pendingLatencyVersion.load());
+    }
+}
+
+void SubEQAudioProcessor::writeIirHistory (const juce::AudioBuffer<float>& buffer,
+                                           int nch, int numSamples) noexcept
+{
+    if (iirHistory.empty() || iirHistorySize <= 0)
+        return;
+
+    const int channels = std::min (nch, iirHistoryChannels);
+    for (int n = 0; n < numSamples; ++n)
+    {
+        for (int ch = 0; ch < channels; ++ch)
+            iirHistory[static_cast<size_t>(ch) * static_cast<size_t>(iirHistorySize)
+                       + static_cast<size_t>(iirHistoryWrite)] =
+                buffer.getReadPointer (ch)[n];
+
+        if (++iirHistoryWrite == iirHistorySize)
+            iirHistoryWrite = 0;
+    }
 }
 
 SubEQAudioProcessor::~SubEQAudioProcessor()
@@ -112,7 +136,11 @@ double SubEQAudioProcessor::getTailLengthSeconds() const
     // FIR modes keep up to (FIR length + block latency) samples in the
     // pipeline; report the full tail so hosts don't truncate the convolution
     // tail on transport stop.
-    const auto mode = static_cast<SubEQ::EQMode> (currentMode.load());
+    // Read the parameter, not currentMode: hosts may query the tail right
+    // after setStateInformation, before the first processBlock updates the
+    // audio-thread cache.
+    const auto mode = static_cast<SubEQ::EQMode> (
+        juce::roundToInt (eqModeParam != nullptr ? eqModeParam->load() : 0.0f));
     if (mode == SubEQ::EQMode::ZeroLatency)
         return 0.0;
 
@@ -123,9 +151,10 @@ double SubEQAudioProcessor::getTailLengthSeconds() const
     return static_cast<double> (fftProcessor.getTailLengthSamples()) / sr;
 }
 
-bool SubEQAudioProcessor::getFirPhaseResponseDegrees (double normalizedW, double& phaseDeg) const
+std::shared_ptr<const SubEQ::FFTProcessor::FIRState>
+SubEQAudioProcessor::getFirDesignSnapshot() const
 {
-    return fftProcessor.getFirPhaseResponseDegrees (normalizedW, phaseDeg);
+    return fftProcessor.getFirDesignSnapshot();
 }
 
 int SubEQAudioProcessor::getFirDesignVersion() const
@@ -165,11 +194,29 @@ void SubEQAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     // PDC 不再在音频线程直接调用 setLatencySamples()（音频线程禁止）：延迟上报
     // 统一由 processBlock 置脏标记、timerCallback 在消息线程执行；同会话重入
     // prepare（transport stop/start）时已发布设计与延迟上报均被保留，无需动作。
-    eqEngine.prepare (sampleRate, samplesPerBlock);
+    eqEngine.prepare (sampleRate);
     eqEngine.reset();
+    outputStage.prepare (sampleRate, SubEQ::FFTProcessor::MaxLatencySamples,
+                         std::max (1, getTotalNumInputChannels()));
+    outputStage.setMasterDb (static_cast<double> (masterGainParam->load()));
+    outputStage.setBypass (bypassParam->load() > 0.5f);
+    outputStage.snapToTargets();
+    dryInput.setSize (std::max (1, getTotalNumInputChannels()),
+                      std::max (samplesPerBlock, 8192));
+    transitionBuffer.setSize (std::max (1, getTotalNumInputChannels()),
+                              std::max (samplesPerBlock, 8192));
+    iirHistorySize = SubEQ::FFTProcessor::MaxLatencySamples + 1;
+    iirHistoryChannels = std::max (1, getTotalNumInputChannels());
+    iirHistory.assign (static_cast<size_t>(iirHistoryChannels)
+                           * static_cast<size_t>(iirHistorySize), 0.0f);
+    iirHistoryWrite = 0;
+    firEntryFadeRemaining = 0;
     fftProcessor.prepare (sampleRate, samplesPerBlock, getTotalNumInputChannels());
     fftProcessor.setParameterSource (&apvts);
-    fftProcessor.reset();
+    // Do NOT reset the convolution on a same-session prepare: prepare()
+    // already resets it when the sample rate/channel count changes, and
+    // dropping an active design here would force a needless re-warm + PDC
+    // handshake on every transport stop/start.
     spectrumAnalyzer.prepare (sampleRate);
     inputAnalyzer.prepare (sampleRate);
     // 不强制 currentMode/eqModeCache 归零：同会话重复 prepare 时 eq_mode
@@ -178,6 +225,7 @@ void SubEQAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     // 参数真正变化时才由 updateEQParameters 置 modeChanged。
     modeChanged = false;
     eqParamsChanged = false;
+    lastRequestedDesignVersion = -1;
     updateEQParameters();
 }
 
@@ -208,23 +256,8 @@ bool SubEQAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) co
 
 void SubEQAudioProcessor::updateEQParameters()
 {
-    // Update master gain (use epsilon to avoid spurious updates from float jitter)
-    float masterGain = masterGainParam->load();
-    if (std::abs (masterGain - masterGainCache) > 0.001f)
-    {
-        masterGainCache = masterGain;
-        eqEngine.setMasterGain (static_cast<double> (masterGain));
-        eqParamsChanged = true;
-    }
-
-    // Update bypass
-    bool bypass = bypassParam->load() > 0.5f;
-    if (bypass != bypassCache)
-    {
-        bypassCache = bypass;
-        eqEngine.setBypass (bypass);
-        eqParamsChanged = true;
-    }
+    // Master gain and bypass are post-convolution output-stage parameters: they
+    // are read directly by OutputStage every block and never request a redesign.
 
     // Update EQ mode
     int mode = static_cast<int> (eqModeParam->load());
@@ -312,11 +345,35 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
         buffer.clear (i, 0, buffer.getNumSamples());
 
+    // Capture the raw input before any processing. The history is published at
+    // the end of the block, so warm states always align with the start of the
+    // next block (not with samples that have not been convolved yet).
+    const int dryChannels = std::min (totalNumInputChannels, SubEQ::EQNode::MaxChannels);
+    const bool haveDryCopy = dryInput.getNumSamples() >= buffer.getNumSamples()
+                          && dryInput.getNumChannels() >= dryChannels;
+    if (haveDryCopy)
+    {
+        for (int ch = 0; ch < dryChannels; ++ch)
+            dryInput.copyFrom (ch, 0, buffer, ch, 0, buffer.getNumSamples());
+    }
+
+    {
+        float* historyPtrs[SubEQ::EQNode::MaxChannels] = {};
+        const int historyChannels = dryChannels;
+        for (int ch = 0; ch < historyChannels; ++ch)
+            historyPtrs[ch] = buffer.getWritePointer (ch);
+        fftProcessor.captureHistory (historyPtrs, historyChannels,
+                                     buffer.getNumSamples(), false);
+    }
+
     // Update EQ parameters before processing
     updateEQParameters();
 
-    // Advance coefficient interpolation once per block (shared by all channels)
-    eqEngine.advanceSmoothing (buffer.getNumSamples());
+    if (spectrumDisplayResetRequested.exchange (false, std::memory_order_acquire))
+    {
+        spectrumAnalyzer.resetDisplayState();
+        inputAnalyzer.resetDisplayState();
+    }
 
     const auto mode = static_cast<SubEQ::EQMode> (currentMode.load());
 
@@ -327,11 +384,17 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
 
         // Flush the FIR pipeline on any mode switch: stale input blocks /
         // overlap tails from a previous FIR session must never convolve with
-        // new coefficients (audible echoes/transients).
-        fftProcessor.reset();
+        // new coefficients (audible echoes/transients). The raw input history
+        // is preserved so a later FIR entry can warm from past audio.
+        fftProcessor.resetConvolution();
 
         if (mode == SubEQ::EQMode::ZeroLatency)
         {
+            // The IIR chain did not run while FIR was active; its biquad states
+            // are frozen at the moment of leaving ZL. Reset them so the first
+            // ZL block cannot inject stale low-frequency energy.
+            eqEngine.reset();
+
             // Back to pure IIR: report zero latency (deferred to the message
             // thread — setLatencySamples must not run on the audio thread)
             if (reportedLatency.load() != 0)
@@ -357,22 +420,6 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     }
     eqParamsChanged = false;
 
-    // Pick up a freshly published FIR design and report its latency (PDC).
-    // The actual setLatencySamples() call is deferred to timerCallback on the
-    // message thread (it allocates/locks inside updateHostDisplay).
-    // 与音频路径的一致性（F-006）：延迟不同的设计发布后立即冲刷切换
-    // （无交叉淡化），延迟相同的设计走 1024 样本交叉淡化且延迟不变——
-    // 两条路径下上报的延迟都匹配实际输出的管线延迟。
-    if (mode != SubEQ::EQMode::ZeroLatency)
-    {
-        int newLatency = fftProcessor.getLatencySamples();
-        if (newLatency != reportedLatency.load())
-        {
-            reportedLatency.store (newLatency);
-            latencyDirty.store (true, std::memory_order_release);
-        }
-    }
-
     // Input spectrum: analyze BEFORE processing (buffer still holds the raw
     // input at this point; EQ processing overwrites it in place). 频谱分析
     // 仅在编辑器存在时运行（spectrumEditorCount 由编辑器构造/析构维护）。
@@ -382,28 +429,148 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     // Process audio based on current mode
     if (mode == SubEQ::EQMode::ZeroLatency)
     {
-        // IIR biquad processing
-        for (int channel = 0; channel < totalNumInputChannels; ++channel)
-        {
-            auto* inputData = buffer.getReadPointer (channel);
-            auto* outputData = buffer.getWritePointer (channel);
-            eqEngine.processChannel (inputData, outputData, buffer.getNumSamples(), channel);
-        }
+        firEntryFadeRemaining = 0;
+
+        // IIR node chain, in place, advanced in 32-sample sub-blocks so node
+        // enable/coefficient ramps are sample-rate independent of host blocks.
+        float* channelPtrs[SubEQ::EQNode::MaxChannels] = {};
+        const int nch = std::min (totalNumInputChannels, SubEQ::EQNode::MaxChannels);
+        for (int ch = 0; ch < nch; ++ch)
+            channelPtrs[ch] = buffer.getWritePointer (ch);
+
+        eqEngine.processChannels (channelPtrs, nch, buffer.getNumSamples());
+        writeIirHistory (buffer, nch, buffer.getNumSamples());
     }
     else
     {
-        // FIR processing. Until a design is published, output silence rather
-        // than an unprocessed passthrough: with PDC still 0, a passthrough
-        // would be latency-mismatched against the compensated signal.
-        if (fftProcessor.isReady())
-            fftProcessor.process (buffer);
+        // FIR processing. While the first design is being built/warmed (or
+        // waiting for PDC), process() returns false without touching the
+        // buffer; keep the IIR path alive so switching to FIR never mutes the
+        // plugin for the warm-up period.
+        const bool wasActive = fftProcessor.hasActiveDesign();
+        const bool firActive = fftProcessor.process (buffer);
+        const int nch = std::min (totalNumInputChannels, SubEQ::EQNode::MaxChannels);
+
+        if (!firActive)
+        {
+            float* channelPtrs[SubEQ::EQNode::MaxChannels] = {};
+            for (int ch = 0; ch < nch; ++ch)
+                channelPtrs[ch] = buffer.getWritePointer (ch);
+            eqEngine.processChannels (channelPtrs, nch, buffer.getNumSamples());
+            writeIirHistory (buffer, nch, buffer.getNumSamples());
+            firEntryFadeRemaining = 0;
+        }
         else
-            buffer.clear();
+        {
+            if (!wasActive && haveDryCopy)
+                firEntryFadeRemaining = 1024;
+
+            if (firEntryFadeRemaining > 0 && haveDryCopy && nch > 0)
+            {
+                // Crossfade the newly active FIR output against the IIR path
+                // on the same raw input. The IIR state advances normally (it is
+                // reset if we later return to Zero Latency).
+                for (int ch = 0; ch < nch; ++ch)
+                    transitionBuffer.copyFrom (ch, 0, dryInput, ch, 0,
+                                               buffer.getNumSamples());
+
+                float* transitionPtrs[SubEQ::EQNode::MaxChannels] = {};
+                for (int ch = 0; ch < nch; ++ch)
+                    transitionPtrs[ch] = transitionBuffer.getWritePointer (ch);
+                eqEngine.processChannels (transitionPtrs, nch, buffer.getNumSamples());
+
+                const int numSamples = buffer.getNumSamples();
+                const int latency = std::max (0, fftProcessor.getLatencySamples());
+                const int ringSize = iirHistorySize;
+                const bool haveRing = ringSize > 0 && !iirHistory.empty();
+
+                for (int n = 0; n < numSamples; ++n)
+                {
+                    const int rem = firEntryFadeRemaining - n;
+                    const float firGain = (rem > 0)
+                                              ? 1.0f - static_cast<float>(rem) / 1024.0f
+                                              : 1.0f;
+                    const float iirGain = 1.0f - firGain;
+                    const int readIndex = (haveRing && latency > 0)
+                                              ? (iirHistoryWrite - latency + ringSize) % ringSize
+                                              : -1;
+
+                    for (int ch = 0; ch < nch; ++ch)
+                    {
+                        float* dst = buffer.getWritePointer (ch);
+                        const float iirCurrent = transitionBuffer.getReadPointer (ch)[n];
+                        const bool ringCh = haveRing && ch < iirHistoryChannels;
+                        const float iirAligned = (readIndex >= 0 && ringCh)
+                                                     ? iirHistory[static_cast<size_t>(ch)
+                                                                  * static_cast<size_t>(ringSize)
+                                                                  + static_cast<size_t>(readIndex)]
+                                                     : iirCurrent;
+
+                        if (ringCh)
+                            iirHistory[static_cast<size_t>(ch) * static_cast<size_t>(ringSize)
+                                       + static_cast<size_t>(iirHistoryWrite)] = iirCurrent;
+
+                        dst[n] = firGain * dst[n] + iirGain * iirAligned;
+                    }
+
+                    if (haveRing && ++iirHistoryWrite == ringSize)
+                        iirHistoryWrite = 0;
+                }
+                firEntryFadeRemaining = std::max (0, firEntryFadeRemaining - numSamples);
+            }
+        }
     }
 
-    // Feed audio to the output spectrum analyzer (post-EQ signal)
+    // PDC handshake: report the *published* design's latency first. The audio
+    // path keeps the old design until the message thread has called
+    // setLatencySamples() and acknowledged that version.
+    {
+        int desiredLatency = reportedLatency.load();
+        if (mode == SubEQ::EQMode::ZeroLatency)
+        {
+            desiredLatency = 0;
+        }
+        else
+        {
+            // No published design yet (e.g. just entered FIR): keep the last
+            // reported latency. Reporting 0 and then L would make the host
+            // bounce its compensation twice; the first FIR design will update
+            // this as soon as its package is published.
+            const int published = fftProcessor.getPublishedLatencySamples();
+            if (published > 0)
+                desiredLatency = published;
+        }
+
+        const int designVersion = fftProcessor.getDesignVersion();
+        if (desiredLatency != reportedLatency.load()
+            || designVersion != lastRequestedDesignVersion)
+        {
+            reportedLatency.store (desiredLatency);
+            pendingLatencyVersion.store (designVersion);
+            latencyDirty.store (true, std::memory_order_release);
+            lastRequestedDesignVersion = designVersion;
+        }
+    }
+
+    // Post-EQ output stage: smoothed master gain and latency-compensated bypass.
+    outputStage.setMasterDb (static_cast<double> (masterGainParam->load()));
+    outputStage.setBypass (bypassParam->load() > 0.5f);
+    outputStage.setLatency (mode == SubEQ::EQMode::ZeroLatency
+                                ? 0 : fftProcessor.getLatencySamples());
+
+    float* outputPtrs[SubEQ::EQNode::MaxChannels] = {};
+    const int nout = std::min (totalNumOutputChannels, SubEQ::EQNode::MaxChannels);
+    for (int ch = 0; ch < nout; ++ch)
+        outputPtrs[ch] = buffer.getWritePointer (ch);
+    outputStage.process (haveDryCopy ? dryInput.getArrayOfReadPointers() : nullptr,
+                         outputPtrs, nout, buffer.getNumSamples());
+
+    // Feed audio to the output spectrum analyzer (final post-EQ/output signal)
     if (spectrumEditorCount.load() > 0 && totalNumInputChannels > 0)
         spectrumAnalyzer.process (buffer.getReadPointer (0), buffer.getNumSamples());
+
+    // Publish this block's raw input only after convolution has advanced.
+    fftProcessor.publishHistory();
 }
 
 //==============================================================================
@@ -422,6 +589,9 @@ void SubEQAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     auto state = apvts.copyState();
     std::unique_ptr<juce::XmlElement> xml (state.createXml());
+    // Explicit state version for future parameter-semantics migrations. A
+    // missing attribute means a pre-0.5.0 session.
+    xml->setAttribute ("stateVersion", 2);
     copyXmlToBinary (*xml, destData);
 }
 

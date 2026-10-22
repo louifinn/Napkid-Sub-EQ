@@ -10,7 +10,10 @@
 
 #pragma once
 
-#include <JuceHeader.h>
+#include <algorithm>
+#include <cmath>
+#include <complex>
+
 #include "SubEQ_FilterType.h"
 #include "SubEQ_Biquad.h"
 
@@ -81,6 +84,13 @@ public:
             {
                 for (int b = 0; b < active; ++b)
                     coeffs[b] = targetCoeffs[b];
+
+                if (extraBiquadFadeOut)
+                {
+                    for (int ch = 0; ch < MaxChannels; ++ch)
+                        states[ch][1].reset();
+                }
+
                 smoothing = false;
                 extraBiquadFadeOut = false;   // dropped biquad reached identity
             }
@@ -98,9 +108,9 @@ public:
             }
         }
 
-        // Enable dry/wet crossfade (~15 ms time constant, block granularity).
-        // Toggling a node only retargets this fade (setEnabled), so enable/
-        // disable never produces a discontinuity.
+        // Enable dry/wet crossfade (~15 ms). The engine advances this in short
+        // sub-blocks, so a 1024-sample host block no longer becomes a one-step
+        // hard switch.
         if (fadeGain != fadeTarget)
         {
             const double fstep = fadeStepPerSample * static_cast<double>(numSamples);
@@ -162,44 +172,38 @@ private:
     bool enabled = false;
 };
 
-// Engine managing up to 8 cascaded EQ nodes + master gain
+// Engine managing up to 8 cascaded EQ nodes. Master gain / bypass live in
+// OutputStage; this engine is the node chain only (audio processing and the
+// FIR design target). The display response still carries master/bypass so the
+// editor can show the effective transfer function.
 class EQEngine
 {
 public:
     static constexpr int MaxNodes = 8;
+    static constexpr int SmoothingSubBlock = 32;
 
     EQEngine() = default;
 
-    void prepare(double sampleRate, int maxBlockSize);
+    void prepare(double sampleRate);
     void reset();
 
-    // Process a single channel (channel index for per-channel state access).
-    // Robust against hosts delivering more samples than the prepared maximum:
-    // processing falls back to tempBuffer-sized chunks instead of overflowing.
+    // Process one channel in place (input may alias output). No temporary
+    // buffers, no allocation: safe for arbitrary host block sizes.
     void processChannel(const float* input, float* output, int numSamples, int channel);
 
-private:
-    void processChunk(const float* input, float* output, int numSamples, int channel,
-                      double masterGainLinear);
-
-public:
+    // Process all channels in 32-sample sub-blocks, advancing coefficient
+    // smoothing once per sub-block so every channel stays in sync and large
+    // host blocks no longer produce one-step gains.
+    void processChannels(float* const* channels, int numChannels, int numSamples);
 
     // Access nodes for parameter updates
     EQNode& getNode(int index) { return nodes[index]; }
     const EQNode& getNode(int index) const { return nodes[index]; }
 
-    // Master gain in dB
+    // Display-only output-stage values (not used by processChannel).
     void setMasterGain(double gainDb) noexcept { masterGain = gainDb; }
     double getMasterGain() const noexcept { return masterGain; }
-
-    // Bypass only retargets the dry/wet crossfade (~15 ms); the node chain
-    // keeps processing while bypassed (warm bypass), so un-bypassing fades in
-    // live filter output instead of a stale-state transient (F-008).
-    void setBypass(bool shouldBypass) noexcept
-    {
-        bypass = shouldBypass;
-        bypassFadeTarget = shouldBypass ? 0.0 : 1.0;
-    }
+    void setBypass(bool shouldBypass) noexcept { bypass = shouldBypass; }
     bool isBypassed() const noexcept { return bypass; }
 
     // Enable/disable coefficient smoothing on all nodes
@@ -211,32 +215,24 @@ public:
             nodes[i].setSmoothingEnabled(shouldSmooth);
     }
 
-    // Advance coefficient interpolation on all nodes by numSamples, plus the
-    // bypass dry/wet fade. Called once per audio block (audio thread) so every
-    // channel shares the same interpolation state.
+    // Advance coefficient interpolation and enable fades on all nodes.
     void advanceSmoothing(int numSamples) noexcept
     {
         for (int i = 0; i < MaxNodes; ++i)
             nodes[i].advanceSmoothing(numSamples);
-
-        // 旁路湿/干淡化推进（~15 ms，块粒度；F-008）：bypass 切换不再瞬时
-        // 直通。旁路期间节点链保持处理（热旁路），解除旁路时无陈旧状态瞬态。
-        if (bypassFadeGain != bypassFadeTarget)
-        {
-            const double fstep = bypassFadeStepPerSample * static_cast<double>(numSamples);
-            bypassFadeGain = (bypassFadeTarget > bypassFadeGain)
-                           ? std::min (bypassFadeTarget, bypassFadeGain + fstep)
-                           : std::max (bypassFadeTarget, bypassFadeGain - fstep);
-        }
     }
 
-    // Get overall frequency response in dB at normalized frequency w
+    // Get overall display frequency response in dB at normalized frequency w
     double getResponseDb(double w) const noexcept;
 
-    // Get overall magnitude response (linear scale, not dB) at normalized frequency w
+    // Display magnitude (nodes * master gain, flat when bypassed).
     double getMagnitudeLinear(double w) const noexcept;
 
-    // Get overall phase response in degrees at normalized frequency w
+    // Node-chain-only magnitude; the FIR designer must use this (master gain
+    // and bypass are applied after convolution, not baked into the FIR).
+    double getNodesMagnitudeLinear(double w) const noexcept;
+
+    // Get overall display phase response in degrees at normalized frequency w
     double getResponsePhaseDegrees(double w) const noexcept;
 
 private:
@@ -244,15 +240,6 @@ private:
     double masterGain = 0.0;
     bool bypass = false;
     double sampleRate = 48000.0;
-
-    // 旁路湿/干淡化状态（音频线程独占）：1 = 全湿输出，0 = 直通。
-    // 默认全湿（未旁路）。
-    double bypassFadeGain = 1.0;
-    double bypassFadeTarget = 1.0;
-    double bypassFadeStepPerSample = 1.0 / (48000.0 * 0.015);
-
-    juce::HeapBlock<double> tempBuffer;
-    int tempBufferSize = 0;
 };
 
 } // namespace SubEQ

@@ -49,12 +49,14 @@ private:
     juce::Label hopLabel;
     juce::Label smoothingLabel;
     juce::Label latencyLabel;
-    // 手工 APVTS 同步（替代 ComboBoxAttachment：附件的监听器同样会在宿主
-    // 自动化时于音频线程同步回调并直接改 ComboBox，属消息线程专属操作——
-    // 这里把参数 → 界面同步经 callAsync 推迟到消息线程）。
+    // 手工 APVTS 同步（替代 ComboBoxAttachment）：监听器只写原子脏标记，
+    // 10 Hz Timer 在消息线程重读参数并更新 ComboBox；音频线程不分配/不加锁。
     void parameterChanged(const juce::String& parameterID, float newValue) override;
     void attachChoice(const juce::String& parameterID, juce::ComboBox& box);
     juce::ComboBox* boxForParameter(const juce::String& parameterID);
+    void syncChoiceBoxes();
+
+    std::atomic<bool> uiDirty { false };
 
     int dividerX = -1;                      // processing/spectrum group separator x (-1 = not laid out)
     juce::Rectangle<int> latencyChipBounds; // capsule behind the latency text

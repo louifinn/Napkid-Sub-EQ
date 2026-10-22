@@ -44,6 +44,7 @@ public:
     void mouseDoubleClick(const juce::MouseEvent& event) override;
     void mouseWheelMove(const juce::MouseEvent& event,
                         const juce::MouseWheelDetails& wheel) override;
+    bool keyPressed(const juce::KeyPress& key) override;
 
     // APVTS Listener
     void parameterChanged(const juce::String& parameterID, float newValue) override;
@@ -55,6 +56,7 @@ private:
     juce::AudioProcessorValueTreeState& apvts;
     juce::RangedAudioParameter* gainParam = nullptr;
 
+    std::atomic<bool> repaintDirty { false };
     bool isDragging = false;
     bool isHovering = false;
     bool isPressed = false;      // mouse button down (hollow ring while pressed)

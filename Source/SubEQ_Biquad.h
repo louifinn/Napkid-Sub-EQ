@@ -32,9 +32,24 @@ struct BiquadCoefficients
         return std::abs(a2) < 1.0 && std::abs(a1) < 1.0 + a2;
     }
 
+    bool isFinite() const noexcept
+    {
+        return std::isfinite(b0) && std::isfinite(b1) && std::isfinite(b2)
+            && std::isfinite(a1) && std::isfinite(a2);
+    }
+
+    // Restore identity if any coefficient is non-finite. NaN comparisons make
+    // isStable()/forceStable() ineffective, so callers must sanitize first.
+    void sanitize() noexcept
+    {
+        if (!isFinite())
+            *this = BiquadCoefficients{};
+    }
+
     // Force coefficients to be stable by nudging a1/a2 inward
     void forceStable() noexcept
     {
+        sanitize();
         if (a2 >= 1.0)  a2 = 0.9999999999;
         if (a2 <= -1.0) a2 = -0.9999999999;
         const double limit = 1.0 + a2;

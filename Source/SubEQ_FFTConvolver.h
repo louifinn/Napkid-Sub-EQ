@@ -39,6 +39,25 @@ struct OlaChannelState
     int outRead = 0;
 };
 
+// Build the frequency-domain filter used by processOlaChannel. The tap count
+// is authoritative: callers may pass a Type-I linear-phase design whose size
+// is one less than the nominal FIR-length parameter. Taps beyond the FFT size
+// are ignored rather than read out of bounds.
+inline std::vector<std::complex<double>> buildFirFrequencyCoeffs(
+    const std::vector<double>& taps, int convFFTSize)
+{
+    if (convFFTSize <= 0)
+        return {};
+
+    std::vector<std::complex<double>> spec(static_cast<size_t>(convFFTSize));
+    const size_t count = std::min(taps.size(), spec.size());
+    for (size_t i = 0; i < count; ++i)
+        spec[i] = { taps[i], 0.0 };
+
+    fftInPlace(spec.data(), convFFTSize);
+    return spec;
+}
+
 // Process `numSamples` through one channel. `scratch` is a caller-owned work
 // buffer of size L shared across channels to bound memory (one scratch per
 // processor, not per channel). `freqCoeffs` is the frequency-domain filter
@@ -101,11 +120,35 @@ inline void processOlaChannel(OlaChannelState& st,
             {
                 // Carry the tail into the next block: shift the accumulator and
                 // ADD this block's tail (a convolution spans multiple blocks,
-                // so older tails must accumulate).
+                // so older tails must accumulate). Check the tail too: a
+                // poisoned future block must not hide until it reaches y.
+                bool tailPoisoned = false;
                 for (int i = 0; i < L - M; ++i)
-                    st.overlap[i] = st.overlap[i + M] + scratch[M + i].real();
+                {
+                    if (!std::isfinite (scratch[M + i].real())
+                        || !std::isfinite (scratch[M + i].imag()))
+                    {
+                        tailPoisoned = true;
+                        st.overlap[i] = 0.0;
+                        continue;
+                    }
+
+                    const double v = st.overlap[i + M] + scratch[M + i].real();
+                    if (!std::isfinite(v))
+                    {
+                        tailPoisoned = true;
+                        st.overlap[i] = 0.0;
+                    }
+                    else
+                    {
+                        st.overlap[i] = v;
+                    }
+                }
                 for (int i = L - M; i < L; ++i)
                     st.overlap[i] = 0.0;
+
+                if (tailPoisoned)
+                    std::fill(st.overlap.begin(), st.overlap.end(), 0.0);
             }
 
             st.pos = 0;

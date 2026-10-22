@@ -49,7 +49,7 @@ namespace DesignConstants
     // 底部面板布局（ModeSelector::resized 的列宽/间距/圆角 chip 尺寸）
     inline constexpr int modeColumnWidth    = 156;
     inline constexpr int firColumnWidth     = 80;
-    inline constexpr int spectrumColumnWidth = 78;   // v0.4.1：频谱组增至六列（含平滑）
+    inline constexpr int spectrumColumnWidth = 80;   // v0.5.0：留出 42 px 文本区，避免默认选项截断
     inline constexpr int columnGap          = 8;
     inline constexpr int groupGap           = 24;
     inline constexpr int latencyChipWidth   = 232;

@@ -21,7 +21,8 @@ public:
     static juce::Font value();
 
 private:
-    static juce::Typeface::Ptr getAvenirTypeface();
+    static juce::Typeface::Ptr getRegularTypeface();
+    static juce::Typeface::Ptr getBoldTypeface();
     static juce::Font withTypeface(juce::Typeface::Ptr typeface, float size,
                                     juce::Font::FontStyleFlags style = juce::Font::plain);
 

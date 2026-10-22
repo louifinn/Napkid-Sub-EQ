@@ -2,8 +2,8 @@
 
 <JUCERPROJECT id="YD8LOD" name="Napkid Sub EQ" projectType="audioplug" useAppConfig="0"
               addUsingNamespaceToJuceHeader="0" jucerFormatVersion="1" pluginFormats="buildStandalone,buildVST3"
-              pluginVST3Category="EQ" companyName="Napkid Audio" companyEmail="3225607112@qq.com"
-              version="0.4.6" pluginCode="Nseq" pluginManufacturer="Napkid Audio">
+              pluginVST3Category="EQ" companyName="Napkid Audio" companyEmail=""
+              version="0.5.0" pluginCode="Nseq" pluginManufacturer="Napkid Audio">
   <MAINGROUP id="lnXInZ" name="Napkid Sub EQ">
     <GROUP id="{730EE156-EB98-7118-C7AB-A3A3DB8657E7}" name="Source">
       <FILE id="zHF3zP" name="PluginProcessor.cpp" compile="1" resource="0"
@@ -15,6 +15,23 @@
       <FILE id="GEYmWY" name="PluginEditor.h" compile="0" resource="0" file="Source/PluginEditor.h"/>
       <FILE id="sEqC01" name="SubEQ_Core.cpp" compile="1" resource="0" file="Source/SubEQ_Core.cpp"/>
       <FILE id="sEqC02" name="SubEQ_Core.h" compile="0" resource="0" file="Source/SubEQ_Core.h"/>
+      <FILE id="sEqBq1" name="SubEQ_Biquad.h" compile="0" resource="0" file="Source/SubEQ_Biquad.h"/>
+      <FILE id="sEqBq2" name="SubEQ_BiquadDesign.h" compile="0" resource="0" file="Source/SubEQ_BiquadDesign.h"/>
+      <FILE id="sEqCm1" name="SubEQ_CoordinateMapper.h" compile="0" resource="0" file="Source/SubEQ_CoordinateMapper.h"/>
+      <FILE id="sEqDm1" name="SubEQ_DSPMath.h" compile="0" resource="0" file="Source/SubEQ_DSPMath.h"/>
+      <FILE id="sEqFc1" name="SubEQ_FFTConvolver.h" compile="0" resource="0" file="Source/SubEQ_FFTConvolver.h"/>
+      <FILE id="sEqFt1" name="SubEQ_FilterType.h" compile="0" resource="0" file="Source/SubEQ_FilterType.h"/>
+      <FILE id="sEqFd1" name="SubEQ_FIRDesign.h" compile="0" resource="0" file="Source/SubEQ_FIRDesign.h"/>
+      <FILE id="sEqFh1" name="SubEQ_FIRHistory.h" compile="0" resource="0" file="Source/SubEQ_FIRHistory.h"/>
+      <FILE id="sEqFs1" name="SubEQ_FIRSwitchState.h" compile="0" resource="0" file="Source/SubEQ_FIRSwitchState.h"/>
+      <FILE id="sEqFr1" name="SubEQ_FirResolution.h" compile="0" resource="0" file="Source/SubEQ_FirResolution.h"/>
+      <FILE id="sEqNi1" name="SubEQ_NodeInteraction.h" compile="0" resource="0" file="Source/SubEQ_NodeInteraction.h"/>
+      <FILE id="sEqOs1" name="SubEQ_OutputStage.h" compile="0" resource="0" file="Source/SubEQ_OutputStage.h"/>
+      <FILE id="sEqSc1" name="SubEQ_SpectrumConfig.h" compile="0" resource="0" file="Source/SubEQ_SpectrumConfig.h"/>
+      <FILE id="sEqSm1" name="SubEQ_SpectrumMath.h" compile="0" resource="0" file="Source/SubEQ_SpectrumMath.h"/>
+      <FILE id="sEqSp1" name="SubEQ_Spring.h" compile="0" resource="0" file="Source/SubEQ_Spring.h"/>
+      <FILE id="sEqVq1" name="SubEQ_VQTDesign.h" compile="0" resource="0" file="Source/SubEQ_VQTDesign.h"/>
+      <FILE id="sEqWf1" name="SubEQ_WindowFunctions.h" compile="0" resource="0" file="Source/SubEQ_WindowFunctions.h"/>
       <FILE id="sEqP01" name="SubEQ_Parameters.h" compile="0" resource="0"
             file="Source/SubEQ_Parameters.h"/>
       <FILE id="sEqS01" name="SubEQ_Spectrum.cpp" compile="1" resource="0"
@@ -64,7 +81,9 @@
               file="Source/SubEQ_Editor/ModeSelector.h"/>
       </GROUP>
       <GROUP id="{C3D4E5F6-A7B8-9012-CDEF-234567890123}" name="Fonts">
-        <FILE id="avnFt" name="Avenir.ttf" compile="0" resource="1" file="Source/Fonts/Avenir.ttf"/>
+        <FILE id="intRg1" name="Inter-Regular.ttf" compile="0" resource="1" file="Source/Fonts/Inter-Regular.ttf"/>
+        <FILE id="intBd1" name="Inter-Bold.ttf" compile="0" resource="1" file="Source/Fonts/Inter-Bold.ttf"/>
+        <FILE id="intOf1" name="OFL.txt" compile="0" resource="0" file="Source/Fonts/OFL.txt"/>
       </GROUP>
     </GROUP>
   </MAINGROUP>

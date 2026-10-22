@@ -53,7 +53,7 @@
  #define JucePlugin_ManufacturerWebsite    "www.NapkidAudio.com"
 #endif
 #ifndef  JucePlugin_ManufacturerEmail
- #define JucePlugin_ManufacturerEmail      "3225607112@qq.com"
+ #define JucePlugin_ManufacturerEmail      ""
 #endif
 #ifndef  JucePlugin_ManufacturerCode
  #define JucePlugin_ManufacturerCode       0x4d616e75
@@ -77,13 +77,13 @@
  #define JucePlugin_EditorRequiresKeyboardFocus  0
 #endif
 #ifndef  JucePlugin_Version
- #define JucePlugin_Version                0.4.6
+ #define JucePlugin_Version                0.5.0
 #endif
 #ifndef  JucePlugin_VersionCode
- #define JucePlugin_VersionCode            0x406
+ #define JucePlugin_VersionCode            0x500
 #endif
 #ifndef  JucePlugin_VersionString
- #define JucePlugin_VersionString          "0.4.6"
+ #define JucePlugin_VersionString          "0.5.0"
 #endif
 #ifndef  JucePlugin_VSTUniqueID
  #define JucePlugin_VSTUniqueID            JucePlugin_PluginCode
@@ -155,7 +155,7 @@
  #define JucePlugin_ARAFactoryID           "com.NapkidAudio.NapkidSubEQ.factory"
 #endif
 #ifndef  JucePlugin_ARADocumentArchiveID
- #define JucePlugin_ARADocumentArchiveID   "com.NapkidAudio.NapkidSubEQ.aradocumentarchive.0.4.6"
+ #define JucePlugin_ARADocumentArchiveID   "com.NapkidAudio.NapkidSubEQ.aradocumentarchive.0.5.0"
 #endif
 #ifndef  JucePlugin_ARACompatibleArchiveIDs
  #define JucePlugin_ARACompatibleArchiveIDs  ""

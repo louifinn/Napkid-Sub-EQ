@@ -32,6 +32,7 @@ private:
     FrequencyResponse freqResponse;
     MasterGainSlider masterGainSlider;
     ModeSelector modeSelector;
+    juce::TooltipWindow tooltipWindow { this, 700 };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SubEQAudioProcessorEditor)
 };

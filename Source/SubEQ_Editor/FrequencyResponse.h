@@ -91,6 +91,9 @@ private:
     int draggedNode = -1;
     bool dragGestureGain = false;            // Gain gesture begun at drag start
     bool dragGestureQ = false;               // Q gesture begun at drag start
+    bool gestureFreqOpen = false;
+    bool gestureGainOpen = false;
+    bool gestureQOpen = false;
     int activeMouseSource = -1;              // multi-touch isolation: owning source
     juce::Point<float> dragStartPos;
     float dragStartFreq = 0.0f;
@@ -125,6 +128,7 @@ private:
     int spectrumBands = 61;                  // band count of the spectrumData snapshot
     int inputSpectrumBands = 61;             // band count of the input snapshot
     int currentTimerHz = 0;                  // spectrum refresh timer rate
+    int lastUiEqMode = -1;                   // selected eq_mode, for repaint invalidation
 
     // Node physics/scale animations run at a fixed 60 Hz on a separate timer
     // so they never slow down when the spectrum refresh rate is lowered
@@ -164,7 +168,11 @@ private:
     void updateResponsePaths();
     void drawBackground(juce::Graphics& g);
     void drawGrid(juce::Graphics& g);
+    void drawFirResolutionWarning(juce::Graphics& g);
     void drawSpectrum(juce::Graphics& g);
+    juce::Rectangle<float> getSpectrumRangeChipBounds() const;
+    double getSpectrumDisplayRangeDb() const;
+    void toggleSpectrumRange();
     void drawResponseCurve(juce::Graphics& g);
     void drawPhaseCurve(juce::Graphics& g);
     void drawNodes(juce::Graphics& g);

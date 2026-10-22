@@ -3,7 +3,7 @@
 
     SubEQ_Parameters.h
     AudioProcessorValueTreeState parameter definitions for Sub EQ.
-    8 EQ nodes × 5 params + master/bypass/mode/FIR length + 6 spectrum = 50 parameters.
+    8 EQ nodes × 5 params + master/bypass/mode/FIR length + 7 spectrum = 51 parameters.
 
   ==============================================================================
 */
@@ -90,11 +90,8 @@ inline void applyNodeValuesToEngine(EQEngine& engine, int nodeIndex,
 // NOTE: APVTS::getRawParameterValue() returns the *denormalised* (physical)
 // value — in JUCE 7 it points at ParameterAdapter::getRawDenormalisedValue(),
 // already converted via convertFrom0to1. No further decoding is needed.
-inline void applyParametersToEngine(juce::AudioProcessorValueTreeState& apvts, EQEngine& engine)
+inline void applyNodesToEngine(juce::AudioProcessorValueTreeState& apvts, EQEngine& engine)
 {
-    engine.setMasterGain(static_cast<double>(apvts.getRawParameterValue("master_gain")->load()));
-    engine.setBypass(apvts.getRawParameterValue("bypass")->load() > 0.5f);
-
     for (int i = 0; i < NumNodes; ++i)
     {
         const float freq   = apvts.getRawParameterValue(getNodeParamID(i, ParamID::Freq))->load();
@@ -105,6 +102,17 @@ inline void applyParametersToEngine(juce::AudioProcessorValueTreeState& apvts, E
 
         applyNodeValuesToEngine(engine, i, freq, gain, qVal, type, enabled);
     }
+}
+
+// Full display transfer function (nodes + master gain + bypass). The FIR
+// designer must use applyNodesToEngine/getNodesMagnitudeLinear instead:
+// output gain and bypass are post-convolution.
+inline void applyParametersToEngine(juce::AudioProcessorValueTreeState& apvts, EQEngine& engine)
+{
+    engine.setMasterGain(static_cast<double>(apvts.getRawParameterValue("master_gain")->load()));
+    engine.setBypass(apvts.getRawParameterValue("bypass")->load() > 0.5f);
+
+    applyNodesToEngine(apvts, engine);
 }
 
 // Create the APVTS parameter layout
@@ -233,7 +241,13 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout
         "spectrum_smoothing",
         "Spectrum Smoothing",
         juce::StringArray { "Off", "1/6", "1/3", "2/3" },
-        1 // default 1/6 octave（功率域段间平滑，宽度以倍频程计；Off 保持逐段原始读数）
+        0 // default Off: a full-scale tone must read 0 dB in the default view
+    ));
+    layout.add(std::make_unique<juce::AudioParameterChoice>(
+        "spectrum_range",
+        "Spectrum Range",
+        juce::StringArray { "24 dB", "60 dB" },
+        1 // default 60 dB full dynamic range
     ));
 
     return layout;

@@ -22,15 +22,22 @@ MasterGainSlider::MasterGainSlider(juce::AudioProcessorValueTreeState& apvtsRef)
 {
     gainParam = apvts.getParameter("master_gain");
     setOpaque(true);
+    setTitle("Master Gain");
+    setDescription("Master output gain in decibels");
+    setWantsKeyboardFocus(true);
     // JUCE 7: mouse move/enter/exit events are always delivered (the legacy
     // setMouseTracking flag was removed), so hover feedback just works.
     thumbScale.setValueImmediate(1.0f);
     trackScale.setValueImmediate(1.0f);
     apvts.addParameterListener("master_gain", this);
+    startTimerHz(20);   // idle poll for host automation repaint
 }
 
 MasterGainSlider::~MasterGainSlider()
 {
+    if (isDragging && gainParam != nullptr)
+        gainParam->endChangeGesture();
+
     stopTimer();
     apvts.removeParameterListener("master_gain", this);
 }
@@ -38,18 +45,16 @@ MasterGainSlider::~MasterGainSlider()
 void MasterGainSlider::parameterChanged(const juce::String& parameterID, float newValue)
 {
     juce::ignoreUnused(parameterID, newValue);
-    // 该回调可能在音频线程执行（宿主自动化同步派发 APVTS 监听器）：repaint
-    // 必须推迟到消息线程（Component 方法非线程安全），并用 SafePointer 防止
-    // 组件先于回调销毁。
-    juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<MasterGainSlider> (this)]
-    {
-        if (safe != nullptr)
-            safe->repaint();
-    });
+    // May run on the audio thread during host automation: only set an atomic
+    // flag; the 30 Hz timer on the message thread repaints.
+    repaintDirty.store(true, std::memory_order_release);
 }
 
 void MasterGainSlider::timerCallback()
 {
+    if (repaintDirty.exchange(false, std::memory_order_acquire))
+        repaint();
+
     bool animating = thumbScale.isAnimating() || trackScale.isAnimating();
 
     // Fill-bar inertia: spring the filtered edge toward the exact thumb centre
@@ -73,8 +78,11 @@ void MasterGainSlider::timerCallback()
 
     if (animating)
         repaint();
-    else
-        stopTimer();
+
+    // Idle at 20 Hz; run at 60 Hz only while a spring/scale animation is live.
+    const int desiredHz = animating ? 60 : 20;
+    if (getTimerInterval() != 1000 / desiredHz)
+        startTimerHz (desiredHz);
 }
 
 //==============================================================================
@@ -326,6 +334,17 @@ void MasterGainSlider::mouseDown(const juce::MouseEvent& event)
     }
     else
     {
+        // Only the actual travel area is clickable; the title and panel padding
+        // must not jump the gain to ±24 dB. The horizontal guard keeps clicks
+        // on the left/right blank margins from jumping the value too.
+        const float y = event.position.y;
+        if (y < getTravelTop() || y > getTravelBottom())
+            return;
+
+        const float dx = event.position.x - static_cast<float>(getWidth()) * 0.5f;
+        if (dx < -12.0f || dx > 12.0f)
+            return;
+
         // Click on the track: jump the thumb. Capture the OLD edge position
         // first so the spring visibly travels from there to the new position.
         // Dragging becomes active from the new position (click-and-drag);
@@ -424,14 +443,37 @@ void MasterGainSlider::mouseDoubleClick(const juce::MouseEvent&)
     resetToZero();
 }
 
+bool MasterGainSlider::keyPressed(const juce::KeyPress& key)
+{
+    float delta = 0.0f;
+    if (key == juce::KeyPress (juce::KeyPress::upKey))          delta = 0.5f;
+    else if (key == juce::KeyPress (juce::KeyPress::downKey))   delta = -0.5f;
+    else if (key == juce::KeyPress (juce::KeyPress::pageUpKey)) delta = 3.0f;
+    else if (key == juce::KeyPress (juce::KeyPress::pageDownKey)) delta = -3.0f;
+    else return false;
+
+    if (gainParam == nullptr)
+        return true;
+
+    const float value = juce::jlimit (-24.0f, 24.0f, getCurrentValue() + delta);
+    gainParam->beginChangeGesture();
+    setValue (value);
+    gainParam->endChangeGesture();
+    repaint();
+    return true;
+}
+
 void MasterGainSlider::mouseWheelMove(const juce::MouseEvent& event,
                                        const juce::MouseWheelDetails& wheel)
 {
+    if (isDragging || event.mods.isAnyMouseButtonDown())
+        return;
+
     float oldFillY = getThumbCentreY();
     float value = getCurrentValue();
     // Windows 滚轮 deltaY ≈ ±0.234/格（JUCE 源码 amount/256，amount=±60）
     // → ×10 后实际约 ±2.3 dB/格（F-013：原注释 ±1 dB 与实现不符）
-    value += wheel.deltaY * 10.0f;
+    value += wheel.deltaY * 10.0f * (wheel.isReversed ? -1.0f : 1.0f);
 
     // Wrap each wheel step in a gesture so hosts record automation correctly
     if (gainParam != nullptr)

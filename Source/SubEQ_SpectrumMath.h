@@ -213,9 +213,13 @@ inline void vqtUpdateDisplayBands (T* powers, T* envelopeState,
                                    int radius, T attackAlpha, T releaseAlpha,
                                    T* outDb, PowerAtBandFn&& powerAtBand) noexcept
 {
-    // 第一遍：本层各段瞬时功率先整层落盘——邻段平滑读到的是同层的新值
+    // 第一遍：本层各段瞬时功率先整层落盘——邻段平滑读到的是同层的新值。
+    // 非有限功率按 0 处理：否则一次 NaN 会永久污染包络并让频段卡在地板。
     for (int i = 0; i < numBandsInTier; ++i)
-        powers[firstBand + i] = static_cast<T> (powerAtBand (i));
+    {
+        const T p = static_cast<T> (powerAtBand (i));
+        powers[firstBand + i] = std::isfinite (p) ? p : static_cast<T> (0);
+    }
 
     // 第二遍：频域平滑（功率域）→ 时间包络（功率域一阶）→ dB/钳位/输出
     for (int i = 0; i < numBandsInTier; ++i)

@@ -6,6 +6,16 @@
     convolution. Coefficient design runs on a background thread with the shared
     radix-2 FFT (SubEQ_DSPMath.h) — JUCE FFT wrapper is unreliable here.
 
+    v0.5.0 T2 switching:
+      - raw input history ring (audio writer / background reader)
+      - background shadow OLA convolution builds a pre-warmed state exactly at
+        the latest completed OLA block boundary
+      - audio swaps the warm state in and crossfades only when the design's
+        group delay is unchanged; latency-changing designs flush at a block
+        boundary (PDC handshake is layered on top in PluginProcessor)
+      - no shared_ptr/vector of a large object is ever destroyed on the audio
+        thread; superseded states go through the retirement rings
+
   ==============================================================================
 */
 
@@ -13,6 +23,7 @@
 #include "SubEQ_DSPMath.h"
 #include "SubEQ_Parameters.h"
 #include "SubEQ_FIRDesign.h"
+#include "SubEQ_FIRSwitchState.h"
 
 namespace SubEQ
 {
@@ -28,7 +39,7 @@ FFTProcessor::FFTProcessor()  : juce::Thread ("SubEQ FIR Designer")
 FFTProcessor::~FFTProcessor()
 {
     // Generous join timeout: the worker loop polls threadShouldExit every
-    // 50 ms and a single design (longest FIR) completes in well under a
+    // 20 ms and a single design (longest FIR) completes in well under a
     // second, so 5 s leaves ample margin against scheduler stalls.
     if (!stopThread (5000))
     {
@@ -45,10 +56,8 @@ FFTProcessor::~FFTProcessor()
 void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
 {
     sampleRate.store(sr, std::memory_order_release);
+    preparedChannels.store(std::max(1, channels), std::memory_order_release);
 
-    // 块尺寸增大时仅重分配交叉淡化临时缓冲（F-003）：卷积状态与已发布
-    // 设计全部保留。process() 的淡化分支要求 numSamples <= xfadeNew 容量，
-    // 容量不足会被静默跳过淡化——参数编辑的输出阶跃随之回归。
     const int xfadeSamples = std::max(1, maxBlockSize);
     if (xfadeNew.getNumSamples() < xfadeSamples)
     {
@@ -56,124 +65,221 @@ void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
         xfadeNew.setSize(std::max(1, numChannels), xfadeSamples);
     }
 
-    // Same session parameters: keep the buffers and any published design.
-    // Hosts commonly re-call prepareToPlay (transport stop/start, loop
-    // points) with an unchanged setup; dropping the published design would
-    // mute the output until the background redesign completes. The design
-    // epoch is deliberately NOT bumped here: an in-flight design was built
-    // from the same sample rate and is still valid — discarding it would
-    // silently revert the user's latest parameter edit.
+    // Same session parameters: keep history, published design and warm state.
+    // Hosts re-call prepareToPlay on transport stop/start.
     if (sr == preparedSampleRate && channels == numChannels && !fftWork.empty())
         return;
 
-    // Any design started before this prepare is stale (it may have snapshotted
-    // a previous sample rate) and must not be published.
     designEpoch.fetch_add(1, std::memory_order_release);
 
     preparedSampleRate = sr;
-    numChannels = channels;
+    numChannels = std::max(1, channels);
 
-    // Pre-allocate for the longest FIR so the audio thread never allocates
-    // when a new design is published mid-stream.
     const int maxL = convolutionFftSize(MaxFirLength, ConvBlockLen);
 
-    channelStates.resize(numChannels);
-    for (auto& ch : channelStates)
+    activeStates.resize(static_cast<size_t>(numChannels));
+    oldStates.resize(static_cast<size_t>(numChannels));
+    for (auto* list : { &activeStates, &oldStates })
     {
-        ch.inputBlock.assign(ConvBlockLen, { 0.0, 0.0 });
-        ch.pos = 0;
-        ch.overlap.assign(maxL, 0.0);
-        ch.outQueue.clear();
-        ch.outQueue.reserve(ConvBlockLen * 2);
-        ch.outRead = 0;
+        for (auto& ch : *list)
+        {
+            ch.inputBlock.assign(static_cast<size_t>(ConvBlockLen), {});
+            ch.pos = 0;
+            ch.overlap.assign(static_cast<size_t>(maxL), 0.0);
+            ch.outQueue.clear();
+            ch.outQueue.reserve(static_cast<size_t>(ConvBlockLen) * 2);
+            ch.outRead = 0;
+        }
     }
 
-    // 交叉淡化用的旧设计累加器：与 channelStates 同构预分配，拷贝赋值时
-    // 容量足够、不会在音频线程分配。
-    oldChannelStates.resize(numChannels);
-    for (auto& ch : oldChannelStates)
-    {
-        ch.inputBlock.assign(ConvBlockLen, { 0.0, 0.0 });
-        ch.pos = 0;
-        ch.overlap.assign(maxL, 0.0);
-        ch.outQueue.clear();
-        ch.outQueue.reserve(ConvBlockLen * 2);
-        ch.outRead = 0;
-    }
-    xfadeOld.setSize(numChannels, std::max(1, maxBlockSize));
-    xfadeNew.setSize(numChannels, std::max(1, maxBlockSize));
-    crossfadeRemaining = 0;
-    processingState = nullptr;
+    xfadeOld.setSize(numChannels, xfadeSamples);
+    xfadeNew.setSize(numChannels, xfadeSamples);
 
-    fftWork.assign(maxL, { 0.0, 0.0 });
+    fftWork.assign(static_cast<size_t>(maxL), {});
+    if (static_cast<int>(warmScratch.size()) < maxL)
+        warmScratch.assign(static_cast<size_t>(maxL), {});
+    prefixScratch.assign(static_cast<size_t>(ConvBlockLen), 0.0f);
+    catchUpInput.assign(static_cast<size_t>(ConvBlockLen), 0.0f);
+    catchUpOutput.assign(static_cast<size_t>(ConvBlockLen), 0.0f);
+    if (static_cast<int>(catchUpScratch.size()) < maxL)
+        catchUpScratch.assign(static_cast<size_t>(maxL), {});
+
+    // Enough history to warm the longest FIR with two extra OLA blocks of
+    // margin; power-of-two capacity keeps modulo cheap.
+    const int warmBlocks = (MaxFirLength + ConvBlockLen - 1) / ConvBlockLen + 2;
+    warmFeedSamples = warmBlocks * ConvBlockLen;
+    if (static_cast<int>(warmInput.size()) < warmFeedSamples)
+        warmInput.assign(static_cast<size_t>(warmFeedSamples), 0.0f);
+    if (static_cast<int>(warmOutput.size()) < warmFeedSamples)
+        warmOutput.assign(static_cast<size_t>(warmFeedSamples), 0.0f);
+
+    // Allocate the history ring for the maximum channel count ONCE. The
+    // background warm builder may read it concurrently, so prepare() must not
+    // reallocate or clear it on ordinary sample-rate/channel-count changes.
+    // Samples before historyValidFrom belong to a previous session and are
+    // never used for warm-up.
+    const int historyCapacity = nextPowerOfTwo(MaxFirLength + ConvBlockLen);
+    if (history.capacity() != historyCapacity
+        || history.numChannels() < SubEQ::EQNode::MaxChannels)
+        history.prepare(SubEQ::EQNode::MaxChannels, historyCapacity);
+    historyValidFrom.store(history.publishedCount(), std::memory_order_release);
+
     activeConvFFTSize = 0;
-    pendingState = nullptr;
+    activeGroupDelay = 0;
+    processedVersion = 0;
+    currentOlaBlockIndex = 0;
+    reportedActiveLatency.store(0, std::memory_order_release);
+    publishedLatency.store(0, std::memory_order_release);
+    latencyAckVersion.store(0, std::memory_order_release);
+    latencyGuardVersion = 0;
+    latencyGuardSamples = 0;
+    latencyWaitVersion = 0;
+    latencyWaitSamples = 0;
+    firstDesignWaitSamples = 0;
+    firstDesignWaitVersion = -1;
+    startupFadeRemaining = 0;
+    crossfadeRemaining = 0;
+    fadeConvFFTSize = 0;
     twiddlePrewarmedSize = 0;
+    audioTwiddlesPrewarmed = false;
 
-    // Pre-build the twiddle tables for every selectable convolution size on
-    // this thread, so the first real-time FFT does not allocate (the cache
-    // is thread_local; prepareToPlay normally runs on the audio thread).
+    // Drop all published/active designs and warm states. Moves are O(1);
+    // destruction happens on the background thread.
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+
+        auto dropDesign = [&](std::shared_ptr<const FIRState>& p)
+        {
+            if (p == nullptr)
+                return;
+            auto& slot = pendingDestroy[pendingDestroyHead];
+            if (slot == nullptr)
+            {
+                slot = std::move(p);
+                pendingDestroyHead = (pendingDestroyHead + 1) % NumRetireSlots;
+            }
+        };
+        auto dropWarm = [&](std::shared_ptr<WarmState>& w)
+        {
+            if (w == nullptr)
+                return;
+            auto& slot = pendingWarmDestroy[pendingWarmDestroyHead];
+            if (slot == nullptr)
+            {
+                slot = std::move(w);
+                pendingWarmDestroyHead = (pendingWarmDestroyHead + 1) % NumWarmRetireSlots;
+            }
+        };
+
+        dropDesign(currentState);
+        dropDesign(localState);
+        dropDesign(activeState);
+        dropDesign(oldState);
+        dropDesign(deferredDesignRetire);
+        dropWarm(currentWarm);
+        dropWarm(localWarm);
+        dropWarm(deferredWarmRetire);
+    }
+
+    lastSeenVersion = 0;
+    lastSeenWarmVersion = 0;
+    stateVersion.fetch_add(1, std::memory_order_release);
+    warmVersion.fetch_add(1, std::memory_order_release);
+
     for (int i = 0; i < NumFirLengthChoices; ++i)
         prewarmTwiddleTable<double>(convolutionFftSize(FirLengthChoices[i], ConvBlockLen));
 
-    // Drop any previously published design: the engine will be redesigned
-    // once the mode/parameters demand it. 全部移交退役环（仅指针搬移），
-    // ~2.3 MB 的 FIRState 析构由后台线程在锁外执行（F-002）。
-    {
-        std::lock_guard<std::mutex> lock(stateMutex);
-        if (currentState != nullptr)
-        {
-            pendingDestroy[pendingDestroyHead] = std::move (currentState);
-            pendingDestroyHead = (pendingDestroyHead + 1) % NumRetireSlots;
-        }
-        if (oldState != nullptr)
-        {
-            pendingDestroy[pendingDestroyHead] = std::move (oldState);
-            pendingDestroyHead = (pendingDestroyHead + 1) % NumRetireSlots;
-        }
-    }
-    stateVersion.fetch_add(1, std::memory_order_release);
-
-    // The published design was just dropped. If the plugin is in a FIR mode
-    // the audio thread would otherwise output silence (or stale coefficients)
-    // until the user touches a parameter again — request a redesign right
-    // away. Non-blocking and audio-thread safe; the worker ignores the
-    // request in Zero Latency mode.
     requestRedesign();
 }
 
-void FFTProcessor::reset()
+void FFTProcessor::resetConvolution()
 {
-    for (auto& ch : channelStates)
-    {
-        std::fill(ch.inputBlock.begin(), ch.inputBlock.end(), std::complex<double>(0.0, 0.0));
-        ch.pos = 0;
-        std::fill(ch.overlap.begin(), ch.overlap.end(), 0.0);
-        ch.outQueue.clear();
-        ch.outRead = 0;
-    }
-    for (auto& ch : oldChannelStates)
-    {
-        std::fill(ch.inputBlock.begin(), ch.inputBlock.end(), std::complex<double>(0.0, 0.0));
-        ch.pos = 0;
-        std::fill(ch.overlap.begin(), ch.overlap.end(), 0.0);
-        ch.outQueue.clear();
-        ch.outRead = 0;
-    }
     crossfadeRemaining = 0;
-    processingState = nullptr;
-    pendingState = nullptr;
-    retireState (oldState);
+    fadeConvFFTSize = 0;
+    activeConvFFTSize = 0;
+    activeGroupDelay = 0;
+    processedVersion = 0;
+    currentOlaBlockIndex = 0;
+    reportedActiveLatency.store(0, std::memory_order_release);
+    publishedLatency.store(0, std::memory_order_release);
+    latencyGuardVersion = 0;
+    latencyGuardSamples = 0;
+    latencyWaitVersion = 0;
+    latencyWaitSamples = 0;
+    firstDesignWaitSamples = 0;
+    firstDesignWaitVersion = -1;
+    startupFadeRemaining = 0;
+
+    // Invalidate any design that is currently being computed. Without this,
+    // a design started before a mode/length change could still publish and be
+    // adopted after the clear.
+    designEpoch.fetch_add(1, std::memory_order_release);
+
+    auto disposeDesign = [&](std::shared_ptr<const FIRState>& p) -> bool
+    {
+        if (p == nullptr)
+            return true;
+        if (retireState(p))
+            return true;
+        if (deferredDesignRetire == nullptr)
+        {
+            deferredDesignRetire = std::move(p);
+            return true;
+        }
+        return false;
+    };
+
+    // Retire active/old designs. The OLA vectors are swapped out when a warm
+    // state is adopted, so there is no large fill here.
+    disposeDesign(activeState);
+    disposeDesign(oldState);
+
+    if (localState != nullptr && retireState(localState))
+        localState.reset();
+    if (localWarm != nullptr && retireWarm(localWarm))
+        localWarm.reset();
+
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        if (currentWarm != nullptr)
+        {
+            auto& slot = pendingWarmDestroy[pendingWarmDestroyHead];
+            if (slot == nullptr)
+            {
+                slot = std::move(currentWarm);
+                pendingWarmDestroyHead = (pendingWarmDestroyHead + 1) % NumWarmRetireSlots;
+            }
+        }
+    }
+
+    stateVersion.fetch_add(1, std::memory_order_release);
+    warmVersion.fetch_add(1, std::memory_order_release);
 }
 
 void FFTProcessor::clearPublishedState()
 {
-    crossfadeRemaining = 0;
-    processingState = nullptr;
-    pendingState = nullptr;
-    retireState (currentState);
-    retireState (oldState);
+    resetConvolution();
+
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        if (currentState != nullptr)
+        {
+            auto& slot = pendingDestroy[pendingDestroyHead];
+            if (slot == nullptr)
+            {
+                slot = std::move(currentState);
+                pendingDestroyHead = (pendingDestroyHead + 1) % NumRetireSlots;
+            }
+        }
+    }
+
     stateVersion.fetch_add(1, std::memory_order_release);
+}
+
+void FFTProcessor::captureHistory(const float* const* channels, int numChannelsIn,
+                                  int numSamples, bool publishNow)
+{
+    history.writeFrame(channels, numChannelsIn, numSamples, publishNow);
 }
 
 void FFTProcessor::setParameterSource(juce::AudioProcessorValueTreeState* source)
@@ -184,32 +290,39 @@ void FFTProcessor::setParameterSource(juce::AudioProcessorValueTreeState* source
 
 void FFTProcessor::requestRedesign()
 {
+    // A new request invalidates any design currently being computed. The
+    // worker captures this epoch after consuming the request, so its own
+    // generation is not invalidated by the request that woke it.
+    designEpoch.fetch_add(1, std::memory_order_release);
     redesignRequested.store(true, std::memory_order_release);
     redesignEvent.signal();
 }
 
 //==============================================================================
-// Background thread: wait for a redesign request, build a design-time engine
-// snapshot from the parameter source, design the FIR + frequency coefficients
-// and publish them.
+// Background thread: design FIR coefficients, publish, then build a pre-warmed
+// OLA state from the input history (shadow convolution).
 void FFTProcessor::run()
 {
+    std::shared_ptr<FIRState> lastDesign;
+    int lastDesignEpoch = -1;
+
     while (!threadShouldExit())
     {
-        // 排空退役环：先把槽位移出临界区再析构（F-002）——~2.3 MB 的
-        // FIRState 释放不占用 stateMutex，音频线程的过渡期锁点不会被
-        // 放大为"等待后台线程完成大块释放"。
+        // Drain retirement rings outside the lock: no large object is ever
+        // destroyed while holding stateMutex or on the audio thread.
         std::shared_ptr<const FIRState> toFree[NumRetireSlots];
+        std::shared_ptr<WarmState> warmToFree[NumWarmRetireSlots];
         {
             std::lock_guard<std::mutex> lock (stateMutex);
             for (int i = 0; i < NumRetireSlots; ++i)
                 toFree[i] = std::move (pendingDestroy[i]);
+            for (int i = 0; i < NumWarmRetireSlots; ++i)
+                warmToFree[i] = std::move (pendingWarmDestroy[i]);
         }
+        for (auto& p : toFree) p.reset();
+        for (auto& w : warmToFree) w.reset();
 
-        redesignEvent.wait(50);
-
-        if (!redesignRequested.exchange(false, std::memory_order_acquire))
-            continue;
+        redesignEvent.wait(20);
 
         auto* source = parameterSource.load(std::memory_order_acquire);
         if (source == nullptr)
@@ -217,6 +330,64 @@ void FFTProcessor::run()
 
         const auto mode = static_cast<EQMode> (
             static_cast<int> (source->getRawParameterValue ("eq_mode")->load()));
+
+        if (warmRebuildRequested.exchange(false, std::memory_order_acquire)
+            && lastDesign != nullptr && mode != EQMode::ZeroLatency)
+        {
+            auto warm = std::make_shared<WarmState>();
+            if (buildWarmState(*lastDesign, warm))
+            {
+                std::shared_ptr<const FIRState> replacedState;
+                std::shared_ptr<WarmState> replacedWarm;
+                bool publish = false;
+
+                {
+                    std::lock_guard<std::mutex> lock (stateMutex);
+                    if (lastDesignEpoch != designEpoch.load(std::memory_order_acquire))
+                    {
+                        // Stale design; a newer request or prepare wins.
+                    }
+                    else if (lastDesign->version == 0)
+                    {
+                        // The design was built but deliberately not published
+                        // because its warm state was not ready. Publish the
+                        // complete package now.
+                        const int v = stateVersion.fetch_add(1, std::memory_order_acq_rel) + 1;
+                        lastDesign->version = v;
+                        warm->version = v;
+                        replacedState = std::move (currentState);
+                        replacedWarm = std::move (currentWarm);
+                        currentState = lastDesign;
+                        currentWarm = warm;
+                        publishedLatency.store(lastDesign->groupDelay + (ConvBlockLen - 1),
+                                               std::memory_order_release);
+                        publish = true;
+                    }
+                    else if (lastDesign->version == stateVersion.load(std::memory_order_acquire))
+                    {
+                        // Same design, newer warm snapshot.
+                        warm->version = lastDesign->version;
+                        replacedWarm = std::move (currentWarm);
+                        currentWarm = warm;
+                        publish = true;
+                    }
+                }
+
+                if (publish)
+                    warmVersion.fetch_add(1, std::memory_order_release);
+                replacedState.reset();
+                replacedWarm.reset();
+            }
+            else
+            {
+                // History not filled yet (or a transient snapshot failure).
+                // Retry without rebuilding the FIR coefficients.
+                warmRebuildRequested.store(true, std::memory_order_release);
+            }
+        }
+
+        if (!redesignRequested.exchange(false, std::memory_order_acquire))
+            continue;
 
         if (mode == EQMode::ZeroLatency)
             continue;
@@ -227,27 +398,23 @@ void FFTProcessor::run()
                                   ? FirLengthChoices[firChoice]
                                   : DefaultFirLength;
 
-        // Capture the design epoch before snapshotting anything: if prepare()
-        // runs while this design is in flight, the design is stale (e.g. it
-        // snapshotted a previous sample rate) and must be discarded, not
-        // published — otherwise the audio thread would consume coefficients
-        // computed for the wrong sample rate until the next redesign.
         const int epoch = designEpoch.load(std::memory_order_acquire);
 
-        // Build an engine snapshot owned by this thread; the parameter values
-        // are read atomically from the APVTS, so no lock is needed.
         const double sr = sampleRate.load(std::memory_order_acquire);
         if (sr != designSampleRate)
         {
-            designEngine.prepare(sr, 512);
+            designEngine.prepare(sr);
             designSampleRate = sr;
         }
-        applyParametersToEngine(*source, designEngine);
+        applyNodesToEngine(*source, designEngine);
 
         auto newState = std::make_shared<FIRState>();
         newState->firLength = firLength;
 
-        auto magnitude = [&](double w) { return designEngine.getMagnitudeLinear(w); };
+        // Master gain and bypass are applied after convolution by OutputStage;
+        // baking them into the FIR caused a full redesign per gain automation
+        // step and delayed bypass.
+        auto magnitude = [&](double w) { return designEngine.getNodesMagnitudeLinear(w); };
         if (mode == EQMode::LinearPhase)
         {
             newState->coeffs = designLinearPhaseFIR(magnitude, firLength, newState->groupDelay);
@@ -256,324 +423,690 @@ void FFTProcessor::run()
         {
             // 解析统计设计目标的 DC / Nyquist 传输零点阶数，供最小相位设计
             // 剥离奇点：高通在 DC、低通在 Nyquist 各 2 阶，带通各 1 阶，其余
-            // 类型无传输零点。旁路时 magnitude 回调恒为 1.0（无零点），
-            // 因此零点计数也归零——否则解析路径会凭空剥离不存在的因子。
+            // 类型无传输零点。Bypass 不再进入 FIR 设计，因此无需旁路归零。
             int dcZeroOrder = 0;
             int nyquistZeroOrder = 0;
-            if (!designEngine.isBypassed())
+            for (int i = 0; i < EQEngine::MaxNodes; ++i)
             {
-                for (int i = 0; i < EQEngine::MaxNodes; ++i)
-                {
-                    const auto& node = designEngine.getNode(i);
-                    if (!node.isEnabled())
-                        continue;
+                const auto& node = designEngine.getNode(i);
+                if (!node.isEnabled())
+                    continue;
 
-                    switch (node.getType())
-                    {
-                        case FilterType::HighPass: dcZeroOrder += 2;      break;
-                        case FilterType::LowPass:  nyquistZeroOrder += 2; break;
-                        case FilterType::BandPass: ++dcZeroOrder;
-                                                   ++nyquistZeroOrder;    break;
-                        default: break;
-                    }
+                switch (node.getType())
+                {
+                    case FilterType::HighPass: dcZeroOrder += 2;      break;
+                    case FilterType::LowPass:  nyquistZeroOrder += 2; break;
+                    case FilterType::BandPass: ++dcZeroOrder;
+                                               ++nyquistZeroOrder;    break;
+                    default: break;
                 }
             }
 
-            // 传入采样率：带内拟合排序限制在本插件的可用带
-            // min(500 Hz, 0.45·fs) 内；候选在 >500 Hz 至 Nyquist 的正确性由
-            // 设计函数的全带 eligibility 独立把关，不合格候选不会因为带内
-            // 指标占优而被选中（0.4.5 复审 P1 根因）。
             newState->coeffs = designMinimumPhaseFIR(magnitude, firLength, newState->groupDelay,
                                                      dcZeroOrder, nyquistZeroOrder, sr);
         }
 
-        // Pre-compute the frequency-domain filter for overlap-add convolution
-        newState->convFFTSize = convolutionFftSize(firLength, ConvBlockLen);
-        std::vector<std::complex<double>> spec(newState->convFFTSize);
-        for (int i = 0; i < firLength; ++i)
-            spec[i] = { newState->coeffs[i], 0.0 };
-        for (int i = firLength; i < newState->convFFTSize; ++i)
-            spec[i] = { 0.0, 0.0 };
-        fftInPlace(spec.data(), newState->convFFTSize);
+        // Type-I linear phase returns nominal-1 taps; use the actual count for
+        // convolution sizing, frequency-response construction and tail
+        // reporting. Never index coeffs with the nominal parameter value.
+        newState->firLength = static_cast<int>(newState->coeffs.size());
+        if (newState->firLength <= 0)
+            continue;
 
-        newState->freqCoeffs = spec;   // double precision frequency response
+        newState->convFFTSize = convolutionFftSize(newState->firLength, ConvBlockLen);
+        newState->freqCoeffs = buildFirFrequencyCoeffs(newState->coeffs,
+                                                       newState->convFFTSize);
 
-        // Publish (release) so the audio thread sees a fully-formed state.
-        // epoch 复检与发布必须在同一临界区内（F-001）：prepare() 先 bump
-        // epoch、再在锁内清空 currentState——若校验在锁外、发布在锁内，
-        // 采样率切换可在二者之间交错，把按旧采样率设计的系数写回。
-        // 被替换的状态移出临界区析构（若为最后引用），大块释放不占用
-        // 锁（F-002）。
-        std::shared_ptr<const FIRState> replaced;
+        // The design is complete but not published until a matching warm state
+        // exists. Keep it as the worker's pending design so a warm-up retry
+        // does not recompute the (potentially expensive) FIR coefficients.
+        lastDesign = newState;
+        lastDesignEpoch = epoch;
+
+        auto warm = std::make_shared<WarmState>();
+        if (!buildWarmState(*newState, warm))
         {
-            std::lock_guard<std::mutex> lock(stateMutex);
-            if (epoch != designEpoch.load(std::memory_order_acquire))
-                continue;   // 过期设计：丢弃（newState 在锁外析构）
-
-            replaced = std::move (currentState);
-            currentState = newState;
+            // History not filled yet (first FIR entry) or a transient snapshot
+            // failure. Retry the warm-up without a full redesign.
+            warmRebuildRequested.store(true, std::memory_order_release);
+            continue;
         }
-        stateVersion.fetch_add(1, std::memory_order_release);
+
+        std::shared_ptr<const FIRState> replacedState;
+        std::shared_ptr<WarmState> replacedWarm;
+        {
+            std::lock_guard<std::mutex> lock (stateMutex);
+            if (epoch != designEpoch.load(std::memory_order_acquire))
+                continue;   // stale design; shared_ptrs destruct on this thread
+
+            // Single writer rule: every version increment uses fetch_add, so
+            // reset/clear events and background publishes can never duplicate
+            // a version number.
+            const int publishedVersion = stateVersion.fetch_add(1, std::memory_order_acq_rel) + 1;
+            newState->version = publishedVersion;
+            warm->version = publishedVersion;
+
+            replacedState = std::move (currentState);
+            replacedWarm = std::move (currentWarm);
+            currentState = newState;
+            currentWarm = warm;
+            publishedLatency.store(newState->groupDelay + (ConvBlockLen - 1),
+                                   std::memory_order_release);
+        }
+        warmVersion.fetch_add(1, std::memory_order_release);
+
+        // Background destruction only.
+        replacedState.reset();
+        replacedWarm.reset();
     }
 }
 
 //==============================================================================
-void FFTProcessor::retireState(std::shared_ptr<const FIRState>& stateToRetire)
+bool FFTProcessor::retireState(std::shared_ptr<const FIRState>& stateToRetire) const
 {
     if (stateToRetire == nullptr)
-        return;
+        return true;
 
-    // 只做指针搬移：FIRState 的析构由后台线程在锁外执行（F-002）。
     std::lock_guard<std::mutex> lock(stateMutex);
-    pendingDestroy[pendingDestroyHead] = std::move (stateToRetire);
+    auto& slot = pendingDestroy[pendingDestroyHead];
+    if (slot != nullptr)
+        return false;
+
+    slot = std::move(stateToRetire);
     pendingDestroyHead = (pendingDestroyHead + 1) % NumRetireSlots;
+    return true;
 }
 
-void FFTProcessor::flushConvolvers()
+bool FFTProcessor::retireWarm(std::shared_ptr<WarmState>& warmToRetire) const
 {
-    // 冲刷新侧卷积累加器与输出队列：旧设计的频率域尾部立即终止，输出
-    // 从下一块起纯为新设计（延迟不同的设计切换路径，见 process()）。
-    for (auto& ch : channelStates)
-    {
-        std::fill(ch.inputBlock.begin(), ch.inputBlock.end(), std::complex<double>(0.0, 0.0));
-        ch.pos = 0;
-        std::fill(ch.overlap.begin(), ch.overlap.end(), 0.0);
-        ch.outQueue.clear();
-        ch.outRead = 0;
-    }
+    if (warmToRetire == nullptr)
+        return true;
+
+    std::lock_guard<std::mutex> lock(stateMutex);
+    auto& slot = pendingWarmDestroy[pendingWarmDestroyHead];
+    if (slot != nullptr)
+        return false;
+
+    slot = std::move(warmToRetire);
+    pendingWarmDestroyHead = (pendingWarmDestroyHead + 1) % NumWarmRetireSlots;
+    return true;
 }
 
-//==============================================================================
 std::shared_ptr<const FFTProcessor::FIRState> FFTProcessor::getPublishedStateForAudioThread() const
 {
-    // Fast path: no new publish since we last looked — zero locks.
-    if (stateVersion.load(std::memory_order_acquire) != lastSeenVersion)
+    const int version = stateVersion.load(std::memory_order_acquire);
+    if (version != lastSeenVersion)
     {
-        std::lock_guard<std::mutex> lock(stateMutex);
-        // 被替换的状态移交退役环，而不是在音频线程析构（~2.3 MB 释放）。
-        if (localState != nullptr)
+        std::shared_ptr<const FIRState> next;
         {
-            pendingDestroy[pendingDestroyHead] = std::move (localState);
-            pendingDestroyHead = (pendingDestroyHead + 1) % NumRetireSlots;
+            std::lock_guard<std::mutex> lock (stateMutex);
+            next = currentState;
         }
-        localState = currentState;
-        lastSeenVersion = stateVersion.load(std::memory_order_relaxed);
+
+        if (next != localState)
+        {
+            const int oldVersion = lastSeenVersion;
+            auto prev = std::move(localState);
+            localState = next;
+            lastSeenVersion = version;
+
+            if (prev != nullptr && !retireState(prev))
+            {
+                if (deferredDesignRetire == nullptr)
+                {
+                    deferredDesignRetire = std::move(prev);
+                }
+                else
+                {
+                    // Ring full and deferred slot occupied: keep the previous
+                    // design cached rather than destroying it on this thread.
+                    localState = std::move(prev);
+                    lastSeenVersion = oldVersion;
+                }
+            }
+        }
+        else
+        {
+            lastSeenVersion = version;
+        }
     }
 
     return localState;
 }
 
-//==============================================================================
-void FFTProcessor::process(juce::AudioBuffer<float>& buffer)
+std::shared_ptr<FFTProcessor::WarmState> FFTProcessor::getWarmStateForAudioThread(int designVersion) const
 {
-    auto state = getPublishedStateForAudioThread();
-    if (state == nullptr || state->freqCoeffs.empty())
-        return;
-
-    const int version = stateVersion.load(std::memory_order_acquire);
-
-    // ---- 发布-订阅接管（F-004）：淡化期间发布的新设计先挂起 ----
-    bool deferred = false;   // 本块挂起新设计、继续推进当前淡化
-    if (crossfadeRemaining > 0 && version != processedVersion)
+    const int version = warmVersion.load(std::memory_order_acquire);
+    if (version != lastSeenWarmVersion)
     {
-        // 延迟不同的设计（FIR 长度/模式变化）必须立即收尾淡化并冲刷切换：
-        // PDC 在发布当块已经翻转，继续淡化会让旧延迟尾音按新延迟补偿
-        // （可闻前回声）。同延迟设计挂起，等淡化收尾后再切换——新侧保持
-        // 原设计，不会在混合权重下中途跳变。
-        if (processingState != nullptr && state->groupDelay != processingState->groupDelay)
+        std::shared_ptr<WarmState> next;
         {
-            crossfadeRemaining = 0;
-            retireState (oldState);
-            flushConvolvers();
+            std::lock_guard<std::mutex> lock (stateMutex);
+            next = currentWarm;
         }
-        else if (processingState != nullptr)
+
+        if (next != localWarm)
         {
-            pendingState = state;
-            state = processingState;
-            deferred = true;   // 跳过下方版本切换分支：processedVersion 保持淡化新侧版本
-        }
-    }
-    else if (crossfadeRemaining <= 0 && pendingState != nullptr)
-    {
-        // 淡化已收尾：采纳挂起的最新设计（下方版本切换分支开启新淡化/冲刷）
-        state = pendingState;
-        pendingState = nullptr;
-    }
+            auto prev = std::move(localWarm);
+            localWarm = next;
+            lastSeenWarmVersion = version;
 
-    const int L = state->convFFTSize;
-    if (L <= 0 || L > static_cast<int>(fftWork.size()))
-        return;
-
-    // 音频线程惰性预热 twiddle（F-010）：宿主可能在非音频线程调用
-    // prepareToPlay，thread_local 缓存在本线程未命中；命中后为廉价查找。
-    if (L != twiddlePrewarmedSize)
-    {
-        prewarmTwiddleTable<double>(L);
-        twiddlePrewarmedSize = L;
-    }
-
-    // 新发布设计的切换策略（F-006）：同延迟设计走 CrossfadeLen 样本交叉
-    // 淡化（两侧管线延迟一致，混合无时间错位，参数编辑无输出阶跃）；延迟
-    // 不同的设计（FIR 长度/模式变化）冲刷累加器立即切换——旧设计尾音若
-    // 按新延迟补偿会变成可闻前回声，宁可瞬时切换也要保证 PDC 与实际输出
-    // 始终一致。
-    if (!deferred && (version != processedVersion || L != activeConvFFTSize))
-    {
-        const std::shared_ptr<const FIRState> prev = processingState;
-
-        if (prev != nullptr && crossfadeRemaining <= 0)
-        {
-            if (prev->groupDelay == state->groupDelay)
+            if (prev != nullptr && !retireWarm(prev))
             {
-                // 同延迟交叉淡化（参数编辑、最小相位换 FIR 长度等）
-                const int oldL = activeConvFFTSize;
-                for (int ch = 0; ch < numChannels; ++ch)
+                if (deferredWarmRetire == nullptr)
+                    deferredWarmRetire = std::move(prev);
+                else
+                    localWarm = std::move(prev);
+            }
+        }
+        else
+        {
+            lastSeenWarmVersion = version;
+        }
+    }
+
+    if (localWarm != nullptr && localWarm->version == designVersion)
+        return localWarm;
+
+    return nullptr;
+}
+
+//==============================================================================
+// Build the exact OLA state at the latest completed OLA block boundary from
+// the raw input history. Feeding the last N+M-1 samples through a zero state
+// is enough for the FIR memory to forget the zero initial state; two extra
+// blocks are added for margin.
+bool FFTProcessor::buildWarmState(const FIRState& design, std::shared_ptr<WarmState>& out)
+{
+    if (out == nullptr || design.freqCoeffs.empty()
+        || design.convFFTSize <= 0 || warmFeedSamples <= 0
+        || static_cast<int>(warmInput.size()) < warmFeedSamples
+        || static_cast<int>(warmOutput.size()) < warmFeedSamples
+        || static_cast<int>(warmScratch.size()) < design.convFFTSize)
+        return false;
+
+    const int channels = preparedChannels.load(std::memory_order_acquire);
+    const int M = ConvBlockLen;
+    const int K = (design.firLength + M - 1) / M + 2;   // warm-up blocks
+    int latestBlock = static_cast<int>(history.publishedCount()
+                                       / static_cast<uint64_t>(M));
+    const int firstValidBlock = static_cast<int>(historyValidFrom.load(std::memory_order_acquire)
+                                                  / static_cast<uint64_t>(M));
+
+    // Do not build a warm state from samples that belong to a previous
+    // sample-rate session; wait until K fresh blocks are available.
+    if (latestBlock - firstValidBlock < K)
+        return false;
+
+    out->states.resize(static_cast<size_t>(std::max(1, channels)));
+    out->version = design.version;
+    out->convFFTSize = design.convFFTSize;
+    out->groupDelay = design.groupDelay;
+
+    std::vector<float> dummyOutput(static_cast<size_t>(M), 0.0f);
+
+    for (int ch = 0; ch < channels; ++ch)
+    {
+        OlaChannelState st;
+        st.inputBlock.assign(static_cast<size_t>(M), {});
+        st.overlap.assign(static_cast<size_t>(design.convFFTSize), 0.0);
+        st.outQueue.clear();
+        st.outQueue.reserve(static_cast<size_t>(M) * 2);
+        st.pos = 0;
+        st.outRead = 0;
+        out->states[static_cast<size_t>(ch)] = std::move(st);
+    }
+
+    // Start K blocks before the latest published boundary (negative blocks
+    // are silence) and feed forward. The audio thread may publish new blocks
+    // while we work; keep extending to the newest boundary. Each OLA block is
+    // much cheaper than real time, so this catches up.
+    int64_t cursor = std::max<int64_t>(static_cast<int64_t>(firstValidBlock),
+                                       static_cast<int64_t>(latestBlock) - K);
+    int fedBlocks = 0;
+    const int maxFedBlocks = K + 128;
+
+    while (fedBlocks < maxFedBlocks)
+    {
+        if (cursor >= static_cast<int64_t>(latestBlock))
+        {
+            latestBlock = static_cast<int>(history.publishedCount()
+                                           / static_cast<uint64_t>(M));
+            if (cursor >= static_cast<int64_t>(latestBlock))
+                break;
+        }
+
+        const int64_t blockStart = cursor * static_cast<int64_t>(M);
+
+        for (int ch = 0; ch < channels; ++ch)
+        {
+            std::fill(warmInput.begin(), warmInput.begin() + M, 0.0f);
+
+            if (blockStart >= 0)
+            {
+                const uint64_t end = static_cast<uint64_t>(blockStart)
+                                   + static_cast<uint64_t>(M);
+                if (!history.snapshot(ch, end, M, warmInput.data()))
+                    return false;
+            }
+
+            processOlaChannel(out->states[static_cast<size_t>(ch)],
+                              warmInput.data(), dummyOutput.data(), M,
+                              M, design.convFFTSize, design.freqCoeffs.data(),
+                              warmScratch);
+        }
+
+        ++cursor;
+        ++fedBlocks;
+
+        if ((fedBlocks & 7) == 0)
+            latestBlock = static_cast<int>(history.publishedCount()
+                                           / static_cast<uint64_t>(M));
+    }
+
+    out->blockIndex = static_cast<int>(cursor);
+    return true;
+}
+
+bool FFTProcessor::catchUpWarmState(WarmState& warm, const FIRState& design, int targetBlock)
+{
+    const int missing = targetBlock - warm.blockIndex;
+    if (missing < 0 || missing > MaxWarmCatchUpBlocks
+        || warm.states.empty()
+        || static_cast<int>(catchUpInput.size()) < ConvBlockLen
+        || static_cast<int>(catchUpOutput.size()) < ConvBlockLen
+        || static_cast<int>(catchUpScratch.size()) < design.convFFTSize)
+        return false;
+
+    const int channels = std::min(numChannels, static_cast<int>(warm.states.size()));
+
+    // The audio thread is the only writer of the history ring, so the range
+    // cannot change during this function. Preflight every snapshot before
+    // mutating any warm state, otherwise a partial catch-up would leave the
+    // state at a boundary that does not match its blockIndex.
+    for (int block = warm.blockIndex; block < targetBlock; ++block)
+    {
+        const uint64_t end = static_cast<uint64_t>(block + 1) * ConvBlockLen;
+        for (int ch = 0; ch < channels; ++ch)
+            if (!history.snapshot(ch, end, ConvBlockLen, catchUpInput.data()))
+                return false;
+    }
+
+    for (int block = warm.blockIndex; block < targetBlock; ++block)
+    {
+        const uint64_t end = static_cast<uint64_t>(block + 1) * ConvBlockLen;
+        for (int ch = 0; ch < channels; ++ch)
+        {
+            if (!history.snapshot(ch, end, ConvBlockLen, catchUpInput.data()))
+                return false;   // should not happen (single writer)
+
+            processOlaChannel(warm.states[static_cast<size_t>(ch)],
+                              catchUpInput.data(), catchUpOutput.data(), ConvBlockLen,
+                              ConvBlockLen, design.convFFTSize,
+                              design.freqCoeffs.data(), catchUpScratch);
+        }
+    }
+
+    warm.blockIndex = targetBlock;
+    return true;
+}
+
+//==============================================================================
+void FFTProcessor::flushConvolvers()
+{
+    auto clear = [](std::vector<OlaChannelState>& list)
+    {
+        for (auto& st : list)
+        {
+            std::fill(st.inputBlock.begin(), st.inputBlock.end(), std::complex<double>(0.0, 0.0));
+            st.pos = 0;
+            std::fill(st.overlap.begin(), st.overlap.end(), 0.0);
+            st.outQueue.clear();
+            st.outRead = 0;
+        }
+    };
+
+    clear(activeStates);
+    clear(oldStates);
+    crossfadeRemaining = 0;
+    if (oldState != nullptr && !retireState(oldState) && deferredDesignRetire == nullptr)
+        deferredDesignRetire = std::move(oldState);
+}
+
+//==============================================================================
+bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
+{
+    const int numSamples = buffer.getNumSamples();
+    if (numSamples <= 0)
+        return false;
+
+    // Retry deferred retirements; never destroy large objects on this thread.
+    if (deferredDesignRetire != nullptr && retireState(deferredDesignRetire))
+        deferredDesignRetire.reset();
+    if (deferredWarmRetire != nullptr && retireWarm(deferredWarmRetire))
+        deferredWarmRetire.reset();
+    if (oldState != nullptr && crossfadeRemaining <= 0
+        && retireState(oldState))
+        oldState.reset();
+
+    auto published = getPublishedStateForAudioThread();
+    if (published == nullptr || published->freqCoeffs.empty())
+    {
+        // No design yet: leave the buffer untouched. The caller keeps the IIR
+        // path alive instead of muting the plugin for the warm-up period.
+        return false;
+    }
+
+    // One-time lazy twiddle warm-up on the audio thread. prepareToPlay may run
+    // on a different thread, and the twiddle cache is thread_local; doing this
+    // once here avoids a hidden allocation on the first real FFT block.
+    if (!audioTwiddlesPrewarmed)
+    {
+        for (int i = 0; i < NumFirLengthChoices; ++i)
+            prewarmTwiddleTable<double>(convolutionFftSize(FirLengthChoices[i], ConvBlockLen));
+        audioTwiddlesPrewarmed = true;
+        twiddlePrewarmedSize = published->convFFTSize;
+    }
+
+    const int channelCount = std::min(buffer.getNumChannels(), numChannels);
+    if (channelCount <= 0)
+        return false;
+
+    const uint64_t historyCount = history.publishedCount();
+    currentOlaBlockIndex = static_cast<int>(historyCount / ConvBlockLen);
+    const int prefix = static_cast<int>(historyCount % ConvBlockLen);
+
+    auto warm = getWarmStateForAudioThread(published->version);
+
+    // A warm state can be adopted at its own exact boundary or advanced by a
+    // small number of OLA blocks on the audio thread. The background builder
+    // may finish during an audio block, which makes the state one block older
+    // than the next block's boundary; bounded catch-up makes that case
+    // deterministic without a second background thread.
+    bool warmOk = false;
+    if (warm != nullptr
+        && warm->version == published->version
+        && warm->states.size() == activeStates.size()
+        && firWarmCatchUpAllowed(warm->blockIndex, currentOlaBlockIndex,
+                                 MaxWarmCatchUpBlocks))
+    {
+        const int missing = currentOlaBlockIndex - warm->blockIndex;
+        warmOk = (missing == 0)
+              || catchUpWarmState(*warm, *published, currentOlaBlockIndex);
+    }
+
+    auto replayPrefix = [&](const FIRState& design)
+    {
+        if (prefix <= 0)
+            return;
+
+        for (int ch = 0; ch < channelCount; ++ch)
+        {
+            if (!history.snapshot(ch, historyCount, prefix, prefixScratch.data()))
+                std::fill(prefixScratch.begin(), prefixScratch.end(), 0.0f);
+
+            processOlaChannel(activeStates[static_cast<size_t>(ch)],
+                              prefixScratch.data(), prefixScratch.data(), prefix,
+                              ConvBlockLen, design.convFFTSize, design.freqCoeffs.data(), fftWork);
+        }
+    };
+
+    auto retireWarmSafely = [&](std::shared_ptr<WarmState>& w)
+    {
+        if (w == nullptr)
+            return;
+        if (retireWarm(w))
+            localWarm.reset();
+        // If the ring is full, localWarm still owns this object; the local
+        // copy released at scope end is not the last reference.
+    };
+
+    // ---- adopt a new design ----
+    if (published->version != processedVersion && crossfadeRemaining <= 0)
+    {
+        const bool latencyChanging = (activeState == nullptr)
+                                  || (published->groupDelay != activeGroupDelay);
+
+        // PDC handshake: the host must be told the new latency before the
+        // audio switches to it. Wait/guard are measured in samples so the
+        // policy does not change with the host block size.
+        bool pdcBlocked = false;
+        if (latencyChanging)
+        {
+            const int ack = latencyAckVersion.load(std::memory_order_acquire);
+            const double sr = sampleRate.load(std::memory_order_acquire);
+            if (ack < published->version)
+            {
+                if (latencyWaitVersion != published->version)
                 {
-                    oldChannelStates[ch] = channelStates[ch];
-                    // FIR 长度变化时，旧累加器在 [oldL, newL) 区域的数据在新
-                    // 尺寸下会被读取——先清零，避免陈旧的未初始化数据混入。
-                    if (L > oldL)
-                    {
-                        const int zeroEnd = std::min(L, static_cast<int>(oldChannelStates[ch].overlap.size()));
-                        std::fill(oldChannelStates[ch].overlap.begin() + oldL,
-                                  oldChannelStates[ch].overlap.begin() + zeroEnd, 0.0);
-                    }
+                    latencyWaitVersion = published->version;
+                    latencyWaitSamples = 0;
                 }
-                oldState = prev;   // 上一块实际使用的设计
-                fadeConvFFTSize = oldL;
+
+                latencyWaitSamples += numSamples;
+                // Offline/headless hosts may never pump the message thread:
+                // after ~1 s of audio, stop gating rather than staying silent.
+                if (sr > 0.0 && static_cast<double>(latencyWaitSamples) <= sr)
+                    pdcBlocked = true;
+            }
+            else
+            {
+                if (latencyGuardVersion != published->version)
+                {
+                    latencyGuardVersion = published->version;
+                    const int guardByTime = (sr > 0.0) ? static_cast<int>(0.05 * sr) : 0;
+                    latencyGuardSamples = std::max(2 * numSamples, guardByTime);
+                }
+
+                if (latencyGuardSamples > 0)
+                {
+                    latencyGuardSamples -= numSamples;
+                    pdcBlocked = true;
+                }
+            }
+        }
+
+        if (!warmOk)
+            warmRebuildRequested.store(true, std::memory_order_release);
+
+        // Last-resort first-design start: if no warm state can be adopted for
+        // 2 s and there is no active design, start from zero state and fade in
+        // rather than staying silent forever. PDC gating still wins.
+        bool fallbackAdopted = false;
+        if (!warmOk && activeState == nullptr && !pdcBlocked)
+        {
+            if (firstDesignWaitVersion != published->version)
+            {
+                firstDesignWaitVersion = published->version;
+                firstDesignWaitSamples = 0;
+            }
+            firstDesignWaitSamples += numSamples;
+            const double sr = sampleRate.load(std::memory_order_acquire);
+            if (sr > 0.0 && static_cast<double>(firstDesignWaitSamples) >= 2.0 * sr)
+            {
+                flushConvolvers();
+                activeState = published;
+                activeConvFFTSize = published->convFFTSize;
+                activeGroupDelay = published->groupDelay;
+                processedVersion = published->version;
+                reportedActiveLatency.store(published->groupDelay + (ConvBlockLen - 1),
+                                            std::memory_order_release);
+                startupFadeRemaining = CrossfadeLen;
+                firstDesignWaitSamples = 0;
+                fallbackAdopted = true;
+            }
+        }
+
+        if (!fallbackAdopted && warmOk && !pdcBlocked)
+        {
+            const bool sameDelay = activeState != nullptr
+                                && published->groupDelay == activeGroupDelay;
+
+            if (activeState == nullptr)
+            {
+                activeStates.swap(warm->states);
+                crossfadeRemaining = 0;
+            }
+            else if (sameDelay)
+            {
+                // Both sides share the same time axis: old state continues,
+                // new state starts from the exact warm snapshot.
+                oldState = activeState;
+                oldStates.swap(activeStates);
+                activeStates.swap(warm->states);
+                fadeConvFFTSize = activeConvFFTSize;
                 crossfadeRemaining = CrossfadeLen;
             }
             else
             {
-                // 延迟不同：冲刷新侧累加器，立即切换到新设计。
-                flushConvolvers();
+                // Different group delay: flushing is the only time-aligned
+                // option. The old design is retired (never destroyed here).
+                if (activeState != nullptr && !retireState(activeState))
+                {
+                    if (deferredDesignRetire == nullptr)
+                        deferredDesignRetire = std::move(activeState);
+                    else
+                    {
+                        warmRebuildRequested.store(true, std::memory_order_release);
+                        buffer.clear();
+                        return true;   // FIR path owns this block; keep it silent
+                    }
+                }
+
+                activeStates.swap(warm->states);
+                oldState = nullptr;
+                crossfadeRemaining = 0;
             }
+
+            activeState = published;
+            activeConvFFTSize = published->convFFTSize;
+            activeGroupDelay = published->groupDelay;
+            processedVersion = published->version;
+            reportedActiveLatency.store(published->groupDelay + (ConvBlockLen - 1),
+                                        std::memory_order_release);
+            firstDesignWaitSamples = 0;
+
+            replayPrefix(*published);
+            retireWarmSafely(warm);
         }
-        activeConvFFTSize = L;
-        processedVersion = version;
     }
 
-    const int channelCount = std::min(buffer.getNumChannels(), numChannels);
-    const int numSamples = buffer.getNumSamples();
-    const bool hasOld = (oldState != nullptr) && !oldState->freqCoeffs.empty();
-
-    if (crossfadeRemaining > 0 && numSamples <= xfadeNew.getNumSamples())
+    if (activeState == nullptr)
     {
-        // 双卷积 + 线性斜坡混合：旧侧从当前累加器无缝续接，新侧从 0 权重
-        // 渐入；权重按样本递增，淡化结束后的输出纯为新设计。
+        // Design exists but is not active yet (warm-up/PDC). Leave the raw
+        // input untouched so the caller can keep the IIR path running.
+        return false;
+    }
+
+    // ---- convolve ----
+    if (crossfadeRemaining > 0 && numSamples <= xfadeNew.getNumSamples()
+        && oldState != nullptr)
+    {
         const int startRemaining = crossfadeRemaining;
-        const float invLen = 1.0f / static_cast<float>(CrossfadeLen + 1);
+        const int oldL = fadeConvFFTSize;
+
         for (int ch = 0; ch < channelCount; ++ch)
         {
             auto* data = buffer.getWritePointer(ch);
-            if (hasOld)
-            {
-                processOlaChannel(oldChannelStates[ch],
-                                  xfadeOld.getWritePointer(ch), xfadeOld.getWritePointer(ch),
-                                  numSamples, ConvBlockLen, fadeConvFFTSize,
-                                  oldState->freqCoeffs.data(), fftWork);
-            }
-            processOlaChannel(channelStates[ch],
-                              xfadeNew.getWritePointer(ch), xfadeNew.getWritePointer(ch),
-                              numSamples, ConvBlockLen, L,
-                              state->freqCoeffs.data(), fftWork);
 
-            const float* oldData = hasOld ? xfadeOld.getReadPointer(ch) : nullptr;
+            processOlaChannel(oldStates[static_cast<size_t>(ch)], data,
+                              xfadeOld.getWritePointer(ch), numSamples,
+                              ConvBlockLen, oldL, oldState->freqCoeffs.data(), fftWork);
+
+            processOlaChannel(activeStates[static_cast<size_t>(ch)], data,
+                              xfadeNew.getWritePointer(ch), numSamples,
+                              ConvBlockLen, activeConvFFTSize,
+                              activeState->freqCoeffs.data(), fftWork);
+
+            const float* oldData = xfadeOld.getReadPointer(ch);
             const float* newData = xfadeNew.getReadPointer(ch);
+
             for (int n = 0; n < numSamples; ++n)
             {
-                const int remaining = startRemaining - n;
-                if (remaining <= 0)
-                {
-                    data[n] = newData[n];
-                    continue;
-                }
-                const float w = static_cast<float>(CrossfadeLen - remaining + 1) * invLen;
-                data[n] = w * newData[n] + (hasOld ? (1.0f - w) * oldData[n] : 0.0f);
+                const float w = firCrossfadeWeight(n, startRemaining, CrossfadeLen);
+                data[n] = w * newData[n] + (1.0f - w) * oldData[n];
             }
         }
 
         crossfadeRemaining = std::max(0, startRemaining - numSamples);
-        if (crossfadeRemaining == 0)
-            retireState (oldState);   // 淡化结束：旧设计移交退役环（锁内仅指针搬移）
+        if (crossfadeRemaining == 0 && oldState != nullptr)
+        {
+            if (!retireState(oldState) && deferredDesignRetire == nullptr)
+                deferredDesignRetire = std::move(oldState);
+        }
     }
     else
     {
         if (crossfadeRemaining > 0)
         {
-            // 临时缓冲不足（宿主块尺寸超预期）或旧设计不可用：直接收尾淡化，
-            // 避免状态悬挂。（F-003 已使块尺寸变化提前重分配缓冲，此分支
-            // 仅剩超常规宿主行为时的兜底。）
+            // Host block larger than the prepared xfade buffer: abandon the
+            // fade and switch cleanly rather than reading past the buffer.
             crossfadeRemaining = 0;
-            retireState (oldState);
+            if (oldState != nullptr)
+            {
+                if (!retireState(oldState) && deferredDesignRetire == nullptr)
+                    deferredDesignRetire = std::move(oldState);
+            }
         }
+
         for (int ch = 0; ch < channelCount; ++ch)
         {
             auto* data = buffer.getWritePointer(ch);
-            processOlaChannel(channelStates[ch], data, data, numSamples,
-                              ConvBlockLen, L, state->freqCoeffs.data(), fftWork);
+            processOlaChannel(activeStates[static_cast<size_t>(ch)], data, data,
+                              numSamples, ConvBlockLen, activeConvFFTSize,
+                              activeState->freqCoeffs.data(), fftWork);
+        }
+
+        if (startupFadeRemaining > 0)
+        {
+            for (int n = 0; n < numSamples; ++n)
+            {
+                const int rem = startupFadeRemaining - n;
+                const float gain = (rem > 0)
+                                       ? 1.0f - static_cast<float>(rem)
+                                                / static_cast<float>(CrossfadeLen)
+                                       : 1.0f;
+                for (int ch = 0; ch < channelCount; ++ch)
+                    buffer.getWritePointer(ch)[n] *= gain;
+            }
+            startupFadeRemaining = std::max(0, startupFadeRemaining - numSamples);
         }
     }
 
-    processingState = state;   // 记录本块实际使用的设计，供下次淡化起点
+    return true;
 }
 
 //==============================================================================
 int FFTProcessor::getLatencySamples() const
 {
-    auto state = getPublishedStateForAudioThread();
-    if (state == nullptr)
-        return 0;
-    // Overlap-add pipeline delays the output by ConvBlockLen-1 samples
-    // (the first output sample appears after the first complete block).
-    //
-    // PDC 与实际输出的一致性（F-006）：延迟不同的设计发布后立即冲刷切换
-    // （无交叉淡化），因此 PDC 翻转的当块起输出即按新延迟补偿；同延迟
-    // 设计走 1024 样本交叉淡化且延迟数值不变——两条路径下上报的延迟都
-    // 匹配实际输出的管线延迟。
-    return state->groupDelay + (ConvBlockLen - 1);
-}
-
-bool FFTProcessor::isReady() const
-{
-    auto state = getPublishedStateForAudioThread();
-    return (state != nullptr) && !state->freqCoeffs.empty();
+    return reportedActiveLatency.load(std::memory_order_acquire);
 }
 
 int FFTProcessor::getTailLengthSamples() const
 {
-    // Lock-guarded direct read — may be called from the host/GUI thread, so it
-    // must not touch the audio-thread localState cache.
     std::lock_guard<std::mutex> lock(stateMutex);
-    // 未发布时按最大 FIR 长度回退（保守上界）：用户可能选择了 16384/65536
-    // 而默认值 4096 会低估宿主应等待的卷积尾。
     if (currentState == nullptr)
         return MaxFirLength + ConvBlockLen;
     return currentState->firLength + ConvBlockLen;
 }
 
 //==============================================================================
-bool FFTProcessor::getFirPhaseResponseDegrees(double normalizedW, double& phaseDeg) const
+std::shared_ptr<const FFTProcessor::FIRState> FFTProcessor::getFirDesignSnapshot() const
 {
-    // 仅供 GUI 线程调用：临界区内只做 shared_ptr 拷贝（占用时间为纳秒级），
-    // 之后的插值/取相位都在锁外按不可变快照计算，不会拉长音频线程的发布
-    // 临界区，也不会从音频线程阻塞等待。若本函数持有的引用恰好是最后一份，
-    // FIRState 的析构会落在 GUI 线程——不是实时线程，可以接受。
-    std::shared_ptr<const FIRState> state;
-    {
-        std::lock_guard<std::mutex> lock(stateMutex);
-        state = currentState;
-    }
+    std::lock_guard<std::mutex> lock(stateMutex);
+    return currentState;
+}
 
-    if (state == nullptr || state->freqCoeffs.empty() || state->convFFTSize <= 1)
+bool FFTProcessor::computeFirPhaseResponseDegrees(const FIRState& state,
+                                                  double normalizedW, double& phaseDeg)
+{
+    if (state.freqCoeffs.empty() || state.convFFTSize <= 1)
         return false;
 
-    const int fftSize = state->convFFTSize;
+    const int fftSize = state.convFFTSize;
     const double twoPi = juce::MathConstants<double>::twoPi;
-    const double groupDelay = static_cast<double>(state->groupDelay);
+    const double groupDelay = static_cast<double>(state.groupDelay);
 
-    // 归一化角频率 w（弧度/样本）换算为 freqCoeffs 的 bin 位置，再对 FFT 长度
-    // 取模（覆盖 w 超出 [0, pi] 的调用）。
     double binPos = normalizedW * static_cast<double>(fftSize) / twoPi;
     binPos = std::fmod(binPos, static_cast<double>(fftSize));
     if (binPos < 0.0)
@@ -584,35 +1117,20 @@ bool FFTProcessor::getFirPhaseResponseDegrees(double normalizedW, double& phaseD
     const int index1 = (index0 + 1) % fftSize;
     const double frac = binPos - lower;
 
-    // 相邻两个 bin 各自按本 bin 的频率把整体群延迟转回去（乘以 e^{+jωD}，即
-    // 去延迟后的复数响应），再在两者之间做复数线性插值，最后取 arg 得到剩余
-    // 相位。为什么不先插值再减 ωD：std::arg 返回的是主值，补偿整体延迟只能
-    // 用“旋转”实现（arg(H) + ωD 再折回），而且 Linear Phase 的 groupDelay
-    // ≈ N/2 使相邻 bin 的相位旋转近 90°，先插值后补偿的插值误差实测可达
-    // ±4°（4096 抽头、0.5–500 Hz 扫频）；先补偿后插值则与真值一致。
-    // 注意 index1 回绕到 0 时 w1 仍取连续值 2π，因 groupDelay 为整数，
-    // e^{j2π·groupDelay} = 1，与 bin 0 的实际频率 0 等价。
     const double w0 = twoPi * lower / static_cast<double>(fftSize);
     const double w1 = twoPi * (lower + 1.0) / static_cast<double>(fftSize);
     const std::complex<double> derotate0(std::cos(w0 * groupDelay), std::sin(w0 * groupDelay));
     const std::complex<double> derotate1(std::cos(w1 * groupDelay), std::sin(w1 * groupDelay));
 
-    const std::complex<double> a0 = state->freqCoeffs[static_cast<size_t>(index0)] * derotate0;
-    const std::complex<double> a1 = state->freqCoeffs[static_cast<size_t>(index1)] * derotate1;
+    const std::complex<double> a0 = state.freqCoeffs[static_cast<size_t>(index0)] * derotate0;
+    const std::complex<double> a1 = state.freqCoeffs[static_cast<size_t>(index1)] * derotate1;
     const std::complex<double> response = a0 + (a1 - a0) * frac;
 
-    // 幅度为 0 时相位无定义（例如 Type-II 线性相位 FIR 在 Nyquist 处）：本次
-    // 查询按“不可用”上报，由调用方决定是否跳过该点。
     const double magnitude = std::abs(response);
     if (!std::isfinite(magnitude) || magnitude <= 0.0)
         return false;
 
-    // 剩余相位/excess phase：Linear Phase（groupDelay = (N-1)/2）显示平坦 0°
-    // （仅余整数延迟取整带来的约 2° 倾斜，可忽略），Minimum Phase
-    // （groupDelay = 0）显示真实的最小相位曲线。
     double phase = std::arg(response);
-
-    // 规范到 (-pi, pi]（与 EQEngine::getResponsePhaseDegrees 的 [-180, 180] 一致）
     phase = std::fmod(phase, twoPi);
     if (phase <= -juce::MathConstants<double>::pi)
         phase += twoPi;
@@ -620,6 +1138,35 @@ bool FFTProcessor::getFirPhaseResponseDegrees(double normalizedW, double& phaseD
         phase -= twoPi;
 
     phaseDeg = phase * 180.0 / juce::MathConstants<double>::pi;
+    return true;
+}
+
+bool FFTProcessor::computeFirMagnitudeDb(const FIRState& state,
+                                         double normalizedW, double& magnitudeDb)
+{
+    if (state.freqCoeffs.empty() || state.convFFTSize <= 1)
+        return false;
+
+    const int fftSize = state.convFFTSize;
+    const double twoPi = juce::MathConstants<double>::twoPi;
+    double binPos = normalizedW * static_cast<double>(fftSize) / twoPi;
+    binPos = std::fmod(binPos, static_cast<double>(fftSize));
+    if (binPos < 0.0)
+        binPos += static_cast<double>(fftSize);
+
+    const double lower = std::floor(binPos);
+    const int index0 = static_cast<int>(lower) % fftSize;
+    const int index1 = (index0 + 1) % fftSize;
+    const double frac = binPos - lower;
+    const std::complex<double> a0 = state.freqCoeffs[static_cast<size_t>(index0)];
+    const std::complex<double> a1 = state.freqCoeffs[static_cast<size_t>(index1)];
+    const std::complex<double> response = a0 + (a1 - a0) * frac;
+    const double magnitude = std::abs(response);
+
+    if (!std::isfinite(magnitude) || magnitude <= 0.0)
+        return false;
+
+    magnitudeDb = 20.0 * std::log10(magnitude);
     return true;
 }
 

@@ -42,6 +42,11 @@ int SpectrumAnalyzer::kernelSetIndex (int resolutionIndex, int bandCount, Window
 
 void SpectrumAnalyzer::prepare (double sr)
 {
+    // Same sample rate: all 24 kernel combinations and the decimator chain
+    // are already built; transport stop/start must not rebuild them.
+    if (sr == sampleRate && !kernelSets.empty())
+        return;
+
     sampleRate = sr;
 
     // 全量构建 24 个核组合（窗 × 密度 × 分辨率）：O(N) 三角函数只发生在
@@ -92,6 +97,8 @@ void SpectrumAnalyzer::prepare (double sr)
 
 void SpectrumAnalyzer::resetRuntimeState()
 {
+    generation.fetch_add(1, std::memory_order_release);
+
     for (int k = 0; k < numStages; ++k)
     {
         for (auto& s : stages[k].state) s.reset();
@@ -112,6 +119,8 @@ void SpectrumAnalyzer::resetRuntimeState()
         envPowers[i] = kDisplayFloorPower;
         bandDbScratch[i] = static_cast<double> (kDisplayFloorDb);
     }
+
+    generation.fetch_add(1, std::memory_order_release);
 }
 
 void SpectrumAnalyzer::configure (int resolutionIndex, int numBandsIn, int hopSizeIn,
@@ -120,8 +129,15 @@ void SpectrumAnalyzer::configure (int resolutionIndex, int numBandsIn, int hopSi
     const int bands = kBandsByDensity[bandDensityForBands (numBandsIn)];
     const int hop = (hopSizeIn == 1024) ? 1024 : (hopSizeIn == 2048 ? 2048 : 512);
 
-    // 复位分析状态：陈旧数据绝不跨配置混入
-    resetRuntimeState();
+    // Only reset the analysis state when the analysis grid actually changes.
+    // A smoothing-only change must keep powers/env/rings, otherwise the low
+    // tiers go blank for ~1.4 s while they refill.
+    const bool analysisChanged = (bands != activeNumBands)
+                              || (resolutionIndex != lastResolutionIndex)
+                              || (window != lastWindow)
+                              || (hop != hopSize.load());
+    if (analysisChanged)
+        resetRuntimeState();
 
     // 状态全部一致后才发布新配置
     activeNumBands = bands;
@@ -142,10 +158,14 @@ void SpectrumAnalyzer::process (const float* samples, int numSamples)
 
     // 抽取级联（直流阻断 + 逐级 ↓2）与离线原型共用 SubEQ_VQTDesign.h 的
     // vqtDecimationStep——该级联决定进入分析的样本序列与速率，属数值路径。
+    // 非有限输入必须在这里截断：一次 NaN 会永久污染递归状态与环形缓冲。
     for (int i = 0; i < numSamples; ++i)
-        vqtDecimationStep (static_cast<double> (samples[i]), stages, numStages,
+    {
+        const double x = std::isfinite (samples[i]) ? static_cast<double> (samples[i]) : 0.0;
+        vqtDecimationStep (x, stages, numStages,
                            dcPole, dcState,
                            [this] (int t, double sample) { pushTierSample (t, sample); });
+    }
 }
 
 void SpectrumAnalyzer::pushTierSample (int t, double sample)
@@ -205,10 +225,23 @@ void SpectrumAnalyzer::analyzeTier (int t)
 
 int SpectrumAnalyzer::getSpectrum (float* outputBands) const
 {
-    const int bands = numBands.load();
-    for (int i = 0; i < bands; ++i)
-        outputBands[i] = bandData[i].load();
-    return bands;
+    if (outputBands == nullptr)
+        return 0;
+
+    // Retry if a reconfiguration lands during the copy. Per-band atomics keep
+    // the read UB-free; the generation counter removes the mixed-frame case.
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+        const uint32_t gen = generation.load(std::memory_order_acquire);
+        const int bands = numBands.load(std::memory_order_acquire);
+        for (int i = 0; i < bands && i < MaxBands; ++i)
+            outputBands[i] = bandData[i].load(std::memory_order_relaxed);
+
+        if (generation.load(std::memory_order_acquire) == gen)
+            return bands;
+    }
+
+    return numBands.load(std::memory_order_acquire);
 }
 
 } // namespace SubEQ

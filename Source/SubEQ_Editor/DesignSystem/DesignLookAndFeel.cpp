@@ -176,17 +176,29 @@ void DesignLookAndFeel::drawComboBox(juce::Graphics& g, int width, int height, b
     g.setColour(DesignColours::whiteAlpha(enabled ? 40 : 18));
     g.drawRoundedRectangle(body, DesignConstants::cornerRadiusMedium, 1.0f);
 
+    if (box.hasKeyboardFocus (true))
+    {
+        g.setColour(DesignColours::accent().withAlpha(0.65f));
+        g.drawRoundedRectangle(body.reduced(1.0f), DesignConstants::cornerRadiusMedium, 1.5f);
+    }
+
     // Text — drawn here with left padding instead of relying on the ComboBox's
     // internal label (which would start at x=0, outside the body's rounded
     // edge, overflowing the left visual boundary). The internal label is
     // suppressed in drawLabel().
-    auto textArea = juce::Rectangle<float>(body.getX() + 10.0f, body.getY(),
-                                           body.getWidth() - static_cast<float>(buttonW) - 14.0f,
+    // buttonX already starts after the internal label; do not subtract buttonW
+    // a second time (that left ~31 px of text for a 78 px control).
+    const float textLeft = body.getX() + 6.0f;
+    const float textRight = static_cast<float>(buttonX) - 2.0f;
+    auto textArea = juce::Rectangle<float>(textLeft, body.getY(),
+                                           std::max(0.0f, textRight - textLeft),
                                            body.getHeight());
     g.setColour(enabled ? box.findColour(juce::ComboBox::textColourId)
                         : DesignColours::textSecondary().withMultipliedAlpha(0.7f));
-    g.setFont(DesignFonts::body());
-    g.drawText(box.getText(), textArea, juce::Justification::centredLeft, false);
+    // Caption size fits the 78 px spectrum columns without truncating
+    // "B-Harris" / "1/6 oct"; the tooltip carries the full explanation.
+    g.setFont(DesignFonts::caption());
+    g.drawText(box.getText(), textArea, juce::Justification::centredLeft, true);
 
     // Arrow (text is drawn above; arrow keeps its reserved area)
     auto arrowBounds = juce::Rectangle<int>(buttonX, buttonY, buttonW, buttonH).toFloat();

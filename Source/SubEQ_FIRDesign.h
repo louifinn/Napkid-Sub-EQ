@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "SubEQ_DSPMath.h"
+#include "SubEQ_WindowFunctions.h"
 
 namespace SubEQ
 {
@@ -83,39 +84,85 @@ constexpr double kMinPhaseMaxTapMagnitude = 1.0e3;
 // 拐点——故多节点不追求整阶精确零点（测试判据本身也是 legacy 近似）。
 constexpr int kMaxExactZeroProjectionOrder = 2;
 
-// Linear Phase FIR (Type-II even-length): sample the magnitude over [0, pi]
-// with a linear phase term so the time-domain impulse is symmetric.
-// Latency = (firLength - 1) / 2.
+// Linear Phase FIR (Type-I, odd length): Type-I can represent a non-zero
+// Nyquist response and has an integer group delay (N-1)/2. The caller passes
+// the nominal even length; the actual tap count is nominal-1, so the reported
+// latency stays 2047/8191/32767 for the three UI choices while the old Type-II
+// half-sample group-delay error disappears.
+//
+// Design: dense magnitude grid (4x the tap count), linear phase term, inverse
+// FFT, centre-tap extraction, BH-4 window, then exact DC/Nyquist zero
+// projection when the target has a null there.
 template <typename MagnitudeFn>
 inline std::vector<double> designLinearPhaseFIR(MagnitudeFn magnitude, int firLength, int& latencyOut)
 {
-    std::vector<std::complex<double>> spectrum(firLength);
-    const double delayPhaseFactor = -kPi * (firLength - 1) / firLength;
-
-    // Step 1: magnitude response with linear phase term for strict symmetry.
-    // For even-length Type-II FIR, the Nyquist response (i = N/2) must be 0.
-    for (int i = 0; i < firLength / 2; ++i)
+    if (firLength < 3)
     {
-        const double w = kPi * i / (firLength / 2);
-        const double mag = magnitude(w);
-        const double phase = delayPhaseFactor * i;
-        spectrum[i] = { mag * std::cos(phase), mag * std::sin(phase) };
+        latencyOut = 0;
+        return { 1.0 };
     }
-    spectrum[firLength / 2] = { 0.0, 0.0 };   // Type-II FIR: H(pi) = 0
 
-    // Conjugate symmetry for the second half
-    for (int i = firLength / 2 + 1; i < firLength; ++i)
-        spectrum[i] = std::conj(spectrum[firLength - i]);
+    const int taps = firLength - 1;          // odd Type-I
+    const int half = (taps - 1) / 2;         // integer group delay
+    const int designSize = nextPowerOfTwo(std::max(4 * taps, 16));
+    const double twoPi = 2.0 * 3.14159265358979323846;
 
-    // Step 2: IDFT -> time-domain coefficients
-    ifftInPlace(spectrum.data(), firLength);
+    std::vector<std::complex<double>> spectrum(static_cast<size_t>(designSize));
 
-    std::vector<double> coeffsOut(firLength);   // double 抽头：与 DSP 精度约定一致
-    for (int i = 0; i < firLength; ++i)
-        coeffsOut[i] = spectrum[i].real();
+    for (int k = 0; k <= designSize / 2; ++k)
+    {
+        const double w = twoPi * static_cast<double>(k) / static_cast<double>(designSize);
+        double mag = magnitude(w);
+        if (!std::isfinite(mag))
+            mag = 0.0;
+        mag = std::max(0.0, mag);
 
-    latencyOut = (firLength - 1) / 2;
-    return coeffsOut;
+        const double phase = -twoPi * static_cast<double>(half)
+                           * static_cast<double>(k) / static_cast<double>(designSize);
+        const std::complex<double> bin(mag * std::cos(phase), mag * std::sin(phase));
+        spectrum[static_cast<size_t>(k)] = bin;
+
+        if (k > 0 && k < designSize / 2)
+            spectrum[static_cast<size_t>(designSize - k)] = std::conj(bin);
+    }
+
+    ifftInPlace(spectrum.data(), designSize);
+
+    std::vector<double> coeffs(static_cast<size_t>(taps));
+    for (int i = 0; i < taps; ++i)
+        coeffs[static_cast<size_t>(i)] = spectrum[static_cast<size_t>(i)].real();
+
+    // Smooth truncation: keep the linear-phase symmetry, suppress Gibbs.
+    for (int i = 0; i < taps; ++i)
+        coeffs[static_cast<size_t>(i)] *= windowValue(WindowType::BlackmanHarris, i, taps);
+
+    // Exact transmission zeros when the target has them. Both corrections are
+    // symmetric (Type-I), so they preserve linear phase.
+    const double dcTarget = magnitude(0.0);
+    if (std::isfinite(dcTarget) && dcTarget < 1.0e-6)
+    {
+        double sum = 0.0;
+        for (double c : coeffs)
+            sum += c;
+        const double corr = sum / static_cast<double>(taps);
+        for (double& c : coeffs)
+            c -= corr;
+    }
+
+    const double nyquistTarget = magnitude(3.14159265358979323846);
+    if (std::isfinite(nyquistTarget) && nyquistTarget < 1.0e-6)
+    {
+        double alt = 0.0;
+        for (int i = 0; i < taps; ++i)
+            alt += (i & 1) ? -coeffs[static_cast<size_t>(i)]
+                           :  coeffs[static_cast<size_t>(i)];
+        const double corr = -alt / static_cast<double>(taps);
+        for (int i = 0; i < taps; ++i)
+            coeffs[static_cast<size_t>(i)] += (i & 1) ? -corr : corr;
+    }
+
+    latencyOut = half;
+    return coeffs;
 }
 
 namespace detail
@@ -726,17 +773,18 @@ inline std::vector<double> designMinimumPhaseFIR(MagnitudeFn magnitude, int firL
     // 合法高增益目标的峰值远超 kMinPhaseMaxTapMagnitude 也要保留，且不做
     // 全带 eligibility 排序（它是结构性近似零点路径，只作最终兜底）。
     // 仍要求有限性并做精确零点投影（H(0)/H(π) 修到机器精度）。
+    // 返回顺序：合格 factored 候选（带内 fit 最优）→ legacy（有限/projected）
+    // → 仅 legacy 非有限时才回退冲激。legacy 只在 factored 全部不合格时才
+    // 计算——它是 8× 网格兜底，放在成功路径上会白白增加参数拖动的设计延迟。
+    if (!bestEligible.empty())
+        return bestEligible;
+
     std::vector<double> legacyCandidate = detail::designLegacyMinimumPhase(magnitude, firLength);
     if (prepareCandidate(legacyCandidate, false))
     {
         legacyFallback = std::move(legacyCandidate);
         legacyUsable = true;
     }
-
-    // 返回顺序：合格 factored 候选（带内 fit 最优）→ legacy（有限/projected）
-    // → 仅 legacy 非有限时才回退冲激。
-    if (!bestEligible.empty())
-        return bestEligible;
 
     // factored 候选全部不合格（或被 sanity gate 拒绝）：回退 legacy 作为
     // 0.4.4 安全基线——兼容 0.4.4 的近似零点 + 本文的精确零点投影。

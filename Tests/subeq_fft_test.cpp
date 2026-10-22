@@ -1,4 +1,4 @@
-// Standalone regression tests for the shared standalone DSP (13 header-only
+// Standalone regression tests for the shared standalone DSP (17 header-only
 // modules, included directly — no copy drift):
 //   - Source/SubEQ_DSPMath.h          (radix-2 FFT/IDFT, multi-slot twiddle cache)
 //   - Source/SubEQ_FIRDesign.h        (linear / minimum phase FIR design)
@@ -13,6 +13,10 @@
 //   - Source/SubEQ_FilterType.h       (FilterType enum <-> int mapping)
 //   - Source/SubEQ_WindowFunctions.h  (Hann/Blackman/BH-4/Nuttall window family)
 //   - Source/SubEQ_VQTDesign.h        (multi-rate VQT tier/kernel design + offline engine math)
+//   - Source/SubEQ_FIRSwitchState.h   (warm boundary / crossfade policy)
+//   - Source/SubEQ_FIRHistory.h       (T2 input history ring)
+//   - Source/SubEQ_OutputStage.h      (master ramp / latency-compensated bypass)
+//   - Source/SubEQ_FirResolution.h    (FIR resolution assessment)
 //
 // Build (Windows, VS dev prompt; /utf-8 for the non-ASCII comments):
 //   cl /EHsc /std:c++17 /O2 /utf-8 Tests/subeq_fft_test.cpp /Fo:Tests\subeq_fft_test.obj /Fe:Tests\subeq_fft_test.exe
@@ -29,6 +33,14 @@
 #include "../Source/SubEQ_BiquadDesign.h"
 #include "../Source/SubEQ_WindowFunctions.h"
 #include "../Source/SubEQ_VQTDesign.h"
+#include "../Source/SubEQ_FIRSwitchState.h"
+#include "../Source/SubEQ_FIRHistory.h"
+#include "../Source/SubEQ_OutputStage.h"
+#include "../Source/SubEQ_FirResolution.h"
+
+// Exact regression baseline: a silently shrinking test matrix must fail.
+// Update this only together with CHANGELOG/AGENTS after a verified run.
+static constexpr int kExpectedChecks = 595;
 
 #include <complex>
 #include <vector>
@@ -278,9 +290,11 @@ static int feedSignal (OfflineVqtAnalyzer& a, double freqHz, double amplitude,
 }
 
 static int failures = 0;
+static int checksRun = 0;
 
 static void check(bool ok, const std::string& name)
 {
+    ++checksRun;
     if (!ok) { std::printf("FAIL: %s\n", name.c_str()); ++failures; }
     else     std::printf("PASS: %s\n", name.c_str());
 }
@@ -699,30 +713,40 @@ int main()
         check(maxRelErr < 1e-4, "twiddle cache: float FFT matches double at N=16384 after size mixing (maxRelErr=" + std::to_string(maxRelErr) + ")");
     }
 
-    // ---- Test 10: linear phase FIR design ----
+    // ---- Test 10: linear phase FIR design (Type-I odd taps) ----
     {
-        const int N = 1024;
+        const int nominal = 1024;
+        const int taps = nominal - 1;   // Type-I
         int latency = -1;
         auto target = [](double w) { return 1.0 + 0.5 * std::sin(w); };
 
-        auto coeffs = designLinearPhaseFIR(target, N, latency);
-        check(latency == (N - 1) / 2, "linear phase FIR latency == (N-1)/2");
+        auto coeffs = designLinearPhaseFIR(target, nominal, latency);
+        check(static_cast<int>(coeffs.size()) == taps,
+              "linear phase FIR uses Type-I odd tap count");
+        check(latency == (taps - 1) / 2,
+              "linear phase FIR latency is an integer (N-1)/2");
 
         bool symmetric = true;
-        for (int i = 0; i < N / 2; ++i)
-            if (std::abs(coeffs[i] - coeffs[N - 1 - i]) > 1e-5) symmetric = false;
+        for (int i = 0; i < taps / 2; ++i)
+            if (std::abs(coeffs[static_cast<size_t>(i)]
+                         - coeffs[static_cast<size_t>(taps - 1 - i)]) > 1e-9)
+                symmetric = false;
         check(symmetric, "linear phase FIR is symmetric");
 
-        std::vector<std::complex<double>> spec(N);
-        for (int i = 0; i < N; ++i) spec[i] = { (double)coeffs[i], 0.0 };
-        fftInPlace(spec.data(), N);
+        const int fftSize = nextPowerOfTwo(taps);
+        std::vector<std::complex<double>> spec(static_cast<size_t>(fftSize));
+        for (int i = 0; i < taps; ++i)
+            spec[static_cast<size_t>(i)] = { coeffs[static_cast<size_t>(i)], 0.0 };
+        fftInPlace(spec.data(), fftSize);
         double maxErr = 0.0;
-        for (int i = 0; i < N / 2; ++i)   // skip Nyquist (forced 0)
+        for (int i = 0; i <= fftSize / 2; ++i)
         {
-            const double w = kPi * i / (N / 2);
-            maxErr = std::max(maxErr, std::abs(std::abs(spec[i]) - target(w)));
+            const double w = kPi * i / (fftSize / 2);
+            maxErr = std::max(maxErr, std::abs(std::abs(spec[static_cast<size_t>(i)]) - target(w)));
         }
-        check(maxErr < 1e-5, "linear phase FIR magnitude matches target (maxErr=" + std::to_string(maxErr) + ")");
+        check(maxErr < 0.02,
+              "linear phase FIR magnitude matches target (windowed design, maxErr="
+                  + std::to_string(maxErr) + ")");
     }
 
     // ---- Test 11: minimum phase FIR design ----
@@ -1708,13 +1732,20 @@ int main()
                     const VQTTier& T = set.tiers[t];
                     if (T.decimation != (1 << (d9 + VQTNumTiers - 1 - t))) ladderOk = false;
                     if (T.fftSize < nextPowerOfTwo(T.fftSize)) pow2Ok = false;
-                    if (T.windowSeconds > VQTTierCapSeconds + 1.0e-9) capOk = false;
+                    if (T.windowSeconds > 2.0 * VQTTierCapSeconds + 1.0e-9) capOk = false;
                     if (T.fftSize < VQTMinTierFftSize) pow2Ok = false;
                     totalBands += T.numBandsInTier;
                 }
+
+                // The low-frequency gamma tier is the one that used to be
+                // quantised below 2 s; upper tiers legitimately have shorter
+                // windows because their resolution demand is lower.
+                if (set.tiers[0].windowSeconds + 1.0e-9 < VQTTierCapSeconds)
+                    capOk = false;
+
                 check(ladderOk, "tier decimation ladder");
                 check(pow2Ok, "tier fft size is pow2 (>= guard)");
-                check(capOk, "tier windows respect 2 s cap (pow2-quantised)");
+                check(capOk, "tier windows are at least 2 s and below 4 s");
                 check(totalBands == numBands, "tier band partition sums to band count");
 
                 // 核支撑必须落在帧谱范围内且非空
@@ -1846,13 +1877,18 @@ int main()
             const VQTKernelSet set = buildVQTKernelSet (fs, numBands, 1.5, WindowType::BlackmanHarris);
             OfflineVqtAnalyzer a;
             a.prepare (fs, set, hop);
-            const double w1 = 2.0 * 3.14159265358979323846 * 28.0 / fs;
-            const double w2 = 2.0 * 3.14159265358979323846 * 34.0 / fs;
+            const int b28 = OfflineVqtAnalyzer::bandIndexNear (28.0, numBands);
+            const int b34 = OfflineVqtAnalyzer::bandIndexNear (34.0, numBands);
+            // Place each tone exactly at its band centre. With the longer
+            // (>=2 s) low-tier window the bands are narrower, so a tone 0.5 Hz
+            // off-centre legitimately reads below -6 dB.
+            const double f28 = octaveBandCenterFreq (0.5f, b28, numBands);
+            const double f34 = octaveBandCenterFreq (0.5f, b34, numBands);
+            const double w1 = 2.0 * 3.14159265358979323846 * f28 / fs;
+            const double w2 = 2.0 * 3.14159265358979323846 * f34 / fs;
             for (int i = 0; i < static_cast<int> (8.0 * fs); ++i)
                 a.processSample (0.5 * std::sin (w1 * i) + 0.5 * std::sin (w2 * i));
 
-            const int b28 = OfflineVqtAnalyzer::bandIndexNear (28.0, numBands);
-            const int b34 = OfflineVqtAnalyzer::bandIndexNear (34.0, numBands);
             check(a.bandDb[b28] > -8.0 && a.bandDb[b28] < -4.0, "28 Hz tone reads ~-6 dB");
             check(a.bandDb[b34] > -8.0 && a.bandDb[b34] < -4.0, "34 Hz tone reads ~-6 dB");
             check(b28 != b34, "28/34 Hz fall into distinct bands");
@@ -2121,6 +2157,439 @@ int main()
                         totalFall * 1000.0, totalBound * 1000.0,
                         tailFall * 1000.0, tailBound * 1000.0, dt * 1000.0);
         }
+    }
+
+    // ---- Test 27: FIR warm-boundary helpers ----
+    {
+        check(firWarmCatchUpAllowed(7, 7, 4),
+              "FIR warm: an exact boundary is adoptable");
+        check(firWarmCatchUpAllowed(6, 7, 4),
+              "FIR warm: one-block lag is catch-up adoptable");
+        check(firWarmCatchUpAllowed(3, 7, 4),
+              "FIR warm: catch-up window boundary is inclusive");
+        check(!firWarmCatchUpAllowed(2, 7, 4),
+              "FIR warm: larger lag is rejected");
+        check(!firWarmCatchUpAllowed(8, 7, 4),
+              "FIR warm: a state ahead of the audio boundary is rejected");
+        check(!firWarmCatchUpAllowed(-1, 7, 4),
+              "FIR warm: a negative block index is rejected");
+
+        const float w0 = firCrossfadeWeight(0, 1024, 1024);
+        const float w1 = firCrossfadeWeight(1023, 1024, 1024);
+        check(std::abs(w0 - 1.0f / 1025.0f) < 1e-6f && w1 > 0.998f,
+              "FIR crossfade weights span 0 -> 1 over the fade length");
+        check(firCrossfadeWeight(1024, 1024, 1024) == 1.0f,
+              "FIR crossfade reaches unity after the fade");
+    }
+
+    // ---- Test 28: FIR history ring ----
+    {
+        FirHistoryRing ring;
+        ring.prepare(2, 16);
+        std::vector<float> a(10), b(10);
+        for (int i = 0; i < 10; ++i) { a[i] = float(i + 1); b[i] = -float(i + 1); }
+        const float* frames[2] = { a.data(), b.data() };
+        ring.writeFrame(frames, 2, 10);
+        check(ring.publishedCount() == 10, "history ring publishes the write count");
+
+        float got[4] = {};
+        check(ring.snapshot(0, 10, 4, got) && got[0] == 7.0f && got[3] == 10.0f,
+              "history ring snapshots the newest samples (ch0)");
+        check(ring.snapshot(1, 10, 4, got) && got[0] == -7.0f && got[3] == -10.0f,
+              "history ring snapshots the newest samples (ch1)");
+
+        check(!ring.snapshot(0, 11, 1, got),
+              "history ring rejects reads past the published frontier");
+        check(!ring.snapshot(0, 10, 20, got),
+              "history ring rejects reads older than its capacity");
+
+        std::vector<float> more(6);
+        for (int i = 0; i < 6; ++i) more[i] = 100.0f + float(i);
+        const float* one[1] = { more.data() };
+        ring.writeFrame(one, 1, 6);
+        check(ring.publishedCount() == 16, "history ring advances after wrap");
+        check(ring.snapshot(0, 16, 6, got) && got[0] == 100.0f && got[5] == 105.0f,
+              "history ring snapshots across the wrap boundary");
+
+        float big[32] = {};
+        std::vector<float> extra(8, 0.0f);
+        const float* pe[1] = { extra.data() };
+        ring.writeFrame(pe, 1, 8);
+        check(!ring.snapshot(0, 24, 17, big),
+              "history ring rejects a range that has been overwritten");
+
+        // Wide allocation + same-size prepare must not reset published data.
+        FirHistoryRing wide;
+        wide.prepare(8, 32);
+        float c0[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
+        float c1[4] = { -1.0f, -2.0f, -3.0f, -4.0f };
+        const float* fr[2] = { c0, c1 };
+        wide.writeFrame(fr, 2, 4);
+        check(wide.publishedCount() == 4,
+              "history ring writes only the supplied channels in a wide allocation");
+        wide.prepare(8, 32);
+        check(wide.publishedCount() == 4,
+              "history ring same-size prepare does not reset the session");
+        float gotWide[4] = {};
+        check(wide.snapshot(0, 4, 4, gotWide) && gotWide[3] == 4.0f,
+              "history ring keeps channel data after a same-size prepare");
+    }
+
+    // ---- Test 29: output stage ramps and bypass delay ----
+    {
+        OutputStage stage;
+        stage.prepare(48000.0, 8, 1);
+        stage.setMasterDb(-6.020599913);   // 0.5 linear
+        std::vector<float> x(800, 1.0f);
+        float* p[1] = { x.data() };
+        stage.process(p, p, 1, 800);
+        check(x[0] > 0.999f, "output stage master ramp starts at the old gain");
+        check(std::abs(x[799] - 0.501187f) < 0.002f,
+              "output stage master ramp reaches -6 dB");
+
+        OutputStage bypassed;
+        bypassed.prepare(48000.0, 8, 1);
+        bypassed.setMasterDb(0.0);
+        bypassed.setLatency(4);
+        bypassed.setBypass(true);
+        std::vector<float> settle(800, 0.0f);
+        float* ps[1] = { settle.data() };
+        bypassed.process(ps, ps, 1, 800);
+
+        std::vector<float> dryY(16);
+        for (int i = 0; i < 16; ++i) dryY[i] = float(i + 1);
+        std::vector<float> wetY(16, 0.0f);
+        const float* dryPtrs[1] = { dryY.data() };
+        float* wetPtrs[1] = { wetY.data() };
+        bypassed.process(dryPtrs, wetPtrs, 1, 16);
+        check(wetY[0] == 0.0f && wetY[3] == 0.0f
+                  && wetY[4] == 1.0f && wetY[15] == 12.0f,
+              "output stage bypass dry path is delayed by the active latency");
+
+        OutputStage guarded;
+        guarded.prepare(48000.0, 8, 1);
+        std::vector<float> bad(4, 1.0f);
+        bad[1] = std::numeric_limits<float>::quiet_NaN();
+        float* pb[1] = { bad.data() };
+        guarded.process(pb, pb, 1, 4);
+        check(std::isfinite(bad[1]) && std::isfinite(bad[2]),
+              "output stage replaces non-finite samples");
+    }
+
+    // ---- Test 29b: output stage latency retention, snapping, ramp completion ----
+    {
+        // Changing latency must not clear the dry history: bypass would
+        // otherwise go silent for the full new latency.
+        OutputStage s;
+        s.prepare(48000.0, 8, 1);
+        s.setMasterDb(0.0);
+        s.setBypass(false);
+        s.snapToTargets();
+        std::vector<float> fill(16);
+        for (int i = 0; i < 16; ++i) fill[i] = float(i + 1);
+        float* pf[1] = { fill.data() };
+        s.process(pf, pf, 1, 16);
+
+        s.setBypass(true);
+        s.snapToTargets();
+        s.setLatency(4);
+        std::vector<float> dry(8, 100.0f);
+        std::vector<float> wet(8, 0.0f);
+        const float* pd[1] = { dry.data() };
+        float* pw[1] = { wet.data() };
+        s.process(pd, pw, 1, 8);
+        check(wet[0] == 13.0f,
+              "output stage latency change retains the bypass dry history");
+
+        OutputStage snap;
+        snap.prepare(48000.0, 8, 1);
+        snap.setMasterDb(-6.020599913);
+        snap.snapToTargets();
+        std::vector<float> one(1, 1.0f);
+        float* po[1] = { one.data() };
+        snap.process(po, po, 1, 1);
+        check(std::abs(one[0] - 0.5f) < 0.002f,
+              "output stage snap starts at the current parameter value");
+
+        OutputStage ramp;
+        ramp.prepare(48000.0, 8, 1);
+        ramp.setMasterDb(-6.020599913);
+        std::vector<float> blocks(1024, 1.0f);
+        float* pr[1] = { blocks.data() };
+        ramp.setMasterDb(-6.020599913);   // same target: must not restart the ramp
+        ramp.process(pr, pr, 1, 512);
+        ramp.setMasterDb(-6.020599913);
+        float* pr2[1] = { blocks.data() + 512 };
+        ramp.process(pr2, pr2, 1, 512);
+        check(std::abs(blocks[1023] - 0.5f) < 0.002f,
+              "output stage ramp completes despite per-block target updates");
+
+        OutputStage clamped;
+        clamped.prepare(48000.0, 8, 1);
+        clamped.setMasterDb(24.0);
+        clamped.snapToTargets();
+        std::vector<float> huge(1, 1.0e38f);
+        float* ph[1] = { huge.data() };
+        clamped.process(ph, ph, 1, 1);
+        check(std::isfinite(huge[0]) && huge[0] == std::numeric_limits<float>::max(),
+              "output stage clamps finite doubles beyond float range");
+    }
+
+    // ---- Test 29c: FIR frequency-domain construction is tap-count safe ----
+    {
+        std::vector<double> taps(4095, 0.0);
+        taps[0] = 1.0;
+        auto spec = buildFirFrequencyCoeffs(taps, 8192);
+        bool finite = true;
+        for (const auto& c : spec)
+            finite = finite && std::isfinite(c.real()) && std::isfinite(c.imag());
+        check(spec.size() == 8192, "FIR frequency construction uses the FFT size");
+        check(finite, "FIR frequency construction is finite for Type-I taps");
+        check(std::abs(spec[0].real() - 1.0) < 1.0e-9,
+              "FIR frequency construction keeps a unit impulse at DC");
+
+        std::vector<double> tooMany(100, 1.0);
+        auto clamped = buildFirFrequencyCoeffs(tooMany, 64);
+        check(clamped.size() == 64 && std::isfinite(clamped[0].real()),
+              "FIR frequency construction ignores taps beyond the FFT size");
+    }
+
+
+    // ---- Test 30: FIR resolution assessment ----
+    {
+        auto r = assessFirResolution(0.5, 10.0, FilterType::Bell, 65536, 48000.0);
+        check(!r.resolvable && r.requiredLength > 65536,
+              "FIR resolution: 0.5 Hz high-Q Bell needs more than 65536 taps");
+        r = assessFirResolution(100.0, 0.707, FilterType::Bell, 4096, 48000.0);
+        check(r.resolvable, "FIR resolution: 100 Hz Bell fits 4096 taps");
+        r = assessFirResolution(500.0, 0.707, FilterType::HighPass, 4096, 48000.0);
+        check(r.resolvable, "FIR resolution: 500 Hz HP fits 4096 taps");
+        r = assessFirResolution(0.5, 0.707, FilterType::HighPass, 65536, 48000.0);
+        check(!r.resolvable, "FIR resolution: 0.5 Hz HP does not fit 65536 taps");
+    }
+
+    // ---- Test 31: all eight biquad types ----
+    {
+        const FilterType types[8] = { FilterType::Bell, FilterType::HighPass,
+                                      FilterType::LowPass, FilterType::LowShelf,
+                                      FilterType::HighShelf, FilterType::Notch,
+                                      FilterType::Tilt, FilterType::BandPass };
+        const double sr = 48000.0;
+        for (FilterType t : types)
+        {
+            BiquadCoefficients c[2];
+            const int n = computeBiquadCoefficients(100.0, 6.0, 1.0, t, sr, c);
+            bool finite = true, stable = true;
+            for (int b = 0; b < n; ++b)
+            {
+                finite = finite && std::isfinite(c[b].b0) && std::isfinite(c[b].b1)
+                       && std::isfinite(c[b].b2) && std::isfinite(c[b].a1)
+                       && std::isfinite(c[b].a2);
+                stable = stable && c[b].isStable();
+            }
+            check(n >= 1 && n <= 2 && finite && stable,
+                  std::string("biquad type ") + std::to_string(filterTypeToInt(t))
+                      + " is finite and stable");
+        }
+
+        BiquadCoefficients bell[2], notch[2], lowShelf[2], highShelf[2];
+        computeBiquadCoefficients(100.0, 6.0, 1.0, FilterType::Bell, sr, bell);
+        computeBiquadCoefficients(100.0, 6.0, 1.0, FilterType::Notch, sr, notch);
+        computeBiquadCoefficients(100.0, 6.0, 1.0, FilterType::LowShelf, sr, lowShelf);
+        computeBiquadCoefficients(100.0, 6.0, 1.0, FilterType::HighShelf, sr, highShelf);
+        const double w0 = kTwoPi * 100.0 / sr;
+        const double sixDb = std::pow(10.0, 6.0 / 20.0);
+        check(std::abs(std::abs(biquadResponse(bell[0], w0)) - sixDb) < 1e-6,
+              "Bell center gain matches the requested dB");
+        check(std::abs(biquadResponse(notch[0], w0)) < 1e-6,
+              "Notch center is a true null");
+        check(std::abs(std::abs(biquadResponse(lowShelf[0], 0.0)) - sixDb) < 1e-3,
+              "LowShelf reaches the requested gain at DC");
+        check(std::abs(std::abs(biquadResponse(highShelf[0], kPi)) - sixDb) < 1e-3,
+              "HighShelf reaches the requested gain at Nyquist");
+    }
+
+    // ---- Test 32: OLA drains its tail beyond the input length ----
+    {
+        const int M = 8, L = 32;
+        OlaChannelState st;
+        st.inputBlock.assign(M, {});
+        st.overlap.assign(L, 0.0);
+        st.outQueue.clear();
+        st.outRead = 0;
+        st.pos = 0;
+
+        std::vector<double> h(4, 0.0);
+        h[0] = 0.5; h[1] = 0.25; h[2] = 0.125;
+        std::vector<std::complex<double>> freq(L, {});
+        for (int i = 0; i < static_cast<int>(h.size()); ++i)
+            freq[i] = { h[i], 0.0 };
+        fftInPlace(freq.data(), L);
+
+        std::vector<double> input(64, 0.0);
+        input[0] = 1.0;
+        input[7] = -0.5;
+        const int drain = L + M;
+        std::vector<double> out(input.size() + drain, 0.0);
+        std::vector<std::complex<double>> scratch(L);
+
+        processOlaChannel(st, input.data(), out.data(), static_cast<int>(input.size()),
+                          M, L, freq.data(), scratch);
+        std::vector<double> zeros(drain, 0.0);
+        processOlaChannel(st, zeros.data(), out.data() + input.size(), drain,
+                          M, L, freq.data(), scratch);
+
+        double maxErr = 0.0;
+        for (int n = 0; n < static_cast<int>(out.size()); ++n)
+        {
+            double ref = 0.0;
+            const int k = n - (M - 1);
+            if (k >= 0 && k < static_cast<int>(input.size()))
+                for (int j = 0; j < static_cast<int>(h.size()) && j <= k; ++j)
+                    ref += h[j] * input[k - j];
+            maxErr = std::max(maxErr, std::abs(out[n] - ref));
+        }
+        check(maxErr < 1e-12,
+              "OLA output matches direct convolution including the drained tail");
+    }
+
+    // ---- Test 33: T2 warm state + prefix replay matches continuous OLA ----
+    {
+        const int M = 8, L = 32, N = 8;
+        const int pre = 100;
+
+        std::vector<double> h(N, 0.0);
+        for (int i = 0; i < N; ++i)
+            h[static_cast<size_t>(i)] = 0.5 / static_cast<double>(i + 1);
+
+        std::vector<std::complex<double>> freq(L, {});
+        for (int i = 0; i < N; ++i)
+            freq[static_cast<size_t>(i)] = { h[static_cast<size_t>(i)], 0.0 };
+        fftInPlace(freq.data(), L);
+
+        std::vector<double> input(pre + 16, 0.0);
+        for (int i = 0; i < static_cast<int>(input.size()); ++i)
+            input[static_cast<size_t>(i)] = std::sin(0.1 * i) + 0.3 * std::cos(0.37 * i);
+
+        auto makeState = [&]
+        {
+            OlaChannelState st;
+            st.inputBlock.assign(M, {});
+            st.overlap.assign(L, 0.0);
+            st.outQueue.clear();
+            st.outRead = 0;
+            st.pos = 0;
+            return st;
+        };
+
+        std::vector<std::complex<double>> scratch(L);
+
+        OlaChannelState reference = makeState();
+        std::vector<double> refPre(pre, 0.0);
+        processOlaChannel(reference, input.data(), refPre.data(), pre, M, L,
+                          freq.data(), scratch);
+
+        const int boundary = pre / M;
+        const int end = boundary * M;
+        const int prefix = pre - end;
+        const int K = (N + M - 1) / M + 2;
+        const int feed = K * M;
+
+        std::vector<double> warmIn(feed, 0.0);
+        std::vector<double> warmOut(feed, 0.0);
+        const int avail = std::min(end, feed);
+        std::copy(input.begin() + (end - avail), input.begin() + end,
+                  warmIn.begin() + (feed - avail));
+
+        OlaChannelState warm = makeState();
+        processOlaChannel(warm, warmIn.data(), warmOut.data(), feed, M, L,
+                          freq.data(), scratch);
+
+        std::vector<double> prefixIn(static_cast<size_t>(prefix));
+        std::copy(input.begin() + end, input.begin() + end + prefix, prefixIn.begin());
+        std::vector<double> prefixOut(static_cast<size_t>(prefix), 0.0);
+        processOlaChannel(warm, prefixIn.data(), prefixOut.data(), prefix, M, L,
+                          freq.data(), scratch);
+
+        std::vector<double> next(input.begin() + pre, input.begin() + pre + 8);
+        std::vector<double> refNext(8, 0.0);
+        std::vector<double> warmNext(8, 0.0);
+        processOlaChannel(reference, next.data(), refNext.data(), 8, M, L,
+                          freq.data(), scratch);
+        processOlaChannel(warm, next.data(), warmNext.data(), 8, M, L,
+                          freq.data(), scratch);
+
+        double maxErr = 0.0;
+        for (int i = 0; i < 8; ++i)
+            maxErr = std::max(maxErr, std::abs(refNext[static_cast<size_t>(i)]
+                                             - warmNext[static_cast<size_t>(i)]));
+
+        check(maxErr < 1e-12,
+              "T2 warm state + prefix replay matches continuous OLA");
+    }
+
+    // ---- Test 34: DSP boundary hardening ----
+    {
+        BiquadCoefficients bad;
+        bad.b0 = std::numeric_limits<double>::quiet_NaN();
+        bad.a1 = std::numeric_limits<double>::quiet_NaN();
+        bad.forceStable();
+        check(bad.b0 == 1.0 && bad.b1 == 0.0 && bad.b2 == 0.0
+                  && bad.a1 == 0.0 && bad.a2 == 0.0,
+              "forceStable replaces non-finite coefficients with identity");
+
+        BiquadCoefficients out[2];
+        int n = computeBiquadCoefficients(100.0, 0.0, 0.707, FilterType::Bell,
+                                          0.0, out);
+        check(n == 1 && out[0].b0 == 1.0 && out[0].a1 == 0.0,
+              "invalid sample rate returns identity biquad");
+
+        n = computeBiquadCoefficients(std::numeric_limits<double>::quiet_NaN(),
+                                      0.0, 0.707, FilterType::Bell, 48000.0, out);
+        check(n == 1 && out[0].b0 == 1.0,
+              "NaN frequency returns identity biquad");
+
+        int lat = -1;
+        auto shortLin = designLinearPhaseFIR([](double) { return 1.0; }, 0, lat);
+        check(static_cast<int>(shortLin.size()) == 1 && shortLin[0] == 1.0 && lat == 0,
+              "linear phase design handles a degenerate length");
+
+        auto nanTarget = [](double) { return std::numeric_limits<double>::quiet_NaN(); };
+        auto nanMin = designMinimumPhaseFIR(nanTarget, 64, lat);
+        bool nanFinite = true;
+        for (double v : nanMin)
+            if (!std::isfinite(v))
+                nanFinite = false;
+        check(nanFinite && !nanMin.empty(),
+              "minimum phase design always returns finite coefficients");
+    }
+
+    // ---- Test 35: 12th-order VQT decimator stopband ----
+    {
+        BiquadCoefficients coeffs[kVqtDecimatorBiquads];
+        vqtDecimatorCoefficients(48000.0, coeffs);
+
+        auto cascadeDb = [&] (double freqHz)
+        {
+            const double w = kTwoPi * freqHz / 48000.0;
+            std::complex<double> h(1.0, 0.0);
+            for (int b = 0; b < kVqtDecimatorBiquads; ++b)
+                h *= biquadResponse(coeffs[b], w);
+            return 20.0 * std::log10(std::max(std::abs(h), 1.0e-30));
+        };
+
+        // Stage input 48k -> output 24k; output Nyquist = 12 kHz.
+        check(cascadeDb(12000.0) < -60.0,
+              "12th-order VQT decimator gives >=60 dB at output Nyquist");
+        check(cascadeDb(13200.0) < -70.0,
+              "12th-order VQT decimator gives >=70 dB at 0.55x output rate");
+    }
+
+    std::printf("TOTAL CHECKS RUN: %d\n", checksRun);
+    if (checksRun != kExpectedChecks)
+    {
+        std::printf("FAIL: expected %d checks, ran %d\n", kExpectedChecks, checksRun);
+        ++failures;
     }
 
     if (failures == 0)
