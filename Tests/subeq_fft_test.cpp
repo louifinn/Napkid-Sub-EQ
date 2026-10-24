@@ -1,4 +1,4 @@
-// Standalone regression tests for the shared standalone DSP (17 header-only
+// Standalone regression tests for the shared standalone DSP (18 header-only
 // modules, included directly — no copy drift):
 //   - Source/SubEQ_DSPMath.h          (radix-2 FFT/IDFT, multi-slot twiddle cache)
 //   - Source/SubEQ_FIRDesign.h        (linear / minimum phase FIR design)
@@ -17,12 +17,14 @@
 //   - Source/SubEQ_FIRHistory.h       (T2 input history ring)
 //   - Source/SubEQ_OutputStage.h      (master ramp / latency-compensated bypass)
 //   - Source/SubEQ_FirResolution.h    (FIR resolution assessment)
+//   - Source/SubEQ_OlaBank.h          (fixed-capacity OLA + exact warm synthesis)
 //
 // Build (Windows, VS dev prompt; /utf-8 for the non-ASCII comments):
 //   cl /EHsc /std:c++17 /O2 /utf-8 Tests/subeq_fft_test.cpp /Fo:Tests\subeq_fft_test.obj /Fe:Tests\subeq_fft_test.exe
 #include "../Source/SubEQ_DSPMath.h"
 #include "../Source/SubEQ_FIRDesign.h"
 #include "../Source/SubEQ_FFTConvolver.h"
+#include "../Source/SubEQ_OlaBank.h"
 #include "../Source/SubEQ_SpectrumMath.h"
 #include "../Source/SubEQ_SpectrumConfig.h"
 #include "../Source/SubEQ_CoordinateMapper.h"
@@ -35,12 +37,13 @@
 #include "../Source/SubEQ_VQTDesign.h"
 #include "../Source/SubEQ_FIRSwitchState.h"
 #include "../Source/SubEQ_FIRHistory.h"
+#include "../Source/SubEQ_WarmPlan.h"
 #include "../Source/SubEQ_OutputStage.h"
 #include "../Source/SubEQ_FirResolution.h"
 
 // Exact regression baseline: a silently shrinking test matrix must fail.
 // Update this only together with CHANGELOG/AGENTS after a verified run.
-static constexpr int kExpectedChecks = 595;
+static constexpr int kExpectedChecks = 607;
 
 #include <complex>
 #include <vector>
@@ -2416,6 +2419,7 @@ int main()
         st.inputBlock.assign(M, {});
         st.overlap.assign(L, 0.0);
         st.outQueue.clear();
+        st.outQueue.reserve(M * 2);
         st.outRead = 0;
         st.pos = 0;
 
@@ -2477,6 +2481,7 @@ int main()
             st.inputBlock.assign(M, {});
             st.overlap.assign(L, 0.0);
             st.outQueue.clear();
+            st.outQueue.reserve(M * 2);
             st.outRead = 0;
             st.pos = 0;
             return st;
@@ -2526,6 +2531,157 @@ int main()
 
         check(maxErr < 1e-12,
               "T2 warm state + prefix replay matches continuous OLA");
+    }
+
+    // ---- Test 33b: exact boundary warm synthesis (overlap-save + replay) ----
+    {
+        const int M = 8;
+        const int N = 64;
+        const int L = convolutionFftSize(N, M);
+        const int T = 64;                 // target boundary, multiple of M
+        const int S = T - M;
+
+        std::mt19937 rng(321);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        std::vector<float> signal(static_cast<size_t>(T));
+        for (auto& v : signal) v = dist(rng);
+
+        FirHistoryRing history;
+        history.prepare(1, 256);
+        const float* ptrs[1] = { signal.data() };
+        history.writeFrame(ptrs, 1, T, true);
+
+        std::vector<double> taps(static_cast<size_t>(N));
+        for (auto& v : taps) v = 0.5 / static_cast<double>(1 + &v - taps.data());
+        std::vector<std::complex<double>> freq(static_cast<size_t>(L), {});
+        for (int i = 0; i < N; ++i)
+            freq[static_cast<size_t>(i)] = { taps[static_cast<size_t>(i)], 0.0 };
+        fftInPlace(freq.data(), L);
+
+        // Reference: continuous OLA from zero over [0, T).
+        OlaChannelState reference;
+        prepareOlaChannelState(reference, M, L);
+        std::vector<float> block(static_cast<size_t>(M), 0.0f);
+        std::vector<float> out(static_cast<size_t>(M), 0.0f);
+        std::vector<std::complex<double>> scratch(static_cast<size_t>(L));
+        for (int pos = 0; pos < T; pos += M)
+        {
+            std::copy(signal.begin() + pos, signal.begin() + pos + M, block.begin());
+            processOlaChannel(reference, block.data(), out.data(), M, M, L,
+                              freq.data(), scratch);
+        }
+
+        // Synthesized: overlap at S, then replay [S, T).
+        OlaChannelState warm;
+        prepareOlaChannelState(warm, M, L);
+        std::vector<float> inputScratch(static_cast<size_t>(std::max(N, M)), 0.0f);
+        std::vector<float> dummy(static_cast<size_t>(M), 0.0f);
+        check(olaSynthesizeOverlap(history, 0, static_cast<uint64_t>(S), 0,
+                                   N, L, M, freq.data(), warm,
+                                   inputScratch, scratch),
+              "warm synthesis: overlap-save at boundary succeeds");
+        check(olaReplayBlock(history, 0, static_cast<uint64_t>(S), 0,
+                             L, M, freq.data(), warm,
+                             inputScratch, dummy, scratch),
+              "warm synthesis: final OLA block replay succeeds");
+
+        double maxErr = 0.0;
+        for (int i = 0; i < L; ++i)
+            maxErr = std::max(maxErr,
+                              std::abs(reference.overlap[static_cast<size_t>(i)]
+                                     - warm.overlap[static_cast<size_t>(i)]));
+        const bool sameQueue = reference.outQueue.size() == warm.outQueue.size()
+                            && reference.outRead == warm.outRead;
+        double queueErr = 0.0;
+        if (sameQueue)
+            for (size_t i = 0; i < reference.outQueue.size(); ++i)
+                queueErr = std::max(queueErr, std::abs(reference.outQueue[i] - warm.outQueue[i]));
+        check(maxErr < 1e-12 && sameQueue && queueErr < 1e-12,
+              "warm synthesis state matches continuous OLA at the boundary");
+
+        OlaChannelState tooSmall;
+        prepareOlaChannelState(tooSmall, M, 16);
+        std::vector<float> guardIn(static_cast<size_t>(M), 1.0f);
+        std::vector<float> guardOut(static_cast<size_t>(M), 123.0f);
+        processOlaChannel(tooSmall, guardIn.data(), guardOut.data(), M, M, L,
+                          freq.data(), scratch);
+        bool allZero = true;
+        for (float v : guardOut) if (v != 0.0f) allZero = false;
+        check(allZero, "OLA capacity guard fails closed instead of writing past overlap");
+    }
+
+    // ---- Test 33c: arbitrary host-block warm (T = k*M + r) ----
+    {
+        const int M = 8;
+        const int N = 64;
+        const int L = convolutionFftSize(N, M);
+        const int T = 69;                 // not a multiple of M
+
+        std::mt19937 rng(654);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        std::vector<float> signal(static_cast<size_t>(T));
+        for (auto& v : signal) v = dist(rng);
+
+        FirHistoryRing history;
+        history.prepare(1, 256);
+        const float* ptrs[1] = { signal.data() };
+        history.writeFrame(ptrs, 1, T, true);
+
+        std::vector<double> taps(static_cast<size_t>(N));
+        for (auto& v : taps) v = 0.7 / static_cast<double>(2 + &v - taps.data());
+        std::vector<std::complex<double>> freq(static_cast<size_t>(L), {});
+        for (int i = 0; i < N; ++i)
+            freq[static_cast<size_t>(i)] = { taps[static_cast<size_t>(i)], 0.0 };
+        fftInPlace(freq.data(), L);
+
+        OlaChannelState reference;
+        prepareOlaChannelState(reference, M, L);
+        std::vector<float> refOut(static_cast<size_t>(T), 0.0f);
+        std::vector<std::complex<double>> scratch(static_cast<size_t>(L));
+        processOlaChannel(reference, signal.data(), refOut.data(), T, M, L,
+                          freq.data(), scratch);
+
+        OlaChannelState warm;
+        prepareOlaChannelState(warm, M, L);
+        std::vector<float> inputScratch(static_cast<size_t>(std::max(N, M)), 0.0f);
+        std::vector<float> dummy(static_cast<size_t>(M), 0.0f);
+        const bool ok = olaSynthesizeAt(history, 0, static_cast<uint64_t>(T), 0,
+                                        N, L, M, freq.data(), warm,
+                                        inputScratch, dummy, scratch);
+        check(ok, "arbitrary-host-block warm synthesis succeeds");
+
+        double stateErr = 0.0;
+        for (int i = 0; i < L; ++i)
+            stateErr = std::max(stateErr,
+                                std::abs(reference.overlap[static_cast<size_t>(i)]
+                                       - warm.overlap[static_cast<size_t>(i)]));
+        const bool sameQueue = reference.outQueue.size() == warm.outQueue.size()
+                            && reference.outRead == warm.outRead
+                            && reference.pos == warm.pos;
+        double queueErr = 0.0;
+        if (sameQueue)
+            for (size_t i = 0; i < reference.outQueue.size(); ++i)
+                queueErr = std::max(queueErr,
+                                    std::abs(reference.outQueue[i] - warm.outQueue[i]));
+        check(stateErr < 1e-12 && sameQueue && queueErr < 1e-12,
+              "arbitrary-host-block warm matches continuous OLA");
+    }
+
+    // ---- Test 33d: warm target planning is host-block aligned ----
+    {
+        const WarmTarget t = planWarmTarget(1000, 5376, 512, 512);
+        check(t.targetSample == 6656, "warm target aligns up to the host block");
+        check(t.olaBoundary == 6656 && t.prefixSamples == 0,
+              "aligned warm target has no prefix");
+
+        const WarmTarget p = planWarmTarget(1000, 2000, 1000, 512);
+        check(p.targetSample == 3000, "warm target handles non-512 host blocks");
+        check(p.olaBoundary == 2560 && p.prefixSamples == 440,
+              "warm target exposes OLA boundary and prefix");
+        check(warmAdoptableAt(3000, 3000) && !warmAdoptableAt(3000, 3001),
+              "warm adoption is exact-boundary only");
+        check(warmLeadSamples(48000.0, 512, 0.012) >= 5376,
+              "warm lead covers estimated build time plus slack");
     }
 
     // ---- Test 34: DSP boundary hardening ----

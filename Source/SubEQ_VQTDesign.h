@@ -89,19 +89,9 @@ inline double vqtWindowResolutionMultiplier (WindowType type) noexcept
     return 2.0;   // 非法 WindowType：按最宽主瓣处理（保守帧长）
 }
 
-// 真实的主瓣零点半宽（bin）：Hann 2、Blackman 3、B-Harris/Nuttall 4。
-// 用于镜像保护；注意它不等于上面的“分辨率倍率”（后者是帧长设计参数）。
-inline double vqtWindowNullHalfBins (WindowType type) noexcept
-{
-    switch (type)
-    {
-        case WindowType::Hann:           return 2.0;
-        case WindowType::Blackman:       return 3.0;
-        case WindowType::BlackmanHarris: return 4.0;
-        case WindowType::Nuttall:        return 4.0;
-    }
-    return 4.0;
-}
+// 真实的主瓣零点半宽与镜像项不再用于运行时保护：低频频段的镜像支撑是
+// 0.5 Hz 帧内不足两个周期的物理限制（见 Documentation/SubEQ_VQT_Feasibility.md
+// §8）。这里不声称做了镜像抑制；支撑仍取连续区间 [lo,hi]。
 
 // 顶层降采样指数 d：R9 = fs/2^d 落在 ~3 kHz 附近（round），且 fs 必须被 2^d
 // 整除（44.1 kHz → d=2 即 11025 Hz，48k → 16 倍 = 3000 Hz，96k → 32 倍）。
@@ -221,17 +211,6 @@ inline VQTKernel buildVQTKernel (double freqHz, double tierRateHz, int fftSize, 
     while (hi < fftSize - 1 && std::abs (psi[static_cast<size_t> (hi + 1)]) > floorLevel) ++hi;
     lo = std::max (0, lo - 1);
     hi = std::min (fftSize - 1, hi + 1);
-
-    // 镜像支撑下限保护（近似）：实信号正负频率镜像相距 2·b_k bin；当 b_k
-    // （峰位 bin，= f·F/R）小于主瓣零点半宽（nullBins/2）时镜像落进支撑，
-    // 段读数出现与相位相关的摆动（≥2 s 帧下 0.5 Hz 段帧内仍不足一个整周期
-    // ——gamma 区固有）。这里把支撑下限抬到镜像主瓣之外以缓解；底部 gamma 区
-    // 仍可能在 F−1 截断，不能替代更长的帧/更低采样率。
-    const double bFloat = freqHz * static_cast<double> (fftSize) / tierRateHz;
-    const double nullHalfBins = vqtWindowNullHalfBins (win);   // 真实 nullBins/2
-    const int mirrorGuard = static_cast<int> (std::ceil (nullHalfBins - bFloat));
-    if (mirrorGuard > 0)
-        lo = std::min (std::max (lo, mirrorGuard), pk);
 
     double s = 0.0;
     for (int m = lo; m <= hi; ++m)

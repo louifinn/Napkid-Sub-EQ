@@ -20,10 +20,12 @@
       <FILE id="sEqCm1" name="SubEQ_CoordinateMapper.h" compile="0" resource="0" file="Source/SubEQ_CoordinateMapper.h"/>
       <FILE id="sEqDm1" name="SubEQ_DSPMath.h" compile="0" resource="0" file="Source/SubEQ_DSPMath.h"/>
       <FILE id="sEqFc1" name="SubEQ_FFTConvolver.h" compile="0" resource="0" file="Source/SubEQ_FFTConvolver.h"/>
+      <FILE id="sEqOb1" name="SubEQ_OlaBank.h" compile="0" resource="0" file="Source/SubEQ_OlaBank.h"/>
       <FILE id="sEqFt1" name="SubEQ_FilterType.h" compile="0" resource="0" file="Source/SubEQ_FilterType.h"/>
       <FILE id="sEqFd1" name="SubEQ_FIRDesign.h" compile="0" resource="0" file="Source/SubEQ_FIRDesign.h"/>
       <FILE id="sEqFh1" name="SubEQ_FIRHistory.h" compile="0" resource="0" file="Source/SubEQ_FIRHistory.h"/>
       <FILE id="sEqFs1" name="SubEQ_FIRSwitchState.h" compile="0" resource="0" file="Source/SubEQ_FIRSwitchState.h"/>
+      <FILE id="sEqWp1" name="SubEQ_WarmPlan.h" compile="0" resource="0" file="Source/SubEQ_WarmPlan.h"/>
       <FILE id="sEqFr1" name="SubEQ_FirResolution.h" compile="0" resource="0" file="Source/SubEQ_FirResolution.h"/>
       <FILE id="sEqNi1" name="SubEQ_NodeInteraction.h" compile="0" resource="0" file="Source/SubEQ_NodeInteraction.h"/>
       <FILE id="sEqOs1" name="SubEQ_OutputStage.h" compile="0" resource="0" file="Source/SubEQ_OutputStage.h"/>
@@ -107,12 +109,12 @@
   </MODULES>
   <JUCEOPTIONS JUCE_STRICT_REFCOUNTEDPOINTER="1" JUCE_VST3_CAN_REPLACE_VST2="0"
                JUCE_USE_ANDROID_OBOE="0" JUCE_USE_MP3AUDIOFORMAT="1" JUCE_USE_LAME_AUDIO_FORMAT="1"
-               JUCE_PLUGINHOST_VST3="1" JUCE_WEB_BROWSER="0" JUCE_ASIO="1"/>
+               JUCE_PLUGINHOST_VST3="1" JUCE_WEB_BROWSER="0" JUCE_ASIO="0"/>
   <EXPORTFORMATS>
     <VS2022 targetFolder="Builds/VisualStudio2022">
       <CONFIGURATIONS>
-        <CONFIGURATION isDebug="1" name="Debug" targetName="Napkid Sub EQ" extraCompilerFlags="/utf-8 /I&quot;D:/Program Files/JUCE/modules/juce_audio_devices/native/asio&quot;"/>
-        <CONFIGURATION isDebug="0" name="Release" targetName="Napkid Sub EQ" extraCompilerFlags="/utf-8 /I&quot;D:/Program Files/JUCE/modules/juce_audio_devices/native/asio&quot;"/>
+        <CONFIGURATION isDebug="1" name="Debug" targetName="Napkid Sub EQ" extraCompilerFlags="/utf-8"/>
+        <CONFIGURATION isDebug="0" name="Release" targetName="Napkid Sub EQ" extraCompilerFlags="/utf-8"/>
       </CONFIGURATIONS>
       <MODULEPATHS>
         <MODULEPATH id="juce_analytics" path="D:/Program Files/JUCE/modules"/>

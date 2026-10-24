@@ -83,6 +83,17 @@ public:
     // frames cannot be shown again.
     void resetDisplayState() { resetRuntimeState(); }
 
+    // GUI-thread safe: clear only the published band snapshot (not rings /
+    // envelopes). Used when the editor is reopened while the host is stopped,
+    // where processBlock may never run to consume the audio-thread reset flag.
+    void resetPublishedDisplay() noexcept
+    {
+        generation.fetch_add(1, std::memory_order_release);
+        for (int i = 0; i < MaxBands; ++i)
+            bandData[i].store(-RangeDb, std::memory_order_relaxed);
+        generation.fetch_add(1, std::memory_order_release);
+    }
+
 private:
     void pushTierSample(int tier, double sample);
     void analyzeTier(int tier);

@@ -2,6 +2,7 @@ Builds/
 .vs/
 .reasonix/
 Tests/*.exe
+Tests/*.manifest
 *.obj
 Tests/*.pdb
 /.mimosa/
@@ -11,3 +12,5 @@ docs/review/build_*.log
 .video_agent/
 .zcode/
 .zcodeignore
+dist/
+*.zip

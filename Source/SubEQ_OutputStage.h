@@ -48,6 +48,8 @@ public:
         dry.assign(static_cast<size_t>(numCh) * static_cast<size_t>(ringSize), 0.0f);
         writeIndex = 0;
         latency = 0;
+        latencyPrev = 0;
+        latencyFadeRemaining = 0;
         rampSamples = std::max(1.0, sampleRate * 0.015);
         masterCurrent = masterTarget = 1.0;
         bypassCurrent = bypassTarget = 1.0;
@@ -59,6 +61,8 @@ public:
     {
         std::fill(dry.begin(), dry.end(), 0.0f);
         writeIndex = 0;
+        latencyPrev = latency;
+        latencyFadeRemaining = 0;
         snapToTargets();
     }
 
@@ -106,8 +110,15 @@ public:
 
         // Do not clear the ring: it already contains the most recent raw input
         // for every latency offset. Clearing it would mute the bypass path for
-        // the full new latency (up to ~0.69 s for 65536 taps).
+        // the full new latency (up to ~0.69 s for 65536 taps). Crossfade the
+        // old/new read offsets instead so a bypassed signal never repeats or
+        // skips a block of samples.
+        latencyPrev = latency;
         latency = clamped;
+        // A fully dry or fully wet path does not mix two delayed dry reads;
+        // crossfade only while bypass is actually blending.
+        const bool blending = bypassCurrent > 1.0e-6 && bypassCurrent < 1.0 - 1.0e-6;
+        latencyFadeRemaining = blending ? LatencyFadeSamples : 0;
     }
 
     int getLatencySamples() const noexcept { return latency; }
@@ -120,17 +131,22 @@ public:
     void process(const float* const* dryChannels, float* const* wetChannels,
                  int numChannelsIn, int numSamples) noexcept
     {
-        if (wetChannels == nullptr || numSamples <= 0 || ringSize <= 0)
+        if (wetChannels == nullptr || numSamples <= 0 || ringSize <= 0
+            || dry.size() < static_cast<size_t>(numCh) * static_cast<size_t>(ringSize))
             return;
 
         const int nch = std::min(numCh, numChannelsIn);
+        const auto readDry = [&](int lat, float dryRaw, int ch) noexcept -> float
+        {
+            if (lat <= 0)
+                return dryRaw;
+            const int index = (writeIndex - lat + ringSize) % ringSize;
+            return dry[static_cast<size_t>(ch) * static_cast<size_t>(ringSize)
+                       + static_cast<size_t>(index)];
+        };
 
         for (int n = 0; n < numSamples; ++n)
         {
-            const int readIndex = (latency > 0)
-                                    ? (writeIndex - latency + ringSize) % ringSize
-                                    : writeIndex;
-
             for (int ch = 0; ch < nch; ++ch)
             {
                 float* wetData = wetChannels[ch];
@@ -146,10 +162,16 @@ public:
                 if (!std::isfinite(dryRaw))
                     dryRaw = 0.0f;
 
-                const float drySample = (latency > 0)
-                                            ? dry[static_cast<size_t>(ch) * static_cast<size_t>(ringSize)
-                                                  + static_cast<size_t>(readIndex)]
-                                            : dryRaw;
+                float drySample = (dryData != nullptr)
+                                      ? readDry(latency, dryRaw, ch)
+                                      : dryRaw;
+                if (dryData != nullptr && latencyFadeRemaining > 0)
+                {
+                    const float oldSample = readDry(latencyPrev, dryRaw, ch);
+                    const float w = 1.0f - static_cast<float>(latencyFadeRemaining)
+                                            / static_cast<float>(LatencyFadeSamples);
+                    drySample = oldSample * (1.0f - w) + drySample * w;
+                }
 
                 const double wet = static_cast<double>(in) * masterCurrent;
                 double out = static_cast<double>(drySample)
@@ -169,6 +191,8 @@ public:
 
             advanceRamp(masterCurrent, masterTarget, masterStep, masterRampRemaining);
             advanceRamp(bypassCurrent, bypassTarget, bypassStep, bypassRampRemaining);
+            if (latencyFadeRemaining > 0)
+                --latencyFadeRemaining;
 
             if (++writeIndex == ringSize)
                 writeIndex = 0;
@@ -202,6 +226,9 @@ private:
     int ringSize = 1;
     int writeIndex = 0;
     int latency = 0;
+    int latencyPrev = 0;
+    int latencyFadeRemaining = 0;
+    static constexpr int LatencyFadeSamples = 128;
 
     double masterCurrent = 1.0;
     double masterTarget = 1.0;

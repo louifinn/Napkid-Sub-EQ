@@ -93,6 +93,13 @@ void SpectrumAnalyzer::prepare (double sr)
     // 每次重指向（prepare 重入于同会话 transport stop/start 时保持用户配置）。
     activeSet = &kernelSets[static_cast<size_t> (
         kernelSetIndex (lastResolutionIndex, activeNumBands, lastWindow))];
+
+    // Best-effort twiddle prewarm for every tier size on the prepare thread.
+    // prepareToPlay normally runs before/around the audio thread; if the host
+    // uses a different thread, analyzeTier's lazy fallback still covers it.
+    for (const auto& set : kernelSets)
+        for (int t = 0; t < VQTNumTiers; ++t)
+            prewarmTwiddleTable<double> (set.tiers[t].fftSize);
 }
 
 void SpectrumAnalyzer::resetRuntimeState()
@@ -130,14 +137,21 @@ void SpectrumAnalyzer::configure (int resolutionIndex, int numBandsIn, int hopSi
     const int hop = (hopSizeIn == 1024) ? 1024 : (hopSizeIn == 2048 ? 2048 : 512);
 
     // Only reset the analysis state when the analysis grid actually changes.
-    // A smoothing-only change must keep powers/env/rings, otherwise the low
-    // tiers go blank for ~1.4 s while they refill.
+    // A smoothing-only or hop-only change must keep powers/env/rings; hop
+    // changes only restart the per-tier stride counters.
     const bool analysisChanged = (bands != activeNumBands)
                               || (resolutionIndex != lastResolutionIndex)
-                              || (window != lastWindow)
-                              || (hop != hopSize.load());
+                              || (window != lastWindow);
+    const bool hopChanged = (hop != hopSize.load());
     if (analysisChanged)
+    {
         resetRuntimeState();
+    }
+    else if (hopChanged)
+    {
+        for (int t = 0; t < VQTNumTiers; ++t)
+            tier[t].sinceAnalysis = 0;
+    }
 
     // 状态全部一致后才发布新配置
     activeNumBands = bands;

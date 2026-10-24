@@ -34,10 +34,24 @@ struct OlaChannelState
 {
     std::vector<std::complex<double>> inputBlock;   // size M (block length)
     int pos = 0;
-    std::vector<double> overlap;                    // size L (conv FFT size)
-    std::vector<double> outQueue;                   // output FIFO
+    std::vector<double> overlap;                    // capacity = max L (never resized on audio thread)
+    std::vector<double> outQueue;                   // fixed-capacity output FIFO (reserve 2M)
     int outRead = 0;
 };
+
+// Allocate/reset one OLA channel for the lifetime of a prepared processor.
+// `overlap` is deliberately sized to the largest supported convolution FFT so
+// switching to a longer FIR can never write past the accumulator; the logical
+// L is passed to processOlaChannel and must be <= this capacity.
+inline void prepareOlaChannelState(OlaChannelState& st, int M, int maxFftSize)
+{
+    st.inputBlock.assign(static_cast<size_t>(std::max(1, M)), {});
+    st.pos = 0;
+    st.overlap.assign(static_cast<size_t>(std::max(1, maxFftSize)), 0.0);
+    st.outQueue.clear();
+    st.outQueue.reserve(static_cast<size_t>(std::max(1, M)) * 2);
+    st.outRead = 0;
+}
 
 // Build the frequency-domain filter used by processOlaChannel. The tap count
 // is authoritative: callers may pass a Type-I linear-phase design whose size
@@ -78,6 +92,21 @@ inline void processOlaChannel(OlaChannelState& st,
                               const std::complex<double>* freqCoeffs,
                               std::vector<std::complex<double>>& scratch)
 {
+    // Fail closed: a state prepared for a shorter design must never be driven
+    // with a larger L. This is the invariant that makes zero-state fallback
+    // and warm-wrapper reuse safe; Debug/ASan builds surface it immediately.
+    const bool valid = M > 0 && L >= M && L <= static_cast<int>(st.overlap.size())
+                    && static_cast<int>(st.inputBlock.size()) >= M
+                    && st.pos >= 0 && st.pos < M
+                    && static_cast<int>(scratch.size()) >= L
+                    && freqCoeffs != nullptr;
+    if (!valid)
+    {
+        for (int n = 0; n < numSamples; ++n)
+            output[n] = static_cast<T>(0);
+        return;
+    }
+
     for (int n = 0; n < numSamples; ++n)
     {
         st.inputBlock[st.pos] = { static_cast<double>(input[n]), 0.0 };
@@ -85,6 +114,17 @@ inline void processOlaChannel(OlaChannelState& st,
 
         if (st.pos == M)
         {
+            if (st.outQueue.size() + static_cast<size_t>(M) > st.outQueue.capacity())
+            {
+                // Should be unreachable: the queue drains one sample per input
+                // and peaks at 2M-1. Fail closed rather than allocate/UB.
+                st.outQueue.clear();
+                st.outRead = 0;
+                for (int n2 = n; n2 < numSamples; ++n2)
+                    output[n2] = static_cast<T>(0);
+                return;
+            }
+
             for (int i = 0; i < M; ++i)
                 scratch[i] = st.inputBlock[i];
             for (int i = M; i < L; ++i)

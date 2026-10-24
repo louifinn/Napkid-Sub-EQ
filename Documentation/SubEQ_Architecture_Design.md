@@ -1,6 +1,6 @@
 # Sub EQ — 超低频参量均衡器 架构设计方案
 
-> **历史文档说明（v0.5.0）**：本文主体写于 v0.3.x。当前架构以 `AGENTS.md` / `README.md` 为准：50→51 参数、VQT 频谱（非 8192 点 FFT）、窗口 1040×620、MasterGainSlider（非 juce::Slider）、旁路为后置延迟补偿 dry/wet、FIR 为 Type-I 奇数抽头 + T2 影子预热切换。下文涉及旧尺寸/旧参数数的段落保留为历史设计记录。
+> **历史文档说明（v0.5.0）**：本文主体写于 v0.3.x。当前架构以 `AGENTS.md` / `README.md` 为准：50→51 参数、VQT 频谱（非 8192 点 FFT）、窗口 1040×620、MasterGainSlider（非 juce::Slider）、旁路为后置延迟补偿 dry/wet、FIR 为 Type-I 奇数抽头 + T2 精确边界 warm 合成/静音门控切换。下文涉及旧尺寸/旧参数数的段落保留为历史设计记录。
 
 ## 1. 项目概述
 
@@ -270,7 +270,7 @@ Source/
 | ASIO 支持 | **已添加**，Standalone 版本可用 |
 | 处理模式 | **三种全局模式**（Zero Latency / Minimum Phase / Linear Phase）+ FIR 长度可选（4096 / 16384 / 65536） |
 
-> **FIR 实现注记（v0.5.0）**：标称 4096 / 16384 / 65536 在 Linear Phase 内部对应 Type-I 奇数抽头 4095 / 16383 / 65535，群延迟为整数 (N-1)/2，Nyquist 不再被结构性强制为零。切换采用 T2 影子预热：设计 + warm 状态原子发布，音频在 OLA 块边界采纳；同 groupDelay 走 1024 样本交叉淡化（两侧均处理真实输入），异 groupDelay 经 PDC 握手后冲刷切换；warm 落后 ≤4 块时由音频线程追赶，首设计有超时兜底。最小相位 FIR 由倒谱/解析零点法设计，双精度抽头。默认平滑档为 Off，底部 VQT 帧长为“≥2 s 的 2 的幂”。
+> **FIR 实现注记（v0.5.0）**：标称 4096 / 16384 / 65536 在 Linear Phase 内部对应 Type-I 奇数抽头 4095 / 16383 / 65535，群延迟为整数 (N-1)/2，Nyquist 不再被结构性强制为零。切换采用 T2 精确边界预热：后台用 overlap-save 求边界 S 处累加器，再回放最后一块重建 pending outQueue；设计与 warm 状态原子发布，音频只在 `blockIndex == currentOlaBlockIndex` 时采纳，不做 K 块逐块回放/音频线程 catch-up/零状态超时兜底。同 groupDelay 走 1024 样本交叉淡化（两侧均处理真实输入），异 groupDelay 经 PDC 握手（packed version+latency、按采样数 guard）后冲刷切换；延迟变化期间由静音门控遮住 host PDC 更新窗口，IIR 桥按 host-facing latency 延迟。最小相位 FIR 由倒谱/解析零点法设计，双精度抽头。默认平滑档为 Off，底部 VQT 帧长为“≥2 s 的 2 的幂”；低频频段镜像支撑不做抑制（物理限制）。
 
 ---
 

@@ -7,12 +7,13 @@
     radix-2 FFT (SubEQ_DSPMath.h) — JUCE FFT wrapper is unreliable here.
 
     v0.5.0 T2 switching:
-      - raw input history ring (audio writer / background reader)
-      - background shadow OLA convolution builds a pre-warmed state exactly at
-        the latest completed OLA block boundary
-      - audio swaps the warm state in and crossfades only when the design's
-        group delay is unchanged; latency-changing designs flush at a block
-        boundary (PDC handshake is layered on top in PluginProcessor)
+      - captured/committed raw input history ring (audio writer / background reader)
+      - background exact-boundary warm synthesis: overlap-save at S=T-M plus one
+        final block replay (no O(N/M) feed loop, no audio-thread catch-up)
+      - audio adopts only when the candidate boundary equals the current OLA
+        boundary; missed candidates are rebuilt, never chased on the audio thread
+      - same group delay crossfades over 1024 samples; different group delay is
+        gated by the PDC handshake in PluginProcessor
       - no shared_ptr/vector of a large object is ever destroyed on the audio
         thread; superseded states go through the retirement rings
 
@@ -20,7 +21,9 @@
 */
 
 #include "SubEQ_FFTProcessor.h"
+#include <chrono>
 #include "SubEQ_DSPMath.h"
+#include "SubEQ_OlaBank.h"
 #include "SubEQ_Parameters.h"
 #include "SubEQ_FIRDesign.h"
 #include "SubEQ_FIRSwitchState.h"
@@ -82,14 +85,7 @@ void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
     for (auto* list : { &activeStates, &oldStates })
     {
         for (auto& ch : *list)
-        {
-            ch.inputBlock.assign(static_cast<size_t>(ConvBlockLen), {});
-            ch.pos = 0;
-            ch.overlap.assign(static_cast<size_t>(maxL), 0.0);
-            ch.outQueue.clear();
-            ch.outQueue.reserve(static_cast<size_t>(ConvBlockLen) * 2);
-            ch.outRead = 0;
-        }
+            prepareOlaChannelState(ch, ConvBlockLen, maxL);
     }
 
     xfadeOld.setSize(numChannels, xfadeSamples);
@@ -99,10 +95,9 @@ void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
     if (static_cast<int>(warmScratch.size()) < maxL)
         warmScratch.assign(static_cast<size_t>(maxL), {});
     prefixScratch.assign(static_cast<size_t>(ConvBlockLen), 0.0f);
-    catchUpInput.assign(static_cast<size_t>(ConvBlockLen), 0.0f);
-    catchUpOutput.assign(static_cast<size_t>(ConvBlockLen), 0.0f);
-    if (static_cast<int>(catchUpScratch.size()) < maxL)
-        catchUpScratch.assign(static_cast<size_t>(maxL), {});
+    warmCatchUpOutput.assign(static_cast<size_t>(ConvBlockLen), 0.0f);
+    maxHostBlockSamples = std::max(1, maxBlockSize);
+    currentHostBlockSamples.store(maxHostBlockSamples, std::memory_order_release);
 
     // Enough history to warm the longest FIR with two extra OLA blocks of
     // margin; power-of-two capacity keeps modulo cheap.
@@ -110,8 +105,8 @@ void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
     warmFeedSamples = warmBlocks * ConvBlockLen;
     if (static_cast<int>(warmInput.size()) < warmFeedSamples)
         warmInput.assign(static_cast<size_t>(warmFeedSamples), 0.0f);
-    if (static_cast<int>(warmOutput.size()) < warmFeedSamples)
-        warmOutput.assign(static_cast<size_t>(warmFeedSamples), 0.0f);
+    if (static_cast<int>(warmOutput.size()) < ConvBlockLen)
+        warmOutput.assign(static_cast<size_t>(ConvBlockLen), 0.0f);
 
     // Allocate the history ring for the maximum channel count ONCE. The
     // background warm builder may read it concurrently, so prepare() must not
@@ -122,7 +117,7 @@ void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
     if (history.capacity() != historyCapacity
         || history.numChannels() < SubEQ::EQNode::MaxChannels)
         history.prepare(SubEQ::EQNode::MaxChannels, historyCapacity);
-    historyValidFrom.store(history.publishedCount(), std::memory_order_release);
+    historyValidFrom.store(history.capturedCount(), std::memory_order_release);
 
     activeConvFFTSize = 0;
     activeGroupDelay = 0;
@@ -130,14 +125,15 @@ void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
     currentOlaBlockIndex = 0;
     reportedActiveLatency.store(0, std::memory_order_release);
     publishedLatency.store(0, std::memory_order_release);
+    pendingTargetSample.store(0, std::memory_order_release);
+    pendingAbortVersion.store(-1, std::memory_order_release);
     latencyAckVersion.store(0, std::memory_order_release);
+    offlineDesignCooldown = 0;
     latencyGuardVersion = 0;
     latencyGuardSamples = 0;
     latencyWaitVersion = 0;
     latencyWaitSamples = 0;
-    firstDesignWaitSamples = 0;
-    firstDesignWaitVersion = -1;
-    startupFadeRemaining = 0;
+    warmBuildSecondsEWMA = 0.012;
     crossfadeRemaining = 0;
     fadeConvFFTSize = 0;
     twiddlePrewarmedSize = 0;
@@ -202,13 +198,14 @@ void FFTProcessor::resetConvolution()
     currentOlaBlockIndex = 0;
     reportedActiveLatency.store(0, std::memory_order_release);
     publishedLatency.store(0, std::memory_order_release);
+    pendingTargetSample.store(0, std::memory_order_release);
+    pendingAbortVersion.store(-1, std::memory_order_release);
     latencyGuardVersion = 0;
     latencyGuardSamples = 0;
     latencyWaitVersion = 0;
     latencyWaitSamples = 0;
-    firstDesignWaitSamples = 0;
-    firstDesignWaitVersion = -1;
-    startupFadeRemaining = 0;
+    offlineDesignCooldown = 0;
+    warmBuildSecondsEWMA = 0.012;
 
     // Invalidate any design that is currently being computed. Without this,
     // a design started before a mode/length change could still publish and be
@@ -240,8 +237,11 @@ void FFTProcessor::resetConvolution()
         localWarm.reset();
 
     {
-        std::lock_guard<std::mutex> lock(stateMutex);
-        if (currentWarm != nullptr)
+        // Audio-thread path: never block on the background publisher. If the
+        // lock is busy the warm is left for the next publish/retirement;
+        // correctness does not depend on clearing it synchronously.
+        std::unique_lock<std::mutex> lock (stateMutex, std::try_to_lock);
+        if (lock.owns_lock() && currentWarm != nullptr)
         {
             auto& slot = pendingWarmDestroy[pendingWarmDestroyHead];
             if (slot == nullptr)
@@ -279,6 +279,7 @@ void FFTProcessor::clearPublishedState()
 void FFTProcessor::captureHistory(const float* const* channels, int numChannelsIn,
                                   int numSamples, bool publishNow)
 {
+    currentHostBlockSamples.store(std::max(1, numSamples), std::memory_order_release);
     history.writeFrame(channels, numChannelsIn, numSamples, publishNow);
 }
 
@@ -290,12 +291,24 @@ void FFTProcessor::setParameterSource(juce::AudioProcessorValueTreeState* source
 
 void FFTProcessor::requestRedesign()
 {
-    // A new request invalidates any design currently being computed. The
-    // worker captures this epoch after consuming the request, so its own
-    // generation is not invalidated by the request that woke it.
-    designEpoch.fetch_add(1, std::memory_order_release);
+    // Do not bump designEpoch here: continuous parameter automation must not
+    // invalidate every design in flight. Structural invalidation goes through
+    // invalidateDesigns()/prepare().
     redesignRequested.store(true, std::memory_order_release);
     redesignEvent.signal();
+}
+
+void FFTProcessor::requestWarmRebuild()
+{
+    warmRebuildRequested.store(true, std::memory_order_release);
+    redesignEvent.signal();
+}
+
+void FFTProcessor::invalidateDesigns()
+{
+    designEpoch.fetch_add(1, std::memory_order_release);
+    offlineDesignCooldown = 0;
+    requestRedesign();
 }
 
 //==============================================================================
@@ -305,6 +318,7 @@ void FFTProcessor::run()
 {
     std::shared_ptr<FIRState> lastDesign;
     int lastDesignEpoch = -1;
+    uint64_t lastDesignTarget = 0;
 
     while (!threadShouldExit())
     {
@@ -331,57 +345,64 @@ void FFTProcessor::run()
         const auto mode = static_cast<EQMode> (
             static_cast<int> (source->getRawParameterValue ("eq_mode")->load()));
 
+        // Offline rendering builds designs/warm states synchronously on the
+        // audio thread; keep the worker out of the way.
+        if (nonRealtime.load(std::memory_order_acquire))
+            continue;
+
+        if (redesignRequested.load(std::memory_order_acquire))
+            warmRebuildRequested.store(false, std::memory_order_release);
+
+        // Retry a warm for an already-published design whose target is still
+        // in the future. The design metadata was published early so the audio
+        // coordinator could start its latency transition in time.
         if (warmRebuildRequested.exchange(false, std::memory_order_acquire)
-            && lastDesign != nullptr && mode != EQMode::ZeroLatency)
+            && lastDesign != nullptr && mode != EQMode::ZeroLatency
+            && lastDesign->version != 0
+            && lastDesign->version == stateVersion.load(std::memory_order_acquire))
         {
-            auto warm = std::make_shared<WarmState>();
-            if (buildWarmState(*lastDesign, warm))
+            // If the previous target was missed, choose a fresh future host
+            // block for the SAME design instead of rebuilding coefficients.
+            if (lastDesignTarget <= history.publishedCount())
             {
-                std::shared_ptr<const FIRState> replacedState;
+                const int hostBlock = std::max(1, currentHostBlockSamples.load(std::memory_order_acquire));
+                const double sr = sampleRate.load(std::memory_order_acquire);
+                const uint64_t lead = warmLeadSamples(sr, hostBlock, warmBuildSecondsEWMA);
+                lastDesignTarget = planWarmTarget(history.capturedCount(), lead,
+                                                  hostBlock, ConvBlockLen).targetSample;
+                pendingTargetSample.store(lastDesignTarget, std::memory_order_release);
+            }
+
+            auto warm = std::make_shared<WarmState>();
+            if (buildWarmState(*lastDesign, warm, lastDesignEpoch, lastDesignTarget))
+            {
                 std::shared_ptr<WarmState> replacedWarm;
                 bool publish = false;
-
                 {
                     std::lock_guard<std::mutex> lock (stateMutex);
-                    if (lastDesignEpoch != designEpoch.load(std::memory_order_acquire))
+                    if (lastDesignEpoch == designEpoch.load(std::memory_order_acquire)
+                        && lastDesign->version == stateVersion.load(std::memory_order_acquire))
                     {
-                        // Stale design; a newer request or prepare wins.
-                    }
-                    else if (lastDesign->version == 0)
-                    {
-                        // The design was built but deliberately not published
-                        // because its warm state was not ready. Publish the
-                        // complete package now.
-                        const int v = stateVersion.fetch_add(1, std::memory_order_acq_rel) + 1;
-                        lastDesign->version = v;
-                        warm->version = v;
-                        replacedState = std::move (currentState);
-                        replacedWarm = std::move (currentWarm);
-                        currentState = lastDesign;
-                        currentWarm = warm;
-                        publishedLatency.store(lastDesign->groupDelay + (ConvBlockLen - 1),
-                                               std::memory_order_release);
-                        publish = true;
-                    }
-                    else if (lastDesign->version == stateVersion.load(std::memory_order_acquire))
-                    {
-                        // Same design, newer warm snapshot.
                         warm->version = lastDesign->version;
                         replacedWarm = std::move (currentWarm);
                         currentWarm = warm;
+                        pendingTargetSample.store(lastDesignTarget,
+                                                  std::memory_order_release);
+                        pendingAbortVersion.store(-1, std::memory_order_release);
                         publish = true;
                     }
                 }
-
                 if (publish)
                     warmVersion.fetch_add(1, std::memory_order_release);
-                replacedState.reset();
                 replacedWarm.reset();
+            }
+            else if (lastDesignEpoch != designEpoch.load(std::memory_order_acquire))
+            {
+                lastDesign.reset();
+                lastDesignEpoch = -1;
             }
             else
             {
-                // History not filled yet (or a transient snapshot failure).
-                // Retry without rebuilding the FIR coefficients.
                 warmRebuildRequested.store(true, std::memory_order_release);
             }
         }
@@ -392,111 +413,76 @@ void FFTProcessor::run()
         if (mode == EQMode::ZeroLatency)
             continue;
 
-        const int firChoice = static_cast<int> (
-            source->getRawParameterValue ("fir_length")->load());
-        const int firLength = (firChoice >= 0 && firChoice < NumFirLengthChoices)
-                                  ? FirLengthChoices[firChoice]
-                                  : DefaultFirLength;
+        int epoch = 0;
+        auto newState = buildDesignSnapshot(epoch);
+        if (newState == nullptr)
+            continue;
 
-        const int epoch = designEpoch.load(std::memory_order_acquire);
-
+        const int hostBlock = std::max(1, currentHostBlockSamples.load(std::memory_order_acquire));
         const double sr = sampleRate.load(std::memory_order_acquire);
-        if (sr != designSampleRate)
-        {
-            designEngine.prepare(sr);
-            designSampleRate = sr;
-        }
-        applyNodesToEngine(*source, designEngine);
+        const uint64_t lead = warmLeadSamples(sr, hostBlock, warmBuildSecondsEWMA);
+        const WarmTarget target = planWarmTarget(history.capturedCount(), lead,
+                                                 hostBlock, ConvBlockLen);
 
-        auto newState = std::make_shared<FIRState>();
-        newState->firLength = firLength;
-
-        // Master gain and bypass are applied after convolution by OutputStage;
-        // baking them into the FIR caused a full redesign per gain automation
-        // step and delayed bypass.
-        auto magnitude = [&](double w) { return designEngine.getNodesMagnitudeLinear(w); };
-        if (mode == EQMode::LinearPhase)
-        {
-            newState->coeffs = designLinearPhaseFIR(magnitude, firLength, newState->groupDelay);
-        }
-        else
-        {
-            // 解析统计设计目标的 DC / Nyquist 传输零点阶数，供最小相位设计
-            // 剥离奇点：高通在 DC、低通在 Nyquist 各 2 阶，带通各 1 阶，其余
-            // 类型无传输零点。Bypass 不再进入 FIR 设计，因此无需旁路归零。
-            int dcZeroOrder = 0;
-            int nyquistZeroOrder = 0;
-            for (int i = 0; i < EQEngine::MaxNodes; ++i)
-            {
-                const auto& node = designEngine.getNode(i);
-                if (!node.isEnabled())
-                    continue;
-
-                switch (node.getType())
-                {
-                    case FilterType::HighPass: dcZeroOrder += 2;      break;
-                    case FilterType::LowPass:  nyquistZeroOrder += 2; break;
-                    case FilterType::BandPass: ++dcZeroOrder;
-                                               ++nyquistZeroOrder;    break;
-                    default: break;
-                }
-            }
-
-            newState->coeffs = designMinimumPhaseFIR(magnitude, firLength, newState->groupDelay,
-                                                     dcZeroOrder, nyquistZeroOrder, sr);
-        }
-
-        // Type-I linear phase returns nominal-1 taps; use the actual count for
-        // convolution sizing, frequency-response construction and tail
-        // reporting. Never index coeffs with the nominal parameter value.
-        newState->firLength = static_cast<int>(newState->coeffs.size());
-        if (newState->firLength <= 0)
-            continue;
-
-        newState->convFFTSize = convolutionFftSize(newState->firLength, ConvBlockLen);
-        newState->freqCoeffs = buildFirFrequencyCoeffs(newState->coeffs,
-                                                       newState->convFFTSize);
-
-        // The design is complete but not published until a matching warm state
-        // exists. Keep it as the worker's pending design so a warm-up retry
-        // does not recompute the (potentially expensive) FIR coefficients.
-        lastDesign = newState;
-        lastDesignEpoch = epoch;
-
-        auto warm = std::make_shared<WarmState>();
-        if (!buildWarmState(*newState, warm))
-        {
-            // History not filled yet (first FIR entry) or a transient snapshot
-            // failure. Retry the warm-up without a full redesign.
-            warmRebuildRequested.store(true, std::memory_order_release);
-            continue;
-        }
-
+        // Phase 1: publish design + target metadata immediately. The audio
+        // coordinator can now schedule the latency transition with a real
+        // lead; adoption still requires the matching warm state.
         std::shared_ptr<const FIRState> replacedState;
-        std::shared_ptr<WarmState> replacedWarm;
+        int publishedVersion = 0;
         {
             std::lock_guard<std::mutex> lock (stateMutex);
             if (epoch != designEpoch.load(std::memory_order_acquire))
-                continue;   // stale design; shared_ptrs destruct on this thread
+                continue;
 
-            // Single writer rule: every version increment uses fetch_add, so
-            // reset/clear events and background publishes can never duplicate
-            // a version number.
-            const int publishedVersion = stateVersion.fetch_add(1, std::memory_order_acq_rel) + 1;
+            publishedVersion = stateVersion.fetch_add(1, std::memory_order_acq_rel) + 1;
             newState->version = publishedVersion;
-            warm->version = publishedVersion;
-
             replacedState = std::move (currentState);
-            replacedWarm = std::move (currentWarm);
             currentState = newState;
-            currentWarm = warm;
             publishedLatency.store(newState->groupDelay + (ConvBlockLen - 1),
                                    std::memory_order_release);
+            pendingTargetSample.store(target.targetSample, std::memory_order_release);
+            pendingAbortVersion.store(-1, std::memory_order_release);
         }
-        warmVersion.fetch_add(1, std::memory_order_release);
-
-        // Background destruction only.
         replacedState.reset();
+
+        lastDesign = newState;
+        lastDesignEpoch = epoch;
+        lastDesignTarget = target.targetSample;
+
+        // Phase 2: build the exact warm state for the published target.
+        auto warm = std::make_shared<WarmState>();
+        if (!buildWarmState(*newState, warm, epoch, target.targetSample))
+        {
+            if (epoch != designEpoch.load(std::memory_order_acquire))
+            {
+                lastDesign.reset();
+                lastDesignEpoch = -1;
+            }
+            else
+            {
+                warmRebuildRequested.store(true, std::memory_order_release);
+            }
+            continue;
+        }
+
+        std::shared_ptr<WarmState> replacedWarm;
+        bool publishWarm = false;
+        {
+            std::lock_guard<std::mutex> lock (stateMutex);
+            if (publishedVersion == stateVersion.load(std::memory_order_acquire)
+                && epoch == designEpoch.load(std::memory_order_acquire))
+            {
+                warm->version = publishedVersion;
+                replacedWarm = std::move (currentWarm);
+                currentWarm = warm;
+                pendingTargetSample.store(target.targetSample,
+                                          std::memory_order_release);
+                pendingAbortVersion.store(-1, std::memory_order_release);
+                publishWarm = true;
+            }
+        }
+        if (publishWarm)
+            warmVersion.fetch_add(1, std::memory_order_release);
         replacedWarm.reset();
     }
 }
@@ -507,7 +493,9 @@ bool FFTProcessor::retireState(std::shared_ptr<const FIRState>& stateToRetire) c
     if (stateToRetire == nullptr)
         return true;
 
-    std::lock_guard<std::mutex> lock(stateMutex);
+    std::unique_lock<std::mutex> lock(stateMutex, std::try_to_lock);
+    if (!lock.owns_lock())
+        return false;
     auto& slot = pendingDestroy[pendingDestroyHead];
     if (slot != nullptr)
         return false;
@@ -522,7 +510,9 @@ bool FFTProcessor::retireWarm(std::shared_ptr<WarmState>& warmToRetire) const
     if (warmToRetire == nullptr)
         return true;
 
-    std::lock_guard<std::mutex> lock(stateMutex);
+    std::unique_lock<std::mutex> lock(stateMutex, std::try_to_lock);
+    if (!lock.owns_lock())
+        return false;
     auto& slot = pendingWarmDestroy[pendingWarmDestroyHead];
     if (slot != nullptr)
         return false;
@@ -539,7 +529,9 @@ std::shared_ptr<const FFTProcessor::FIRState> FFTProcessor::getPublishedStateFor
     {
         std::shared_ptr<const FIRState> next;
         {
-            std::lock_guard<std::mutex> lock (stateMutex);
+            std::unique_lock<std::mutex> lock (stateMutex, std::try_to_lock);
+            if (!lock.owns_lock())
+                return localState;   // never block the audio thread on GUI/worker
             next = currentState;
         }
 
@@ -581,12 +573,15 @@ std::shared_ptr<FFTProcessor::WarmState> FFTProcessor::getWarmStateForAudioThrea
     {
         std::shared_ptr<WarmState> next;
         {
-            std::lock_guard<std::mutex> lock (stateMutex);
+            std::unique_lock<std::mutex> lock (stateMutex, std::try_to_lock);
+            if (!lock.owns_lock())
+                return localWarm;    // retry next block
             next = currentWarm;
         }
 
         if (next != localWarm)
         {
+            const int oldVersion = lastSeenWarmVersion;
             auto prev = std::move(localWarm);
             localWarm = next;
             lastSeenWarmVersion = version;
@@ -594,9 +589,14 @@ std::shared_ptr<FFTProcessor::WarmState> FFTProcessor::getWarmStateForAudioThrea
             if (prev != nullptr && !retireWarm(prev))
             {
                 if (deferredWarmRetire == nullptr)
+                {
                     deferredWarmRetire = std::move(prev);
+                }
                 else
+                {
                     localWarm = std::move(prev);
+                    lastSeenWarmVersion = oldVersion;
+                }
             }
         }
         else
@@ -612,143 +612,350 @@ std::shared_ptr<FFTProcessor::WarmState> FFTProcessor::getWarmStateForAudioThrea
 }
 
 //==============================================================================
-// Build the exact OLA state at the latest completed OLA block boundary from
-// the raw input history. Feeding the last N+M-1 samples through a zero state
-// is enough for the FIR memory to forget the zero initial state; two extra
-// blocks are added for margin.
-bool FFTProcessor::buildWarmState(const FIRState& design, std::shared_ptr<WarmState>& out)
+// Build FIR coefficients from the current APVTS snapshot. Safe to call from
+// the background worker or, in offline rendering, from the audio thread; the
+// designEngine is serialized by designMutex. Returns nullptr for ZL / failure.
+std::shared_ptr<FFTProcessor::FIRState> FFTProcessor::buildDesignSnapshot(int& outEpoch)
+{
+    auto* source = parameterSource.load(std::memory_order_acquire);
+    if (source == nullptr)
+        return nullptr;
+
+    const auto mode = static_cast<EQMode> (
+        static_cast<int> (source->getRawParameterValue ("eq_mode")->load()));
+    if (mode == EQMode::ZeroLatency)
+        return nullptr;
+
+    const int firChoice = static_cast<int> (
+        source->getRawParameterValue ("fir_length")->load());
+    const int firLength = (firChoice >= 0 && firChoice < NumFirLengthChoices)
+                              ? FirLengthChoices[firChoice]
+                              : DefaultFirLength;
+
+    outEpoch = designEpoch.load(std::memory_order_acquire);
+    const double sr = sampleRate.load(std::memory_order_acquire);
+
+    std::lock_guard<std::mutex> lock (designMutex);
+
+    if (sr != designSampleRate)
+    {
+        designEngine.prepare(sr);
+        designSampleRate = sr;
+    }
+    applyNodesToEngine(*source, designEngine);
+
+    auto newState = std::make_shared<FIRState>();
+    newState->firLength = firLength;
+
+    // Master gain and bypass are applied after convolution by OutputStage;
+    // baking them into the FIR caused a full redesign per gain automation step
+    // and delayed bypass.
+    auto magnitude = [&](double w) { return designEngine.getNodesMagnitudeLinear(w); };
+    if (mode == EQMode::LinearPhase)
+    {
+        newState->coeffs = designLinearPhaseFIR(magnitude, firLength, newState->groupDelay);
+    }
+    else
+    {
+        // Analytic DC / Nyquist transmission-zero orders for the minimum-phase
+        // cepstral design; bypass is not part of the design target.
+        int dcZeroOrder = 0;
+        int nyquistZeroOrder = 0;
+        for (int i = 0; i < EQEngine::MaxNodes; ++i)
+        {
+            const auto& node = designEngine.getNode(i);
+            if (!node.isEnabled())
+                continue;
+
+            switch (node.getType())
+            {
+                case FilterType::HighPass: dcZeroOrder += 2;      break;
+                case FilterType::LowPass:  nyquistZeroOrder += 2; break;
+                case FilterType::BandPass: ++dcZeroOrder;
+                                           ++nyquistZeroOrder;    break;
+                default: break;
+            }
+        }
+
+        newState->coeffs = designMinimumPhaseFIR(magnitude, firLength, newState->groupDelay,
+                                                 dcZeroOrder, nyquistZeroOrder, sr);
+    }
+
+    newState->firLength = static_cast<int>(newState->coeffs.size());
+    if (newState->firLength <= 0)
+        return nullptr;
+
+    newState->convFFTSize = convolutionFftSize(newState->firLength, ConvBlockLen);
+    newState->freqCoeffs = buildFirFrequencyCoeffs(newState->coeffs,
+                                                   newState->convFFTSize);
+    return newState;
+}
+
+//==============================================================================
+// Build the exact OLA state at a future OLA boundary from raw history.
+//
+// For target boundary T (= k*M), the accumulator at S=T-M depends only on the
+// last N input samples before S. One overlap-save convolution at S gives that
+// accumulator exactly; replaying the single block [S,T) then rebuilds the
+// pending output FIFO and advances the accumulator to T. This is equivalent to
+// feeding from zero for the last N samples, but costs 4 FFTs per channel
+// instead of O(N/M) blocks, and never runs on the audio thread.
+bool FFTProcessor::buildWarmState(const FIRState& design, std::shared_ptr<WarmState>& out,
+                                  int expectedEpoch, uint64_t targetSample)
 {
     if (out == nullptr || design.freqCoeffs.empty()
-        || design.convFFTSize <= 0 || warmFeedSamples <= 0
-        || static_cast<int>(warmInput.size()) < warmFeedSamples
-        || static_cast<int>(warmOutput.size()) < warmFeedSamples
+        || design.convFFTSize <= 0 || design.firLength <= 0
+        || static_cast<int>(warmInput.size()) < std::max(design.firLength, ConvBlockLen)
+        || static_cast<int>(warmOutput.size()) < ConvBlockLen
         || static_cast<int>(warmScratch.size()) < design.convFFTSize)
         return false;
 
+    const auto abortRequested = [&]() noexcept
+    {
+        return threadShouldExit()
+            || nonRealtime.load(std::memory_order_acquire)
+            || designEpoch.load(std::memory_order_acquire) != expectedEpoch;
+    };
+
+    std::lock_guard<std::mutex> warmBuildLock(warmBuildMutex);
     const int channels = preparedChannels.load(std::memory_order_acquire);
     const int M = ConvBlockLen;
-    const int K = (design.firLength + M - 1) / M + 2;   // warm-up blocks
-    int latestBlock = static_cast<int>(history.publishedCount()
-                                       / static_cast<uint64_t>(M));
-    const int firstValidBlock = static_cast<int>(historyValidFrom.load(std::memory_order_acquire)
-                                                  / static_cast<uint64_t>(M));
-
-    // Do not build a warm state from samples that belong to a previous
-    // sample-rate session; wait until K fresh blocks are available.
-    if (latestBlock - firstValidBlock < K)
-        return false;
+    const int N = design.firLength;
+    const int L = design.convFFTSize;
+    const uint64_t validFrom = historyValidFrom.load(std::memory_order_acquire);
 
     out->states.resize(static_cast<size_t>(std::max(1, channels)));
     out->version = design.version;
-    out->convFFTSize = design.convFFTSize;
+    out->convFFTSize = L;
     out->groupDelay = design.groupDelay;
+    out->targetSample = targetSample;
 
-    std::vector<float> dummyOutput(static_cast<size_t>(M), 0.0f);
-
+    const int maxL = convolutionFftSize(MaxFirLength, ConvBlockLen);
     for (int ch = 0; ch < channels; ++ch)
-    {
-        OlaChannelState st;
-        st.inputBlock.assign(static_cast<size_t>(M), {});
-        st.overlap.assign(static_cast<size_t>(design.convFFTSize), 0.0);
-        st.outQueue.clear();
-        st.outQueue.reserve(static_cast<size_t>(M) * 2);
-        st.pos = 0;
-        st.outRead = 0;
-        out->states[static_cast<size_t>(ch)] = std::move(st);
-    }
+        prepareOlaChannelState(out->states[static_cast<size_t>(ch)], M, maxL);
 
-    // Start K blocks before the latest published boundary (negative blocks
-    // are silence) and feed forward. The audio thread may publish new blocks
-    // while we work; keep extending to the newest boundary. Each OLA block is
-    // much cheaper than real time, so this catches up.
-    int64_t cursor = std::max<int64_t>(static_cast<int64_t>(firstValidBlock),
-                                       static_cast<int64_t>(latestBlock) - K);
-    int fedBlocks = 0;
-    const int maxFedBlocks = K + 128;
+    double workSeconds = 0.0;
 
-    while (fedBlocks < maxFedBlocks)
+    const uint64_t boundary = targetSample
+                            - (targetSample % static_cast<uint64_t>(M));
+    const int prefix = static_cast<int>(targetSample - boundary);
+
+    if (boundary >= static_cast<uint64_t>(M))
     {
-        if (cursor >= static_cast<int64_t>(latestBlock))
+        const uint64_t S = boundary - static_cast<uint64_t>(M);
+
+        // The overlap at S only needs history through S, one block before the
+        // OLA boundary. Replay [S, boundary) at the boundary. Only the final
+        // prefix [boundary, target) depends on samples at the host block start.
+        while (history.capturedCount() < S)
         {
-            latestBlock = static_cast<int>(history.publishedCount()
-                                           / static_cast<uint64_t>(M));
-            if (cursor >= static_cast<int64_t>(latestBlock))
-                break;
+            if (abortRequested())
+                return false;
+            juce::Thread::sleep(1);
         }
 
-        const int64_t blockStart = cursor * static_cast<int64_t>(M);
-
+        auto t0 = std::chrono::steady_clock::now();
         for (int ch = 0; ch < channels; ++ch)
         {
-            std::fill(warmInput.begin(), warmInput.begin() + M, 0.0f);
+            if (!olaSynthesizeOverlap(history, ch, S, validFrom, N, L, M,
+                                      design.freqCoeffs.data(),
+                                      out->states[static_cast<size_t>(ch)],
+                                      warmInput, warmScratch))
+                return false;
+        }
+        workSeconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t0).count();
 
-            if (blockStart >= 0)
-            {
-                const uint64_t end = static_cast<uint64_t>(blockStart)
-                                   + static_cast<uint64_t>(M);
-                if (!history.snapshot(ch, end, M, warmInput.data()))
-                    return false;
-            }
-
-            processOlaChannel(out->states[static_cast<size_t>(ch)],
-                              warmInput.data(), dummyOutput.data(), M,
-                              M, design.convFFTSize, design.freqCoeffs.data(),
-                              warmScratch);
+        while (history.capturedCount() < boundary)
+        {
+            if (abortRequested())
+                return false;
+            juce::Thread::sleep(1);
         }
 
-        ++cursor;
-        ++fedBlocks;
-
-        if ((fedBlocks & 7) == 0)
-            latestBlock = static_cast<int>(history.publishedCount()
-                                           / static_cast<uint64_t>(M));
+        t0 = std::chrono::steady_clock::now();
+        for (int ch = 0; ch < channels; ++ch)
+        {
+            if (!olaReplayBlock(history, ch, S, validFrom, L, M,
+                                design.freqCoeffs.data(),
+                                out->states[static_cast<size_t>(ch)],
+                                warmInput, warmOutput, warmScratch))
+                return false;
+        }
+        workSeconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t0).count();
     }
 
-    out->blockIndex = static_cast<int>(cursor);
+    if (prefix > 0)
+    {
+        while (history.capturedCount() < targetSample)
+        {
+            if (abortRequested())
+                return false;
+            juce::Thread::sleep(1);
+        }
+
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int ch = 0; ch < channels; ++ch)
+        {
+            if (!history.snapshotPadded(ch, boundary, prefix, validFrom,
+                                        warmInput.data()))
+                return false;
+            processOlaChannel(out->states[static_cast<size_t>(ch)],
+                              warmInput.data(), warmOutput.data(), prefix,
+                              M, L, design.freqCoeffs.data(), warmScratch);
+        }
+        workSeconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t0).count();
+    }
+
+    warmBuildSecondsEWMA = 0.75 * warmBuildSecondsEWMA + 0.25 * workSeconds;
     return true;
 }
 
-bool FFTProcessor::catchUpWarmState(WarmState& warm, const FIRState& design, int targetBlock)
+//==============================================================================
+// Offline path: build the design and an exact warm state at the current
+// committed boundary. This runs on the audio thread only when the host marks
+// the processor non-realtime; there is no deadline to miss.
+bool FFTProcessor::buildWarmAtCurrentBoundary(const FIRState& design,
+                                               std::shared_ptr<WarmState>& out)
 {
-    const int missing = targetBlock - warm.blockIndex;
-    if (missing < 0 || missing > MaxWarmCatchUpBlocks
-        || warm.states.empty()
-        || static_cast<int>(catchUpInput.size()) < ConvBlockLen
-        || static_cast<int>(catchUpOutput.size()) < ConvBlockLen
-        || static_cast<int>(catchUpScratch.size()) < design.convFFTSize)
+    const int M = ConvBlockLen;
+    const uint64_t committed = history.publishedCount();
+
+    const int channels = preparedChannels.load(std::memory_order_acquire);
+    const int N = design.firLength;
+    const int L = design.convFFTSize;
+    if (out == nullptr || N <= 0 || L < M
+        || static_cast<int>(warmInput.size()) < std::max(N, M)
+        || static_cast<int>(warmOutput.size()) < M
+        || static_cast<int>(warmScratch.size()) < L)
         return false;
 
-    const int channels = std::min(numChannels, static_cast<int>(warm.states.size()));
+    const int maxL = convolutionFftSize(MaxFirLength, ConvBlockLen);
+    out->states.resize(static_cast<size_t>(std::max(1, channels)));
+    out->version = design.version;
+    out->convFFTSize = L;
+    out->groupDelay = design.groupDelay;
+    out->targetSample = committed;
 
-    // The audio thread is the only writer of the history ring, so the range
-    // cannot change during this function. Preflight every snapshot before
-    // mutating any warm state, otherwise a partial catch-up would leave the
-    // state at a boundary that does not match its blockIndex.
-    for (int block = warm.blockIndex; block < targetBlock; ++block)
+    for (int ch = 0; ch < channels; ++ch)
+        prepareOlaChannelState(out->states[static_cast<size_t>(ch)], M, maxL);
+
+    const uint64_t validFrom = historyValidFrom.load(std::memory_order_acquire);
+
+    for (int ch = 0; ch < channels; ++ch)
     {
-        const uint64_t end = static_cast<uint64_t>(block + 1) * ConvBlockLen;
-        for (int ch = 0; ch < channels; ++ch)
-            if (!history.snapshot(ch, end, ConvBlockLen, catchUpInput.data()))
-                return false;
+        if (!olaSynthesizeAt(history, ch, committed, validFrom,
+                             N, L, M, design.freqCoeffs.data(),
+                             out->states[static_cast<size_t>(ch)],
+                             warmInput, warmOutput, warmScratch))
+            return false;
     }
 
-    for (int block = warm.blockIndex; block < targetBlock; ++block)
-    {
-        const uint64_t end = static_cast<uint64_t>(block + 1) * ConvBlockLen;
-        for (int ch = 0; ch < channels; ++ch)
-        {
-            if (!history.snapshot(ch, end, ConvBlockLen, catchUpInput.data()))
-                return false;   // should not happen (single writer)
+    return true;
+}
 
-            processOlaChannel(warm.states[static_cast<size_t>(ch)],
-                              catchUpInput.data(), catchUpOutput.data(), ConvBlockLen,
-                              ConvBlockLen, design.convFFTSize,
-                              design.freqCoeffs.data(), catchUpScratch);
+bool FFTProcessor::ensureOfflineReady()
+{
+    if (!nonRealtime.load(std::memory_order_acquire))
+        return false;
+
+    // The live worker may still be finishing a warm build when the host flips
+    // to offline. Never share its scratch buffers; skip this block and retry.
+    std::unique_lock<std::mutex> warmBuildLock(warmBuildMutex, std::try_to_lock);
+    if (!warmBuildLock.owns_lock())
+        return false;
+
+    const uint64_t committed = history.publishedCount();
+
+    auto published = getPublishedStateForAudioThread();
+
+    const bool needDesign = published == nullptr
+                         || redesignRequested.load(std::memory_order_acquire);
+    if (needDesign)
+    {
+        if (offlineDesignCooldown > 0)
+        {
+            --offlineDesignCooldown;
+        }
+        else
+        {
+            int epoch = 0;
+            auto design = buildDesignSnapshot(epoch);
+            if (design != nullptr && epoch == designEpoch.load(std::memory_order_acquire))
+            {
+                auto warm = std::make_shared<WarmState>();
+                if (buildWarmAtCurrentBoundary(*design, warm))
+                {
+                    std::shared_ptr<const FIRState> replacedState;
+                    std::shared_ptr<WarmState> replacedWarm;
+                    {
+                        std::lock_guard<std::mutex> lock (stateMutex);
+                        if (epoch == designEpoch.load(std::memory_order_acquire))
+                        {
+                            const int v = stateVersion.fetch_add(1, std::memory_order_acq_rel) + 1;
+                            design->version = v;
+                            warm->version = v;
+                            replacedState = std::move (currentState);
+                            replacedWarm = std::move (currentWarm);
+                            currentState = design;
+                            currentWarm = warm;
+                            publishedLatency.store(design->groupDelay + (ConvBlockLen - 1),
+                                                   std::memory_order_release);
+                            pendingTargetSample.store(warm->targetSample,
+                                                      std::memory_order_release);
+                            redesignRequested.store(false, std::memory_order_release);
+                            warmVersion.fetch_add(1, std::memory_order_release);
+                            offlineDesignCooldown = 1;
+                        }
+                    }
+                    // Offline: a one-off large-object release on this thread is
+                    // acceptable (no real-time deadline); steady-state uses the
+                    // retirement rings.
+                    replacedState.reset();
+                    replacedWarm.reset();
+                    return true;
+                }
+            }
+            offlineDesignCooldown = 8;
         }
     }
 
-    warm.blockIndex = targetBlock;
-    return true;
+    if (published == nullptr)
+        return false;
+
+    // Once the published design is the one already driving the audio path,
+    // there is no pending adoption; do not rebuild a warm state every block.
+    if (published->version == processedVersion)
+        return false;
+
+    auto warm = getWarmStateForAudioThread(published->version);
+    if (warm == nullptr || warm->version != published->version
+        || warm->targetSample != committed)
+    {
+        auto rebuilt = std::make_shared<WarmState>();
+        if (!buildWarmAtCurrentBoundary(*published, rebuilt))
+            return false;
+
+        std::shared_ptr<WarmState> replacedWarm;
+        {
+            std::lock_guard<std::mutex> lock (stateMutex);
+            if (published->version == stateVersion.load(std::memory_order_acquire))
+            {
+                rebuilt->version = published->version;
+                replacedWarm = std::move (currentWarm);
+                currentWarm = rebuilt;
+                pendingTargetSample.store(rebuilt->targetSample,
+                                          std::memory_order_release);
+                warmVersion.fetch_add(1, std::memory_order_release);
+            }
+        }
+        replacedWarm.reset();
+        return true;
+    }
+
+    return false;
 }
 
 //==============================================================================
@@ -789,6 +996,9 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
         && retireState(oldState))
         oldState.reset();
 
+    if (nonRealtime.load(std::memory_order_acquire))
+        ensureOfflineReady();
+
     auto published = getPublishedStateForAudioThread();
     if (published == nullptr || published->freqCoeffs.empty())
     {
@@ -814,42 +1024,62 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
 
     const uint64_t historyCount = history.publishedCount();
     currentOlaBlockIndex = static_cast<int>(historyCount / ConvBlockLen);
-    const int prefix = static_cast<int>(historyCount % ConvBlockLen);
 
     auto warm = getWarmStateForAudioThread(published->version);
+    const bool adoptionAborted = pendingAbortVersion.load(std::memory_order_acquire)
+                                 == published->version;
 
-    // A warm state can be adopted at its own exact boundary or advanced by a
-    // small number of OLA blocks on the audio thread. The background builder
-    // may finish during an audio block, which makes the state one block older
-    // than the next block's boundary; bounded catch-up makes that case
-    // deterministic without a second background thread.
-    bool warmOk = false;
-    if (warm != nullptr
+    // A warm candidate is built at a target host block. Normally it is ready
+    // exactly at that block; if the worker finished just after the boundary,
+    // advance it by at most one OLA block on the audio thread (bounded cost:
+    // at most one extra FFT). Larger gaps are rejected and rebuilt.
+    bool warmOk = warm != nullptr
         && warm->version == published->version
+        && warm->convFFTSize == published->convFFTSize
         && warm->states.size() == activeStates.size()
-        && firWarmCatchUpAllowed(warm->blockIndex, currentOlaBlockIndex,
-                                 MaxWarmCatchUpBlocks))
+        && warm->targetSample <= historyCount;
+    int warmGap = 0;
+    if (warmOk)
     {
-        const int missing = currentOlaBlockIndex - warm->blockIndex;
-        warmOk = (missing == 0)
-              || catchUpWarmState(*warm, *published, currentOlaBlockIndex);
+        warmGap = static_cast<int>(historyCount - warm->targetSample);
+        // The worker may just miss the target when the host block is large.
+        // Catch up at most the current host block (bounded by the caller's
+        // block size); larger gaps are rebuilt rather than chased.
+        const int catchUpLimit = std::max(ConvBlockLen, numSamples);
+        if (warmGap > catchUpLimit)
+            warmOk = false;
     }
 
-    auto replayPrefix = [&](const FIRState& design)
+    if (warmOk && warmGap > 0)
     {
-        if (prefix <= 0)
-            return;
-
         for (int ch = 0; ch < channelCount; ++ch)
         {
-            if (!history.snapshot(ch, historyCount, prefix, prefixScratch.data()))
-                std::fill(prefixScratch.begin(), prefixScratch.end(), 0.0f);
+            int offset = 0;
+            while (offset < warmGap)
+            {
+                const int chunk = std::min(ConvBlockLen, warmGap - offset);
+                const uint64_t end = warm->targetSample
+                                   + static_cast<uint64_t>(offset + chunk);
+                if (!history.snapshot(ch, end, chunk, prefixScratch.data()))
+                {
+                    warmOk = false;
+                    break;
+                }
 
-            processOlaChannel(activeStates[static_cast<size_t>(ch)],
-                              prefixScratch.data(), prefixScratch.data(), prefix,
-                              ConvBlockLen, design.convFFTSize, design.freqCoeffs.data(), fftWork);
+                processOlaChannel(warm->states[static_cast<size_t>(ch)],
+                                  prefixScratch.data(), warmCatchUpOutput.data(),
+                                  chunk, ConvBlockLen, published->convFFTSize,
+                                  published->freqCoeffs.data(), fftWork);
+                offset += chunk;
+            }
+
+            if (!warmOk)
+                break;
         }
-    };
+
+        if (warmOk)
+            warm->targetSample = historyCount;
+    }
 
     auto retireWarmSafely = [&](std::shared_ptr<WarmState>& w)
     {
@@ -862,7 +1092,8 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
     };
 
     // ---- adopt a new design ----
-    if (published->version != processedVersion && crossfadeRemaining <= 0)
+    if (published->version != processedVersion && crossfadeRemaining <= 0
+        && !adoptionAborted)
     {
         const bool latencyChanging = (activeState == nullptr)
                                   || (published->groupDelay != activeGroupDelay);
@@ -871,7 +1102,7 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
         // audio switches to it. Wait/guard are measured in samples so the
         // policy does not change with the host block size.
         bool pdcBlocked = false;
-        if (latencyChanging)
+        if (latencyChanging && !nonRealtime.load(std::memory_order_acquire))
         {
             const int ack = latencyAckVersion.load(std::memory_order_acquire);
             const double sr = sampleRate.load(std::memory_order_acquire);
@@ -884,13 +1115,22 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
                 }
 
                 latencyWaitSamples += numSamples;
-                // Offline/headless hosts may never pump the message thread:
-                // after ~1 s of audio, stop gating rather than staying silent.
-                if (sr > 0.0 && static_cast<double>(latencyWaitSamples) <= sr)
-                    pdcBlocked = true;
+                // Offline/headless hosts may never pump the message thread.
+                // Never switch a latency the host has not acknowledged: keep
+                // the old path and revert the host-facing latency instead.
+                // If the host later acknowledges, restore the new latency and
+                // resume the normal guard/switch path.
+                pdcBlocked = true;
+                if (sr > 0.0 && static_cast<double>(latencyWaitSamples) >= sr)
+                    publishedLatency.store(reportedActiveLatency.load(std::memory_order_acquire),
+                                           std::memory_order_release);
             }
             else
             {
+                // The host has acknowledged this version (or a later one):
+                // restore the published target and run the sample-based guard.
+                publishedLatency.store(published->groupDelay + (ConvBlockLen - 1),
+                                       std::memory_order_release);
                 if (latencyGuardVersion != published->version)
                 {
                     latencyGuardVersion = published->version;
@@ -907,37 +1147,25 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
         }
 
         if (!warmOk)
-            warmRebuildRequested.store(true, std::memory_order_release);
-
-        // Last-resort first-design start: if no warm state can be adopted for
-        // 2 s and there is no active design, start from zero state and fade in
-        // rather than staying silent forever. PDC gating still wins.
-        bool fallbackAdopted = false;
-        if (!warmOk && activeState == nullptr && !pdcBlocked)
         {
-            if (firstDesignWaitVersion != published->version)
-            {
-                firstDesignWaitVersion = published->version;
-                firstDesignWaitSamples = 0;
-            }
-            firstDesignWaitSamples += numSamples;
-            const double sr = sampleRate.load(std::memory_order_acquire);
-            if (sr > 0.0 && static_cast<double>(firstDesignWaitSamples) >= 2.0 * sr)
-            {
-                flushConvolvers();
-                activeState = published;
-                activeConvFFTSize = published->convFFTSize;
-                activeGroupDelay = published->groupDelay;
-                processedVersion = published->version;
-                reportedActiveLatency.store(published->groupDelay + (ConvBlockLen - 1),
-                                            std::memory_order_release);
-                startupFadeRemaining = CrossfadeLen;
-                firstDesignWaitSamples = 0;
-                fallbackAdopted = true;
-            }
+            const bool haveCandidate = warm != nullptr
+                && warm->version == published->version
+                && warm->convFFTSize == published->convFFTSize
+                && warm->states.size() == activeStates.size();
+            const bool missed = haveCandidate
+                && warm->targetSample < historyCount;
+            // A candidate for a future host block is valid: wait for it.
+            // Rebuild only when absent, malformed, or already behind the
+            // playhead. No gate/catch-up is involved here.
+            if (!haveCandidate || missed)
+                warmRebuildRequested.store(true, std::memory_order_release);
         }
 
-        if (!fallbackAdopted && warmOk && !pdcBlocked)
+        // No zero-state fallback: a design is published only together with a
+        // matching warm state. If the candidate's boundary was missed, keep
+        // the active design (or the delayed IIR bridge) and rebuild the warm
+        // for a new future boundary. Never start a FIR from zero history.
+        if (warmOk && !pdcBlocked)
         {
             const bool sameDelay = activeState != nullptr
                                 && published->groupDelay == activeGroupDelay;
@@ -984,9 +1212,9 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
             processedVersion = published->version;
             reportedActiveLatency.store(published->groupDelay + (ConvBlockLen - 1),
                                         std::memory_order_release);
-            firstDesignWaitSamples = 0;
+            pendingTargetSample.store(0, std::memory_order_release);
+            pendingAbortVersion.store(-1, std::memory_order_release);
 
-            replayPrefix(*published);
             retireWarmSafely(warm);
         }
     }
@@ -1056,21 +1284,6 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
                               numSamples, ConvBlockLen, activeConvFFTSize,
                               activeState->freqCoeffs.data(), fftWork);
         }
-
-        if (startupFadeRemaining > 0)
-        {
-            for (int n = 0; n < numSamples; ++n)
-            {
-                const int rem = startupFadeRemaining - n;
-                const float gain = (rem > 0)
-                                       ? 1.0f - static_cast<float>(rem)
-                                                / static_cast<float>(CrossfadeLen)
-                                       : 1.0f;
-                for (int ch = 0; ch < channelCount; ++ch)
-                    buffer.getWritePointer(ch)[n] *= gain;
-            }
-            startupFadeRemaining = std::max(0, startupFadeRemaining - numSamples);
-        }
     }
 
     return true;
@@ -1088,6 +1301,17 @@ int FFTProcessor::getTailLengthSamples() const
     if (currentState == nullptr)
         return MaxFirLength + ConvBlockLen;
     return currentState->firLength + ConvBlockLen;
+}
+
+void FFTProcessor::abortPendingPlan() noexcept
+{
+    // The published plan is no longer wanted. Keep the active design (if any)
+    // playing; the audio thread ignores the aborted version and the worker
+    // will publish a fresh plan on the next request.
+    pendingAbortVersion.store(stateVersion.load(std::memory_order_acquire),
+                              std::memory_order_release);
+    pendingTargetSample.store(0, std::memory_order_release);
+    requestRedesign();
 }
 
 //==============================================================================

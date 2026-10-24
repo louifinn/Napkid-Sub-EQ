@@ -157,6 +157,13 @@ void FrequencyResponse::timerCallback()
         parametersChanged = true;
     }
 
+    const bool firActive = processor.isFirActive();
+    if (firActive != lastFirActive)
+    {
+        lastFirActive = firActive;
+        parametersChanged = true;
+    }
+
     // FIR 模式的设计由后台线程异步发布：版本号变化即说明新系数已就绪（新建
     // 计、参数重设计或切入 FIR 后的首份设计），置脏以重建相位曲线——否则
     // 相位会一直停留在“设计未就绪”的空曲线上。
@@ -189,6 +196,13 @@ void FrequencyResponse::paint(juce::Graphics& g)
         drawPhaseCurve(g);
     drawResponseCurve(g);
     drawNodes(g);
+
+    if (hasKeyboardFocus (false))
+    {
+        g.setColour (DesignColours::accent().withAlpha (0.55f));
+        g.drawRoundedRectangle (getResponseArea().reduced (1.0f),
+                                DesignConstants::cornerRadiusMedium, 1.5f);
+    }
 
     // Liquid-glass parameter tooltip for the selected node (topmost layer)
     if (selectedNode >= 0 && isNodeEnabled(selectedNode))
@@ -318,6 +332,26 @@ void FrequencyResponse::drawGrid(juce::Graphics& g)
                    40, 14, juce::Justification::left, false);
     }
 
+    // 60 dB spectrum axis: the EQ grid is ±24 dB, so label the independent
+    // analyser axis explicitly rather than letting users read 0 dB as +24 dB.
+    const double spectrumRange = getSpectrumDisplayRangeDb();
+    if (spectrumRange > 30.0)
+    {
+        for (float db : { 0.0f, -12.0f, -24.0f, -36.0f, -48.0f, -60.0f })
+        {
+            const float y = area.getY()
+                          + static_cast<float> (-db / spectrumRange) * area.getHeight();
+            g.setColour(DesignColours::morandiGrey().withAlpha(0.18f));
+            g.drawHorizontalLine(static_cast<int>(y),
+                                 area.getRight() - 16.0f, area.getRight());
+            g.setColour(DesignColours::textSecondary().withAlpha(0.45f));
+            g.drawText(juce::String(static_cast<int>(db)),
+                       static_cast<int>(area.getRight()) - 38,
+                       static_cast<int>(y) - 7, 20, 14,
+                       juce::Justification::right, false);
+        }
+    }
+
     // 右侧相位角度标签（三种模式都显示相位曲线：FIR 模式为剩余相位）
     if (shouldShowPhaseCurve())
     {
@@ -343,6 +377,9 @@ void FrequencyResponse::drawFirResolutionWarning(juce::Graphics& g)
         selectedMode = juce::roundToInt (v->load());
     if (selectedMode == 0)
         return;
+    if (auto* bypass = apvts.getRawParameterValue ("bypass");
+        bypass != nullptr && bypass->load() > 0.5f)
+        return;
 
     auto* firParam = apvts.getRawParameterValue ("fir_length");
     const double sr = processor.getSampleRate();
@@ -351,7 +388,8 @@ void FrequencyResponse::drawFirResolutionWarning(juce::Graphics& g)
 
     const int choice = juce::jlimit (0, SubEQ::FFTProcessor::NumFirLengthChoices - 1,
                                     juce::roundToInt (firParam->load()));
-    const int firLength = SubEQ::FFTProcessor::FirLengthChoices[choice];
+    const int nominal = SubEQ::FFTProcessor::FirLengthChoices[choice];
+    const int actualTaps = (selectedMode == 2) ? std::max (1, nominal - 1) : nominal;
 
     bool lowResolution = false;
     for (int i = 0; i < SubEQ::NumNodes && !lowResolution; ++i)
@@ -363,12 +401,12 @@ void FrequencyResponse::drawFirResolutionWarning(juce::Graphics& g)
             static_cast<double> (getNodeParamValue (i, SubEQ::ParamID::Freq)),
             static_cast<double> (getNodeParamValue (i, SubEQ::ParamID::Q)),
             SubEQ::intToFilterType (juce::roundToInt (getNodeParamValue (i, SubEQ::ParamID::Type))),
-            firLength, sr);
+            actualTaps, sr);
 
         const int typeIndex = juce::roundToInt (getNodeParamValue (i, SubEQ::ParamID::Type));
         const float gainDb = getNodeParamValue (i, SubEQ::ParamID::Gain);
         const bool gainRelevant = !SubEQ::isGainSensitiveTypeIndex (typeIndex)
-                               || std::abs (gainDb) > 0.05f;
+                               || std::abs (gainDb) > 0.5f;
         if (!r.resolvable && gainRelevant)
             lowResolution = true;
     }
@@ -377,7 +415,8 @@ void FrequencyResponse::drawFirResolutionWarning(juce::Graphics& g)
         return;
 
     auto area = getResponseArea();
-    auto textArea = area.reduced (10.0f).removeFromTop (16.0f);
+    // Keep clear of the frequency labels at the top of the plot.
+    auto textArea = area.reduced (10.0f).withTrimmedTop (20.0f).removeFromTop (16.0f);
     g.setFont (DesignFonts::caption());
     g.setColour (DesignColours::morandiBrown());
     g.drawText ("FIR resolution too low - increase FIR length or use Zero Latency",
@@ -410,10 +449,14 @@ void FrequencyResponse::drawSpectrum(juce::Graphics& g)
         }
 
         // 60 dB mode is the analyser's full range and intentionally uses its
-        // own top-anchored axis (0 dB at the top, -60 dB at the bottom).
+        // own top-anchored axis. Inset the endpoints so a full-scale 0 dB
+        // trace is not clipped by the plot border.
+        const float inset = 4.0f;
         const float clamped = juce::jlimit (static_cast<float> (-rangeDb), 0.0f, db);
         const float t = (0.0f - clamped) / static_cast<float> (rangeDb);
-        return area.getY() + t * area.getHeight();
+        const float top = area.getY() + inset;
+        const float bottom = area.getBottom() - inset;
+        return top + t * (bottom - top);
     };
 
     auto drawBandLine = [&](const float* data, int numBands, juce::Colour colour)
@@ -545,7 +588,9 @@ void FrequencyResponse::updateResponsePaths()
     int selectedMode = 0;
     if (auto* v = apvts.getRawParameterValue ("eq_mode"))
         selectedMode = juce::roundToInt (v->load());
-    const bool firMode = selectedMode != 0;
+    // Only draw the FIR response once that plan is actually feeding the audio
+    // path; while a design is pending/warming, show the audible IIR bridge.
+    const bool firMode = selectedMode != 0 && processor.isFirActive();
     // One snapshot per rebuild: magnitude and phase come from the same design
     // version and the state mutex is taken once, not once per pixel.
     const auto firSnapshot = firMode ? processor.getFirDesignSnapshot() : nullptr;
@@ -911,7 +956,7 @@ bool FrequencyResponse::needsPhysicsTimer() const
 
 void FrequencyResponse::ensurePhysicsTimerRunning()
 {
-    if (!physicsTimer.isTimerRunning())
+    if (needsPhysicsTimer() && !physicsTimer.isTimerRunning())
         physicsTimer.startTimerHz (physicsTimerHz);
 }
 
@@ -1124,6 +1169,10 @@ void FrequencyResponse::mouseDown(const juce::MouseEvent& event)
                 startTypeMenu(selectedNode);
                 return;
             }
+            // Consume the whole label card: padding/gaps must not fall through
+            // to the "create node" branch below.
+            if (getNodeLabelBounds(selectedNode).contains(pos))
+                return;
         }
 
         // Check if clicking on a node
@@ -1242,7 +1291,9 @@ void FrequencyResponse::mouseDrag(const juce::MouseEvent& event)
 
     auto delta = event.position - dragStartPos;
 
-    bool gainSensitive = isGainSensitiveType(draggedNode);
+    // Use the gesture set captured at mouseDown: if automation flips the type
+    // mid-drag, keep writing the parameter whose gesture is actually open.
+    bool gainSensitive = dragGestureGain;
 
     if (event.mods.isShiftDown())
     {
@@ -1347,6 +1398,9 @@ void FrequencyResponse::mouseExit(const juce::MouseEvent&)
 
 void FrequencyResponse::mouseDoubleClick(const juce::MouseEvent& event)
 {
+    if (isDragging || isDraggingNode)
+        return;
+
     int node = findNodeAtPosition(event.position);
     if (node >= 0)
     {
@@ -1397,6 +1451,54 @@ void FrequencyResponse::mouseWheelMove(const juce::MouseEvent& event,
     }
 }
 
+bool FrequencyResponse::keyPressed(const juce::KeyPress& key)
+{
+    if (selectedNode < 0 || !isNodeEnabled(selectedNode))
+        return false;
+
+    const int node = selectedNode;
+    const auto apply = [&] (SubEQ::ParamID param, float value)
+    {
+        beginNodeGesture(node, param);
+        setNodeParamValue(node, param, value);
+        endNodeGesture(node, param);
+        parametersChanged = true;
+        repaint();
+    };
+
+    if (key == juce::KeyPress (juce::KeyPress::leftKey)
+        || key == juce::KeyPress (juce::KeyPress::rightKey))
+    {
+        const float factor = (key == juce::KeyPress (juce::KeyPress::leftKey))
+                                 ? 1.0f / 1.02f : 1.02f;
+        const float freq = juce::jlimit (0.5f, 500.0f,
+            getNodeParamValue (node, SubEQ::ParamID::Freq) * factor);
+        apply (SubEQ::ParamID::Freq, freq);
+        return true;
+    }
+
+    if (key == juce::KeyPress (juce::KeyPress::upKey)
+        || key == juce::KeyPress (juce::KeyPress::downKey))
+    {
+        const float sign = (key == juce::KeyPress (juce::KeyPress::upKey)) ? 1.0f : -1.0f;
+        if (isGainSensitiveType (node))
+        {
+            const float gain = juce::jlimit (-24.0f, 24.0f,
+                getNodeParamValue (node, SubEQ::ParamID::Gain) + sign * 0.5f);
+            apply (SubEQ::ParamID::Gain, gain);
+        }
+        else
+        {
+            const float q = SubEQ::stepLogQ (getNodeParamValue (node, SubEQ::ParamID::Q),
+                                             sign * 0.05f);
+            apply (SubEQ::ParamID::Q, q);
+        }
+        return true;
+    }
+
+    return false;
+}
+
 //==============================================================================
 // Node Selection
 //==============================================================================
@@ -1434,7 +1536,9 @@ void FrequencyResponse::deselectNode()
 
 int FrequencyResponse::findNodeAtPosition(juce::Point<float> pos) const
 {
-    for (int i = 0; i < SubEQ::NumNodes; ++i)
+    // Later-drawn nodes sit on top; search in reverse so overlap selects the
+    // visually topmost node instead of the lowest index.
+    for (int i = SubEQ::NumNodes - 1; i >= 0; --i)
     {
         if (!isNodeEnabled(i))
             continue;

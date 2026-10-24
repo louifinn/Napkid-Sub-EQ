@@ -33,7 +33,16 @@ void EQNode::prepare(double sr)
     // 100 Hz Bell 实际落在 ≈91.9 Hz）。这里在 prepare 内直接重算，与 FIR 路径
     // （FFTProcessor::prepare 在采样率变化时触发重设计）保持等价语义。
     if (rateChanged)
+    {
         update (freq, gainDb, q, currentType);
+        // A sample-rate change is not a musical parameter move: snap to the
+        // new-rate coefficients instead of gliding from stale old-rate ones.
+        smoothing = false;
+        extraBiquadFadeOut = false;
+        coeffs[0] = targetCoeffs[0];
+        if (numBiquads > 1)
+            coeffs[1] = targetCoeffs[1];
+    }
 
     reset();
 }

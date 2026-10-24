@@ -129,6 +129,12 @@ public:
     // the processing chain once the fade reaches 0 (see isActive).
     void setEnabled(bool shouldBeEnabled) noexcept
     {
+        // Re-enabling a node that has fully faded out: clear stale low-frequency
+        // biquad memory before the wet signal fades back in. While the node is
+        // still active/fading this would be a discontinuity and is skipped.
+        if (shouldBeEnabled && !enabled && fadeGain <= 0.0)
+            reset();
+
         enabled = shouldBeEnabled;
         fadeTarget = shouldBeEnabled ? 1.0 : 0.0;
     }

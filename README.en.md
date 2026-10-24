@@ -83,7 +83,7 @@ It is particularly well suited to:
 - **DAW**: any VST3-compatible host
 - **Compiler**: Visual Studio 2022 or newer (the Projucer export targets VS2022)
 - **Dependency**: JUCE 7.x framework
-- **Required with the current project config**: ASIO SDK (`.jucer` sets `JUCE_ASIO=1` and references `D:/Program Files/JUCE/modules/juce_audio_devices/native/asio`)
+- **Optional**: ASIO SDK. The current `.jucer` sets `JUCE_ASIO=0`, so building does not require the ASIO SDK. To enable ASIO in the standalone build, set `JUCE_ASIO` to 1 and add the SDK include path in Projucer (do not hard-code a machine-specific path).
 
 ---
 
@@ -93,7 +93,7 @@ It is particularly well suited to:
 
 1. Install [JUCE](https://juce.com/) (7.x recommended)
 2. Install Visual Studio 2022 (with the Desktop development with C++ workload)
-3. Download the [Steinberg ASIO SDK](https://www.steinberg.net/developers/) into the path referenced by `.jucer` (currently `D:/Program Files/JUCE/modules/juce_audio_devices/native/asio`; update it when moving machines)
+3. (Optional) Download the [Steinberg ASIO SDK](https://www.steinberg.net/developers/), enable `JUCE_ASIO` in Projucer and add its include path. The default `JUCE_ASIO=0` builds VST3/Standalone without the SDK (WASAPI/DirectSound).
 
 ### Build Steps
 
@@ -233,7 +233,7 @@ One of the design goals of this plugin is processing near-DC control signals. At
 ## Known Limitations
 
 - **GUI is Windows-only**: currently uses the Projucer VS2022 export target
-- **Display wobble in the extreme low-frequency spectrum (0.5–1 Hz)**: since v0.4.0 the VQT engine restores full octave resolution above roughly 4–16 Hz (depending on window/resolution tier); v0.5.0 changes the bottom-tier window from “largest power of two ≤2 s” to “smallest power of two ≥2 s” (~2.73 s @48 kHz), improving cycle coverage, but the 0.5 Hz band still contains fewer than two full cycles, so readings exhibit a slow phase wobble (a physical constraint; image rejection has been added to mitigate it). See `Documentation/SubEQ_VQT_Feasibility.md` §8
+- **Display wobble in the extreme low-frequency spectrum (0.5–1 Hz)**: since v0.4.0 the VQT engine restores full octave resolution above roughly 4–16 Hz (depending on window/resolution tier); v0.5.0 changes the bottom-tier window from “largest power of two ≤2 s” to “smallest power of two ≥2 s” (~2.73 s @48 kHz), improving cycle coverage, but the 0.5 Hz band still contains fewer than two full cycles, so readings exhibit a slow phase wobble (a physical constraint; no mirror-support rejection is applied). The 12th-order decimator adds about 1.4 s of low-frequency display lag @48k (about 2.2 s @4k); this affects the display only. See `Documentation/SubEQ_VQT_Feasibility.md` §8.
 - **Spectrum noise-floor definition**: VQT band energy is aggregated by window ENBW × tier bandwidth (2× steps between tiers), so the noise-floor shape differs from the old "single-bin sampling" — it is flatter (constant bandwidth ratio per octave), which is expected behaviour
 - **Relatively high spectrum CPU at 44.1 kHz**: the power-of-two decimation divisibility constraint makes the top-tier oversampling ratio high (about 2× that at 48 kHz), bringing the cost back to the order of the old engine; 48/96/192 kHz are unaffected
 - **Peak broadening from spectrum smoothing (v0.4.1)**: inter-band smoothing tames noise fluctuation but broadens isolated pure-tone peaks — in the worst case (an isolated high-frequency tone) about -4.8 dB at 1/6, -7.0 dB at 1/3 and -9.5 dB at 2/3; the low-frequency range loses significantly less because its analysis kernel already overlaps bands. Choose Off when precise per-band readings are needed
@@ -248,19 +248,26 @@ This project is built on the following third-party technology stack. The license
 ### Core Framework
 
 - **[JUCE](https://juce.com/)**
-  - Copyright (c) 2020–2025 Raw Material Software Limited
+  - Copyright (c) 2020–2026 Raw Material Software Limited
   - This project uses JUCE's **GPL v3** licensing option
-  - The project as a whole is therefore released under the **GNU General Public License v3**
+  - The project as a whole is therefore released under the **GNU General Public License version 3 only**
   - The full license text is in the [LICENSE](LICENSE) file
+
+### Fonts
+
+- **Inter** (Regular / Bold)
+  - Copyright (c) 2016 The Inter Project Authors
+  - SIL Open Font License 1.1; full text in [Source/Fonts/OFL.txt](Source/Fonts/OFL.txt)
+  - The OFL text must accompany release packages
 
 ### Plugin Technology
 
 - **VST3**
   - Copyright (c) Steinberg Media Technologies GmbH
-  - VST3 SDK: [Apache License 2.0](https://github.com/steinbergmedia/vst3sdk)
+  - VST3 SDK: [Steinberg VST3 License, or GPLv3](https://github.com/steinbergmedia/vst3sdk)
   - Official website: https://www.steinberg.net/vst3
 
-- **ASIO** (used by the standalone build; the current `.jucer` enables it, so building requires the ASIO SDK)
+- **ASIO** (optional: standalone only when `JUCE_ASIO=1`; disabled by default)
   - Copyright (c) Steinberg Media Technologies GmbH
   - Proprietary license: ASIO SDK License Agreement
   - Official website: https://www.steinberg.net/developers/

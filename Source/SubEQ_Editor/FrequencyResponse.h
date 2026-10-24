@@ -41,6 +41,7 @@ public:
     void mouseDoubleClick(const juce::MouseEvent& event) override;
     void mouseWheelMove(const juce::MouseEvent& event,
                         const juce::MouseWheelDetails& wheel) override;
+    bool keyPressed(const juce::KeyPress& key) override;
 
     // APVTS Listener
     void parameterChanged(const juce::String& parameterID, float newValue) override;
@@ -66,6 +67,7 @@ private:
     // 上一次看到的 FIR 设计版本号（只由 GUI 线程读写）：FIR 模式下版本变化
     // 说明后台设计已异步发布，需要重建相位曲线。-1 表示从未同步过。
     int lastFirDesignVersion = -1;
+    bool lastFirActive = false;
 
     // Node selection state
     int selectedNode = -1;

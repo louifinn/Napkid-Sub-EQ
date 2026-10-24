@@ -22,6 +22,7 @@
 #include "SubEQ_Core.h"
 #include "SubEQ_FFTConvolver.h"
 #include "SubEQ_FIRHistory.h"
+#include "SubEQ_WarmPlan.h"
 
 namespace SubEQ
 {
@@ -57,15 +58,19 @@ public:
     // audio that played in Zero Latency).
     void resetConvolution();
 
+    // Rebuild only the warm state for the current design, choosing a fresh
+    // future host-block target. Used when the audio missed a warm boundary;
+    // the design (and its latency) stays published.
+    void requestWarmRebuild();
+
     // Capture the raw input for the warm-up history. Called for every mode;
     // publishNow=false defers visibility until publishHistory() at block end.
     void captureHistory(const float* const* channels, int numChannels, int numSamples,
                         bool publishNow = true);
     void publishHistory() noexcept { history.publish(); }
 
-    // Drop the published design without destroying it here: used when
-    // (re-)entering a FIR mode, so the audio thread outputs silence until
-    // the next design is published instead of serving a stale curve.
+    // Drop the published design without destroying it here (kept for callers
+    // that need a hard reset; mode switches now retain the active design).
     // Audio-thread safe — pointer moves under the lock only; destruction
     // happens on the background thread via the retirement ring.
     void clearPublishedState();
@@ -77,6 +82,19 @@ public:
     // Ask the background thread to redesign the FIR from current parameters.
     // Non-blocking; the new coefficients are published asynchronously.
     void requestRedesign();
+
+    // Offline rendering has no real-time deadline: the audio thread builds the
+    // design and exact warm state synchronously at the current OLA boundary.
+    void setNonRealtime(bool shouldBeNonRealtime) noexcept
+    {
+        nonRealtime.store(shouldBeNonRealtime, std::memory_order_release);
+    }
+
+    // Structural change (mode/FIR length/prepare): invalidate any design
+    // currently being computed, but keep the active design running until the
+    // replacement is ready. Used to avoid starvation under continuous
+    // automation.
+    void invalidateDesigns();
 
     // Process entire audio buffer (all channels). Returns true when an active
     // FIR design wrote the buffer; false when no design is active yet (the
@@ -98,6 +116,32 @@ public:
     {
         latencyAckVersion.store(version, std::memory_order_release);
     }
+
+    // A transition was aborted after the host was told the old latency. The
+    // same design version must not be adopted until the coordinator reports
+    // the new latency again.
+    void invalidateLatencyAck() noexcept
+    {
+        latencyAckVersion.store(0, std::memory_order_release);
+    }
+
+    // Host-block-aligned target of the latest published plan (0 when none).
+    // PluginProcessor uses this to delay the PDC report/gate until the plan is
+    // actually about to be adopted, instead of gating for the whole build lead.
+    uint64_t getPendingTargetSample() const noexcept
+    {
+        return pendingTargetSample.load(std::memory_order_acquire);
+    }
+
+    uint64_t getCommittedSampleCount() const noexcept
+    {
+        return history.publishedCount();
+    }
+
+    // Cancel the current published-but-not-adopted plan (latency transition
+    // timeout/missed boundary). The active design keeps playing; the worker
+    // will publish a fresh plan on the next request.
+    void abortPendingPlan() noexcept;
 
     // Total pipeline tail (FIR length + block latency), for tail-length reporting
     int getTailLengthSamples() const;
@@ -145,7 +189,7 @@ private:
     {
         std::vector<OlaChannelState> states;
         int version = 0;
-        int blockIndex = -1;
+        uint64_t targetSample = 0;   // exact host block start
         int convFFTSize = 0;
         int groupDelay = 0;
     };
@@ -191,8 +235,12 @@ private:
     juce::WaitableEvent redesignEvent;
 
     std::atomic<juce::AudioProcessorValueTreeState*> parameterSource { nullptr };  // read by bg thread
-    SubEQ::EQEngine designEngine;                            // background-thread private
+    SubEQ::EQEngine designEngine;                            // guarded by designMutex
+    std::mutex designMutex;
+    mutable std::mutex warmBuildMutex;   // guards warmInput/warmOutput/warmScratch
     double designSampleRate = 0.0;                           // bg-thread cache: last prepared sr
+    std::atomic<bool> nonRealtime { false };                 // host is offline-rendering
+    int offlineDesignCooldown = 0;                           // blocks between offline redesigns
 
     // Overlap-add state (audio thread only). The convolution FFT runs in
     // double precision (float FFT error ~0.4% relative would be audible).
@@ -211,16 +259,11 @@ private:
     std::atomic<int> latencyAckVersion { 0 };
     int latencyGuardVersion = 0;
     int latencyGuardSamples = 0;
-    int latencyWaitVersion = 0;
+    std::atomic<int> latencyWaitVersion = 0;
     int latencyWaitSamples = 0;
-
-    // First-design fallback: if no warm state can be adopted for this long,
-    // start from a zero-state OLA and fade in over 1024 samples rather than
-    // staying silent forever. Only applies when there is no active design.
-    int firstDesignWaitSamples = 0;
-    int firstDesignWaitVersion = -1;
-    int startupFadeRemaining = 0;
-    static constexpr int MaxWarmCatchUpBlocks = 4;
+    std::atomic<uint64_t> pendingTargetSample { 0 };
+    std::atomic<int> pendingAbortVersion { -1 };
+    double warmBuildSecondsEWMA = 0.012;
 
     // stateVersion of the design last seen by process() (audio thread). A
     // newly published design starts a short crossfade from the previous
@@ -253,10 +296,10 @@ private:
     std::vector<std::complex<double>> warmScratch;
     int warmFeedSamples = 0;
     std::atomic<int> preparedChannels { 2 };
+    int maxHostBlockSamples = 512;       // prepare: used only as an initial upper bound
+    std::atomic<int> currentHostBlockSamples { 512 };  // audio: current block size for warm lead
     std::vector<float> prefixScratch;   // audio: replay p samples into a warm state
-    std::vector<float> catchUpInput;    // audio: one OLA block of history
-    std::vector<float> catchUpOutput;   // audio: discarded warm catch-up output
-    std::vector<std::complex<double>> catchUpScratch;   // audio: catch-up FFT scratch
+    std::vector<float> warmCatchUpOutput; // audio: discard output of a bounded warm catch-up
 
     // Audio-thread deferred retirements (ring was full): retried next block.
     mutable std::shared_ptr<const FIRState> deferredDesignRetire;
@@ -269,13 +312,19 @@ private:
     bool retireWarm(std::shared_ptr<WarmState>& warmToRetire) const;
     std::shared_ptr<WarmState> getWarmStateForAudioThread(int designVersion) const;
 
-    // Background: build the exact OLA state at the latest completed OLA block
-    // boundary from the input history.
-    bool buildWarmState(const FIRState& design, std::shared_ptr<WarmState>& out);
+    // Background: build the exact OLA state at a future OLA boundary from the
+    // input history (overlap-save at T-M, then replay the last M samples).
+    // Waits for captured history; aborts when expectedEpoch changes or the
+    // worker is asked to exit. No audio-thread catch-up is ever performed.
+    bool buildWarmState(const FIRState& design, std::shared_ptr<WarmState>& out,
+                        int expectedEpoch, uint64_t targetSample);
 
-    // Audio: advance a warm state from its blockIndex to targetBlock by
-    // replaying the missing history blocks. Bounded by MaxWarmCatchUpBlocks.
-    bool catchUpWarmState(WarmState& warm, const FIRState& design, int targetBlock);
+    // Offline path: synchronously build the design coefficients and an exact
+    // warm state at the current committed boundary.
+    std::shared_ptr<FIRState> buildDesignSnapshot(int& outEpoch);
+    bool buildWarmAtCurrentBoundary(const FIRState& design,
+                                    std::shared_ptr<WarmState>& out);
+    bool ensureOfflineReady();
 
     // Flush the active OLA accumulators (delay-changing switch).
     void flushConvolvers();

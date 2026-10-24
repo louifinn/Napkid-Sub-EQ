@@ -258,6 +258,20 @@ bool MasterGainSlider::isThumbHitArea(juce::Point<float> pos) const
     return pos.getDistanceFrom({ cx, getThumbCentreY() }) <= getThumbRadius() + 3.0f;
 }
 
+bool MasterGainSlider::isInTravelArea(juce::Point<float> pos) const
+{
+    if (pos.y < getTravelTop() || pos.y > getTravelBottom())
+        return false;
+
+    if (isThumbHitArea(pos))
+        return true;
+
+    // The visible track is 6 px wide; do not treat the 20+ px blank margins
+    // (and the title area above the travel range) as a click-to-jump target.
+    const float dx = pos.x - static_cast<float>(getWidth()) * 0.5f;
+    return std::abs(dx) <= 5.0f;
+}
+
 void MasterGainSlider::updateTrackHover()
 {
     // Track + fill widen to 2x while the cursor interacts with the fader in
@@ -299,10 +313,11 @@ void MasterGainSlider::mouseMove(const juce::MouseEvent& event)
 
 void MasterGainSlider::mouseDown(const juce::MouseEvent& event)
 {
-    // Right-click anywhere on the fader: reset to 0dB
+    // Right-click in the fader travel area: reset to 0dB
     if (event.mods.isRightButtonDown())
     {
-        resetToZero();
+        if (isInTravelArea(event.position))
+            resetToZero();
         return;
     }
 
@@ -337,12 +352,7 @@ void MasterGainSlider::mouseDown(const juce::MouseEvent& event)
         // Only the actual travel area is clickable; the title and panel padding
         // must not jump the gain to ±24 dB. The horizontal guard keeps clicks
         // on the left/right blank margins from jumping the value too.
-        const float y = event.position.y;
-        if (y < getTravelTop() || y > getTravelBottom())
-            return;
-
-        const float dx = event.position.x - static_cast<float>(getWidth()) * 0.5f;
-        if (dx < -12.0f || dx > 12.0f)
+        if (!isInTravelArea(event.position))
             return;
 
         // Click on the track: jump the thumb. Capture the OLD edge position
@@ -438,9 +448,10 @@ void MasterGainSlider::mouseExit(const juce::MouseEvent&)
     repaint();
 }
 
-void MasterGainSlider::mouseDoubleClick(const juce::MouseEvent&)
+void MasterGainSlider::mouseDoubleClick(const juce::MouseEvent& event)
 {
-    resetToZero();
+    if (isInTravelArea(event.position))
+        resetToZero();
 }
 
 bool MasterGainSlider::keyPressed(const juce::KeyPress& key)
@@ -467,6 +478,8 @@ void MasterGainSlider::mouseWheelMove(const juce::MouseEvent& event,
                                        const juce::MouseWheelDetails& wheel)
 {
     if (isDragging || event.mods.isAnyMouseButtonDown())
+        return;
+    if (!isInTravelArea(event.position))
         return;
 
     float oldFillY = getThumbCentreY();

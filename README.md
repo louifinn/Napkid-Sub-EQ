@@ -81,7 +81,7 @@ Napkid Sub EQ 是一款专为低频信号处理设计的参量均衡器插件。
 - **DAW**：任何支持 VST3 的宿主
 - **编译器**：Visual Studio 2022 或更高（Projucer 导出目标为 VS2022）
 - **依赖**：JUCE 7.x 框架
-- **必需（当前工程配置）**：ASIO SDK（`.jucer` 默认 `JUCE_ASIO=1` 并引用 `D:/Program Files/JUCE/modules/juce_audio_devices/native/asio`）
+- **可选**：ASIO SDK。当前 `.jucer` 默认 `JUCE_ASIO=0`，构建不依赖 ASIO SDK；如需 Standalone 的 ASIO 支持，将 `JUCE_ASIO` 设为 1 并在 Projucer 中加入 SDK 的 include 路径（不要硬编码本机路径）。
 
 ---
 
@@ -91,7 +91,7 @@ Napkid Sub EQ 是一款专为低频信号处理设计的参量均衡器插件。
 
 1. 安装 [JUCE](https://juce.com/)（推荐 7.x 版本）
 2. 安装 Visual Studio 2022（包含 C++ 桌面开发工作负载）
-3. 下载 [Steinberg ASIO SDK](https://www.steinberg.net/developers/) 并放置到 `.jucer` 引用的路径（当前为 `D:/Program Files/JUCE/modules/juce_audio_devices/native/asio`，换机需同步修改）
+3. （可选）下载 [Steinberg ASIO SDK](https://www.steinberg.net/developers/)，在 Projucer 中开启 `JUCE_ASIO` 并加入 SDK 的 include 路径；默认 `JUCE_ASIO=0`，无 SDK 也可构建 VST3/Standalone（WASAPI/DirectSound）。
 
 ### 构建步骤
 
@@ -179,8 +179,10 @@ Sub EQ/
 │   ├── SubEQ_Spring.h               # 二阶弹簧积分器（共享纯计算）
 │   ├── SubEQ_FilterType.h           # FilterType 枚举 + int↔枚举映射（共享纯计算）
 │   ├── SubEQ_OutputStage.h          # 后置主增益 ramp / 延迟补偿旁路（共享纯计算）
-│   ├── SubEQ_FIRHistory.h           # T2 输入历史环
+│   ├── SubEQ_FIRHistory.h           # T2 captured/committed 输入历史环
 │   ├── SubEQ_FIRSwitchState.h       # warm 边界 / 交叉淡化纯策略
+│   ├── SubEQ_WarmPlan.h             # host-block 对齐的 warm 目标规划（共享纯计算）
+│   ├── SubEQ_OlaBank.h              # 精确边界 OLA warm 合成（共享纯计算）
 │   ├── SubEQ_FirResolution.h        # FIR 分辨率评估
 │   └── SubEQ_Editor/
 │       ├── SubEQLookAndFeel.h       # 窗口/节点/网格布局常量（遗留颜色已删除）
@@ -189,8 +191,11 @@ Sub EQ/
 │       ├── ModeSelector.h/.cpp      # 底部模式选择面板（v0.2.0 新增）
 │       └── DesignSystem/            # 液态玻璃设计系统（颜色/字体/动画/玻璃效果/LookAndFeel）
 │   └── Fonts/                       # 内嵌 Inter Regular/Bold（SIL OFL 1.1，经 jucer 资源编入 BinaryData）
+├── Tests/                           # 607 项离线回归 + JUCE runtime 集成测试
+├── scripts/package_release.ps1      # 发布打包（VST3/Standalone + 许可/OFL）
 ├── Builds/VisualStudio2022/         # VS 项目生成目录（gitignored）
 ├── Napkid Sub EQ.jucer              # Projucer 项目文件
+├── THIRD_PARTY_NOTICES.md           # 第三方许可通告
 └── README.md                        # 本文件
 ```
 
@@ -234,7 +239,7 @@ Sub EQ/
 ## 已知限制
 
 - **GUI 仅限 Windows**：当前使用 Projucer 的 VS2022 导出目标
-- **频谱极低频段（0.5~1 Hz）的显示摆动**：v0.4.0 起 VQT 引擎在约 4~16 Hz 以上（随窗型/分辨率档）恢复满倍频程分辨；v0.5.0 把底部帧长从“≤2 s 的 2 的幂”改为“≥2 s 的 2 的幂”（48 kHz 约 2.73 s），0.5 Hz 段的周期覆盖改善，但窗内仍不足两个完整周期，读数存在慢速相位摆动（物理约束；底部支撑截断与包络平滑只能部分缓解）。详见 `Documentation/SubEQ_VQT_Feasibility.md` §8
+- **频谱极低频段（0.5~1 Hz）的显示摆动**：v0.4.0 起 VQT 引擎在约 4~16 Hz 以上（随窗型/分辨率档）恢复满倍频程分辨；v0.5.0 把底部帧长从“≤2 s 的 2 的幂”改为“≥2 s 的 2 的幂”（48 kHz 约 2.73 s），0.5 Hz 段的周期覆盖改善，但窗内仍不足两个完整周期，读数存在慢速相位摆动（物理约束；不做镜像支撑抑制，仅靠包络平滑）。12 阶抽取链使低频显示相对音频滞后约 1.4 s@48k（4k 约 2.2 s），仅影响显示。详见 `Documentation/SubEQ_VQT_Feasibility.md` §8
 - **频谱噪声底口径**：VQT 段能量按窗 ENBW × 层带宽聚合（层间 2 倍阶梯），噪声底形状与旧"单 bin 取样"不同——更平（每倍频程恒定带宽比例），属预期行为
 - **44.1 kHz 下频谱 CPU 偏高**：2 的幂抽取整除约束使顶层过采样比偏高（约 2 倍于 48 kHz），成本回到旧引擎量级；48/96/192 kHz 不受影响
 - **频谱平滑的峰展宽（v0.4.1）**：段间平滑在驯服噪声起伏的同时会展宽孤立纯音峰——最坏情形（高频孤立单音）1/6 档约 -4.8 dB、1/3 档 -7.0 dB、2/3 档 -9.5 dB；低频段因分析核本就跨段重叠，损失显著更小。需要逐段精确读数时选 Off
@@ -249,19 +254,26 @@ Sub EQ/
 ### 核心框架
 
 - **[JUCE](https://juce.com/)**
-  - Copyright (c) 2020–2025 Raw Material Software Limited
+  - Copyright (c) 2020–2026 Raw Material Software Limited
   - 本项目采用 JUCE 的 **GPL v3** 授权模式
-  - 因此本项目整体以 **GNU General Public License v3** 发布
+  - 因此本项目整体以 **GNU General Public License version 3 only** 发布（不是 or-later）
   - 完整许可文本见 [LICENSE](LICENSE) 文件
+
+### 字体
+
+- **Inter**（Regular / Bold）
+  - Copyright (c) 2016 The Inter Project Authors
+  - SIL Open Font License 1.1，完整文本见 [Source/Fonts/OFL.txt](Source/Fonts/OFL.txt)
+  - 发布包需随附该 OFL 文本
 
 ### 插件技术
 
 - **VST3**
   - Copyright (c) Steinberg Media Technologies GmbH
-  - VST3 SDK: [Apache License 2.0](https://github.com/steinbergmedia/vst3sdk)
+  - VST3 SDK: [Steinberg VST3 License, or GPLv3](https://github.com/steinbergmedia/vst3sdk)
   - 官方网站: https://www.steinberg.net/vst3
 
-- **ASIO**（Standalone 版本使用；当前 `.jucer` 默认开启，构建需要 ASIO SDK）
+- **ASIO**（可选：仅 Standalone 且 `JUCE_ASIO=1` 时使用；默认关闭）
   - Copyright (c) Steinberg Media Technologies GmbH
   - 专有许可：ASIO SDK License Agreement
   - 官方网站: https://www.steinberg.net/developers/

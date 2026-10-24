@@ -37,7 +37,8 @@ public:
             data.assign(needed, 0.0f);
             writeIndex = 0;
             written = 0;
-            published.store(0, std::memory_order_release);
+            captured.store(0, std::memory_order_release);
+            committed.store(0, std::memory_order_release);
         }
     }
 
@@ -46,16 +47,18 @@ public:
         std::fill(data.begin(), data.end(), 0.0f);
         writeIndex = 0;
         written = 0;
-        published.store(0, std::memory_order_release);
+        captured.store(0, std::memory_order_release);
+        committed.store(0, std::memory_order_release);
     }
 
     // Write one block for every channel. channelData may contain fewer channels
-    // than prepared; missing channels are written as silence. publishNow=false
-    // lets the caller write the current block before processing but expose it
-    // only after the convolution has advanced (so warm states always align
-    // with the start of the next block).
+    // than prepared; missing channels are written as silence.
+    // `commit=true` publishes both captured and committed frontiers (legacy
+    // single-call use). `commit=false` exposes the block to the background
+    // warm builder via `captured` while the audio thread keeps `committed` at
+    // the block start; the caller then calls publish() at block end.
     void writeFrame(const float* const* channelData, int numChannelsIn, int numSamples,
-                    bool publishNow = true) noexcept
+                    bool commit = true) noexcept
     {
         if (cap <= 0 || data.empty() || numSamples <= 0)
             return;
@@ -80,38 +83,49 @@ public:
             ++written;
         }
 
-        if (publishNow)
-            published.store(written, std::memory_order_release);
+        captured.store(written, std::memory_order_release);
+        if (commit)
+            committed.store(written, std::memory_order_release);
     }
 
+    // Commit the currently captured frontier as processed. Called at the end
+    // of the audio block, after convolution has advanced.
     void publish() noexcept
     {
-        published.store(written, std::memory_order_release);
+        committed.store(captured.load(std::memory_order_acquire),
+                        std::memory_order_release);
     }
 
     uint64_t publishedCount() const noexcept
     {
-        return published.load(std::memory_order_acquire);
+        return committed.load(std::memory_order_acquire);
+    }
+
+    uint64_t capturedCount() const noexcept
+    {
+        return captured.load(std::memory_order_acquire);
     }
 
     int capacity() const noexcept { return cap; }
     int numChannels() const noexcept { return numCh; }
 
     // Copy `count` samples ending at endExclusive (i.e. [end-count, end)).
-    // Returns false when the range is not yet published or has been overwritten.
+    // Returns false when the range is not yet captured or has been overwritten.
+    // `captured` includes the block currently being processed; that block is
+    // fully written before the counter is published, so it is safe to read.
     bool snapshot(int channel, uint64_t endExclusive, int count, float* out) const noexcept
     {
         if (out == nullptr || count < 0 || channel < 0 || channel >= numCh || cap <= 0)
             return false;
 
         const uint64_t end = endExclusive;
-        if (end > publishedCount() || end < static_cast<uint64_t>(count))
+        const uint64_t capNow = capturedCount();
+        if (end > capNow || end < static_cast<uint64_t>(count))
             return false;
 
         const uint64_t start = end - static_cast<uint64_t>(count);
-        const uint64_t pub = publishedCount();
-        if (pub > static_cast<uint64_t>(cap)
-            && start < pub - static_cast<uint64_t>(cap))
+        if (capNow > static_cast<uint64_t>(cap)
+            && start < capNow - static_cast<uint64_t>(cap))
             return false;
 
         size_t src = static_cast<size_t>(start % static_cast<uint64_t>(cap));
@@ -124,7 +138,36 @@ public:
                 src = 0;
         }
 
+        // A writer advancing far enough during the copy could have wrapped
+        // over the oldest slots; reject rather than returning torn history.
+        const uint64_t after = capturedCount();
+        if (after > static_cast<uint64_t>(cap)
+            && start < after - static_cast<uint64_t>(cap))
+            return false;
+
         return true;
+    }
+
+    // Snapshot [start, start+count), zero-filling anything before validFrom.
+    bool snapshotPadded(int channel, uint64_t start, int count, uint64_t validFrom,
+                        float* out) const noexcept
+    {
+        if (out == nullptr || count < 0 || channel < 0 || channel >= numCh)
+            return false;
+
+        std::fill(out, out + count, 0.0f);
+
+        const uint64_t end = start + static_cast<uint64_t>(count);
+        if (end <= validFrom)
+            return end <= capturedCount();
+
+        const uint64_t readStart = std::max(start, validFrom);
+        if (readStart >= end)
+            return end <= capturedCount();
+
+        const int prefix = static_cast<int>(readStart - start);
+        const int readCount = count - prefix;
+        return snapshot(channel, end, readCount, out + prefix);
     }
 
 private:
@@ -133,7 +176,8 @@ private:
     int cap = 0;
     int writeIndex = 0;
     uint64_t written = 0;
-    std::atomic<uint64_t> published { 0 };
+    std::atomic<uint64_t> captured { 0 };
+    std::atomic<uint64_t> committed { 0 };
 };
 
 } // namespace SubEQ

@@ -94,6 +94,7 @@ private:
     void resetToZero();          // right-click / shared reset path (with fill inertia)
     void snapToZeroDetent(float& value); // 0dB snag during drag
     bool isThumbHitArea(juce::Point<float> pos) const;
+    bool isInTravelArea(juce::Point<float> pos) const;
     void updateTrackHover();
 
     // 0dB detent: values within ±detent are snapped to 0; crossing 0 snaps

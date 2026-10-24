@@ -81,14 +81,24 @@ public:
 
     // Current EQ mode (atomic: written by audio thread, read by GUI thread)
     SubEQ::EQMode getCurrentMode() const { return static_cast<SubEQ::EQMode> (currentMode.load()); }
-    // Actual output-path latency (GUI chip). The host-facing PDC value is
-    // reportedLatency, which may be one handshake ahead of the active design.
-    int getCurrentLatencySamples() const { return fftProcessor.getLatencySamples(); }
+    // Actual output-path latency (GUI chip). This is the host-facing latency
+    // currently used by the IIR bridge / active FIR path.
+    int getCurrentLatencySamples() const { return reportedLatency.load(); }
 
     // GUI: one immutable FIR snapshot for magnitude+phase evaluation. Using a
     // single snapshot avoids taking stateMutex once per pixel and guarantees
     // both curves come from the same design version.
     std::shared_ptr<const SubEQ::FFTProcessor::FIRState> getFirDesignSnapshot() const;
+
+    // Offline integration-test hook: run the deferred PDC report/ack that the
+    // host normally triggers from the 30 Hz message-thread timer.
+    void processDeferredLatencyForTest() { timerCallback(); }
+    bool isFirActive() const { return fftProcessor.hasActiveDesign(); }
+    bool isFirActiveForTest() const { return isFirActive(); }
+    uint64_t getPendingTargetForTest() const { return fftProcessor.getPendingTargetSample(); }
+    uint64_t getCommittedForTest() const { return fftProcessor.getCommittedSampleCount(); }
+    int getIirPathLatencyForTest() const { return iirPathLatency; }
+    bool isLatencyTransitionForTest() const { return latencyTransitionActive; }
 
     // 已发布 FIR 设计的版本号：GUI 据此在后台设计异步发布后自动重绘相位曲线。
     int getFirDesignVersion() const;
@@ -99,7 +109,14 @@ public:
     void spectrumEditorOpened() noexcept
     {
         if (spectrumEditorCount.fetch_add (1) == 0)
+        {
+            // Clear the published snapshot immediately on the GUI thread so a
+            // stopped host cannot show the previous session's low-frequency
+            // data; the audio-thread flag still resets rings/envelopes.
+            spectrumAnalyzer.resetPublishedDisplay();
+            inputAnalyzer.resetPublishedDisplay();
             spectrumDisplayResetRequested.store (true, std::memory_order_release);
+        }
     }
     void spectrumEditorClosed() noexcept { spectrumEditorCount.fetch_sub (1); }
 
@@ -109,7 +126,9 @@ private:
     // message queue lock, so the audio thread only sets latencyDirty and this
     // callback performs the actual host notification.
     void timerCallback() override;
-    void writeIirHistory(const juce::AudioBuffer<float>& buffer, int nch, int numSamples) noexcept;
+    int nominalLatencySamples() const noexcept;
+    void delayIirPath(juce::AudioBuffer<float>& buffer, int nch, int numSamples) noexcept;
+    void requestLatencyReport(int version, int latency) noexcept;
 
     SubEQ::EQEngine eqEngine;
     SubEQ::OutputStage outputStage;
@@ -119,7 +138,27 @@ private:
     int iirHistoryWrite = 0;
     int iirHistorySize = 0;
     int iirHistoryChannels = 0;
+    int iirPathLatency = 0;              // IIR bridge delay = host-facing latency
     int firEntryFadeRemaining = 0;
+    // Output gate used while a latency-changing design waits for host PDC
+    // acknowledgement. Muting through the transition is the only way to keep
+    // the host's compensation and the audible path time-aligned.
+    float switchGateGain = 1.0f;
+    float switchGateStep = 1.0f;
+    int switchGateHoldSamples = 0;
+    // Bounded latency-transition coordinator. It only starts when the pending
+    // plan's target is close, never for the whole warm-build lead.
+    bool latencyTransitionActive = false;
+    int latencyTransitionVersion = -1;
+    int latencyTransitionTargetLatency = 0;
+    int latencyTransitionElapsedSamples = 0;
+    int latencyTransitionDeadlineSamples = 0;
+    int latencyTransitionTotalSamples = 0;
+    uint64_t latencyTransitionLastTarget = 0;
+    bool latencyTransitionReported = false;
+    int latencyAbortVersion = -1;
+    int latencyAbortCooldownSamples = 0;
+    int lastMode = 0;
     // apvts must be declared BEFORE fftProcessor: members are destroyed in
     // reverse declaration order, and ~FFTProcessor joins its background
     // thread (which reads apvts via setParameterSource) — apvts must outlive
@@ -183,13 +222,20 @@ private:
     std::atomic<float>* nodeParams[SubEQ::NumNodes][5] = {};
     std::atomic<int> reportedLatency { 0 };
     std::atomic<int> pendingLatencyVersion { 0 };
+    // Packed (version, latency) so the timer can never ack a version with a
+    // different latency than the one it passed to setLatencySamples().
+    std::atomic<uint64_t> latencyRequest { 0 };
     std::atomic<int> currentMode { static_cast<int> (SubEQ::EQMode::ZeroLatency) };
     std::atomic<int> spectrumEditorCount { 0 };   // 存活的编辑器数
     std::atomic<bool> spectrumDisplayResetRequested { false };
     std::atomic<bool> latencyDirty { false };   // audio thread -> timer: report PDC
+    std::atomic<int> stateEpoch { 0 };           // message-thread state load generation
     int lastRequestedDesignVersion = -1;        // audio thread only
+    double lastPreparedSampleRate = 0.0;
+    int lastPreparedChannels = 0;
     bool modeChanged = false;
     bool eqParamsChanged = false;
+    bool firLengthChanged = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SubEQAudioProcessor)
 };
