@@ -20,9 +20,11 @@
 #include <vector>
 #include <JuceHeader.h>
 #include "SubEQ_Core.h"
+#include "SubEQ_DSPMath.h"
 #include "SubEQ_FFTConvolver.h"
 #include "SubEQ_FIRHistory.h"
 #include "SubEQ_WarmPlan.h"
+#include "SubEQ_LatencyMath.h"
 
 namespace SubEQ
 {
@@ -44,7 +46,8 @@ public:
 
     // Worst-case pipeline latency (linear phase, 65536 taps). OutputStage uses
     // this to size its bypass dry-delay ring once, in prepare().
-    static constexpr int MaxLatencySamples = (MaxFirLength - 1) / 2 + ConvBlockLen - 1;
+    static constexpr int MaxLatencySamples =
+        pipelineLatency(2, MaxFirLength, ConvBlockLen);
 
 
     FFTProcessor();
@@ -68,12 +71,6 @@ public:
     void captureHistory(const float* const* channels, int numChannels, int numSamples,
                         bool publishNow = true);
     void publishHistory() noexcept { history.publish(); }
-
-    // Drop the published design without destroying it here (kept for callers
-    // that need a hard reset; mode switches now retain the active design).
-    // Audio-thread safe — pointer moves under the lock only; destruction
-    // happens on the background thread via the retirement ring.
-    void clearPublishedState();
 
     // Provide the parameter source used by the background thread to build the
     // design-time EQ engine snapshot (apvts must outlive this processor).
@@ -106,23 +103,113 @@ public:
     // getLatencySamples() includes the overlap-add block latency.
     int getLatencySamples() const;
 
-    // Latency of the latest published design (may not be active yet). Used by
-    // the PDC handshake: report first, acknowledge, then let the audio switch.
-    int getPublishedLatencySamples() const noexcept
+    // Version, latency and target published as one PlanMeta record (seqlock);
+    // the slot index rides along so the audio thread can take the payload
+    // without shared ownership or a mutex.
+    void getPublishedPlan(int& version, int& latency, bool& warmReady) const noexcept
     {
-        return publishedLatency.load(std::memory_order_acquire);
+        PlanMeta meta;
+        if (readPlanMeta (meta))
+        {
+            cachedPlan = meta;
+            cachedPlanValid = true;
+        }
+        else if (cachedPlanValid)
+        {
+            // A long torn-writer window must not look like "no plan" to the
+            // coordinator; keep the last coherent plan for this block.
+            meta = cachedPlan;
+        }
+        else
+        {
+            version = 0;
+            latency = 0;
+            warmReady = false;
+            return;
+        }
+
+        const int epoch = designEpoch.load (std::memory_order_acquire);
+        if (meta.epoch == epoch)
+        {
+            version = meta.version;
+            latency = meta.latency;
+            warmReady = meta.warmSlot >= 0
+                     && meta.version >= minimumPlanVersion.load (std::memory_order_acquire);
+        }
+        else
+        {
+            version = 0;
+            latency = 0;
+            warmReady = false;
+        }
     }
-    void acknowledgeLatency(int version) noexcept
+
+    // The ack is paired with the epoch captured when the timer loaded the
+    // request. An abort increments the epoch, so a timer that started before
+    // the abort can never acknowledge the superseded request afterwards.
+    uint64_t getLatencyAckEpoch() const noexcept
     {
-        latencyAckVersion.store(version, std::memory_order_release);
+        return latencyAckState.load(std::memory_order_acquire) >> 32;
+    }
+    int getAckedLatencyVersion() const noexcept
+    {
+        return static_cast<int>(static_cast<uint32_t>(
+            latencyAckState.load(std::memory_order_acquire)));
+    }
+    bool acknowledgeLatency(int version, uint64_t epoch) noexcept
+    {
+        uint64_t cur = latencyAckState.load(std::memory_order_acquire);
+        for (;;)
+        {
+            if ((cur >> 32) != epoch)
+                return false;
+            const uint64_t desired = (epoch << 32)
+                                   | static_cast<uint32_t>(version);
+            if (latencyAckState.compare_exchange_weak(cur, desired,
+                                                      std::memory_order_release,
+                                                      std::memory_order_acquire))
+                return true;
+        }
+    }
+
+    // Host-facing latency currently compensated by the host. A freshly built
+    // design at the SAME latency needs no new PDC handshake; without this an
+    // SR/channel re-prepare would reset the ack version and block adoption
+    // forever (the coordinator only reports latency CHANGES).
+    void setHostLatency(int samples) noexcept
+    {
+        hostLatencySamples.store(samples, std::memory_order_release);
     }
 
     // A transition was aborted after the host was told the old latency. The
     // same design version must not be adopted until the coordinator reports
-    // the new latency again.
+    // the new latency again; the epoch bump also fences in-flight acks.
     void invalidateLatencyAck() noexcept
     {
-        latencyAckVersion.store(0, std::memory_order_release);
+        // An aborted candidate must re-arm the 50 ms guard if it is acked
+        // again; otherwise the next ack would switch with no PDC settling.
+        latencyGuardVersion = 0;
+        latencyGuardSamples = 0;
+        pdcGuardMirror.store(false, std::memory_order_release);
+
+        uint64_t cur = latencyAckState.load(std::memory_order_acquire);
+        for (;;)
+        {
+            const uint64_t epoch = ((cur >> 32) + 1) & 0xffffffffu;
+            const uint64_t desired = epoch << 32;   // ack version 0
+            if (latencyAckState.compare_exchange_weak(cur, desired,
+                                                      std::memory_order_acq_rel,
+                                                      std::memory_order_acquire))
+                return;
+        }
+    }
+
+    // True while the ack guard (50 ms) is holding the switch. The PDC
+    // coordinator must not interpret a warm target that passed during this
+    // guard as a miss, or it would discard a valid acked candidate.
+    bool isPdcGuardActive() const noexcept
+    {
+        return pdcGuardMirror.load(std::memory_order_acquire);
     }
 
     // Host-block-aligned target of the latest published plan (0 when none).
@@ -130,18 +217,55 @@ public:
     // actually about to be adopted, instead of gating for the whole build lead.
     uint64_t getPendingTargetSample() const noexcept
     {
-        return pendingTargetSample.load(std::memory_order_acquire);
+        PlanMeta meta;
+        if (readPlanMeta (meta))
+        {
+            cachedPlan = meta;
+            cachedPlanValid = true;
+        }
+        else if (cachedPlanValid)
+        {
+            meta = cachedPlan;
+        }
+        else
+        {
+            return 0;
+        }
+
+        return meta.epoch == designEpoch.load (std::memory_order_acquire)
+                   ? meta.target : 0;
     }
+
 
     uint64_t getCommittedSampleCount() const noexcept
     {
         return history.publishedCount();
     }
 
-    // Cancel the current published-but-not-adopted plan (latency transition
-    // timeout/missed boundary). The active design keeps playing; the worker
-    // will publish a fresh plan on the next request.
-    void abortPendingPlan() noexcept;
+#if SUBEQ_TESTING
+    // Test-only publication diagnostics (the runtime host calls process() on
+    // the same thread, so these reads do not race the audio thread there).
+    int getWarmVersionForTest() const
+    {
+        PlanMeta meta;
+        return readPlanMeta (meta) && meta.warmSlot >= 0 ? meta.version : -1;
+    }
+    uint64_t getWarmTargetForTest() const
+    {
+        PlanMeta meta;
+        return readPlanMeta (meta) && meta.warmSlot >= 0 ? meta.target : 0;
+    }
+    int getAudioLocalVersionForTest() const
+    {
+        return localDesignSlot >= 0
+                   ? designSlots[localDesignSlot].state.version : -1;
+    }
+    int getAudioLocalWarmVersionForTest() const
+    {
+        return localWarmSlot >= 0
+                   ? warmSlots[localWarmSlot].state.version : -1;
+    }
+#endif
 
     // Total pipeline tail (FIR length + block latency), for tail-length reporting
     int getTailLengthSamples() const;
@@ -168,7 +292,27 @@ public:
         int version = 0;
     };
 
-    std::shared_ptr<const FIRState> getFirDesignSnapshot() const;
+    // GUI-friendly response table: 1024 log-spaced points over 0.5..500 Hz.
+    // Published off the audio thread; the GUI interpolates it instead of
+    // holding a published FIRState (and its lifetime) across paints.
+    static constexpr int NumResponsePoints = 1024;
+    struct FirResponseSnapshot
+    {
+        int version = -1;
+        int groupDelay = 0;
+        double sampleRate = 48000.0;
+        int count = 0;
+        float magnitudeDb[NumResponsePoints] {};
+        float phaseDeg[NumResponsePoints] {};
+        bool phaseValid[NumResponsePoints] {};
+    };
+    bool getFirResponseSnapshot(FirResponseSnapshot& out, int version) const;
+
+    // Version of the design actually feeding the audio path (0 = none).
+    int getActiveDesignVersion() const noexcept
+    {
+        return activeDesignVersion.load(std::memory_order_acquire);
+    }
 
     static bool computeFirPhaseResponseDegrees(const FIRState& state,
                                                double normalizedW, double& phaseDeg);
@@ -194,40 +338,101 @@ private:
         int groupDelay = 0;
     };
 
-    // Audio-thread-only accessor: returns the latest published state. Owns
-    // localState/lastSeenVersion; must never be called from the GUI/host
-    // thread — cross-thread reads go through getTailLengthSamples().
-    std::shared_ptr<const FIRState> getPublishedStateForAudioThread() const;
+    // ---- Immutable design ring (4 slots) + PlanMeta seqlock ----
+    // The producer writes only Free slots and publishes (slot, version,
+    // latency, target) through the seqlock. The audio thread pins the slots it
+    // references in audioDesignMask; the producer never reuses a pinned slot
+    // or the slot the current meta points at. No shared_ptr and no retirement
+    // ring is involved on the audio path.
+    static constexpr int NumDesignSlots = 4;
+    static constexpr int DesignSlotFree = 0;
+    static constexpr int DesignSlotReady = 1;
+    static constexpr int DesignSlotInUse = 2;
+    static constexpr int DesignSlotReserved = 3;
 
-    mutable std::mutex stateMutex;                               // guards currentState/currentWarm (rarely contended)
-    mutable std::shared_ptr<const FIRState> currentState;        // written by bg thread under lock
-    std::atomic<int> stateVersion { 0 };                         // bumped on every publish (release)
-    mutable std::shared_ptr<const FIRState> localState;          // audio-thread cache
-    mutable int lastSeenVersion = 0;                             // audio-thread cache
+    struct DesignSlot
+    {
+        FIRState state;
+    };
+    DesignSlot designSlots[NumDesignSlots];
+    std::atomic<int> designSlotStates[NumDesignSlots];
 
-    mutable std::shared_ptr<WarmState> currentWarm;              // bg thread under lock
-    std::atomic<int> warmVersion { 0 };                          // bumped when currentWarm changes
-    mutable std::shared_ptr<WarmState> localWarm;                // audio-thread cache
-    mutable int lastSeenWarmVersion = 0;                         // audio-thread cache
+    struct PlanMeta
+    {
+        uint32_t seq = 0;
+        int slot = -1;          // design ring slot
+        int warmSlot = -1;      // warm ring slot (-1 = warming)
+        int version = 0;
+        int latency = 0;
+        uint64_t target = 0;
+        int epoch = 0;          // designEpoch at publish; stale epochs ignored
+    };
+    struct PlanMetaStorage
+    {
+        std::atomic<int> slot { -1 };
+        std::atomic<int> warmSlot { -1 };
+        std::atomic<int> version { 0 };
+        std::atomic<int> latency { 0 };
+        std::atomic<uint64_t> target { 0 };
+        std::atomic<int> epoch { 0 };
+    };
+    std::atomic<uint32_t> planMetaSeq { 0 };
+    PlanMetaStorage planMeta;                   // relaxedly stored; seqlock fences
+    mutable PlanMeta cachedPlan;                // audio-side last coherent plan
+    mutable bool cachedPlanValid = false;
+    mutable std::mutex planMetaMutex;           // serializes producer writes only
+    std::atomic<int> minimumPlanVersion { 0 };  // ignore meta below reset cutoff
+    void writePlanMeta(int slot, int warmSlot, int version, int latency,
+                       uint64_t target, int epoch) noexcept;
+    bool readPlanMeta(PlanMeta& out) const noexcept;
+
+    std::atomic<uint32_t> audioDesignMask { 0 };
+    int localDesignSlot = -1;                   // audio thread
+    int activeDesignSlot = -1;                  // audio thread
+    int oldDesignSlot = -1;                     // audio thread
+    int reserveFreeDesignSlot() noexcept;       // producer only (Free/Ready -> Reserved)
+    void updateAudioDesignMask() noexcept;      // audio thread
+    void releaseDesignSlot(int slot) noexcept;  // audio thread: state -> Free
+
+    // Audio-thread-only accessor: latest published design as a raw pointer
+    // into a pinned ring slot, or nullptr. No shared ownership.
+    const FIRState* getPublishedStateForAudioThread();
+
+    // GUI response snapshots (written off the audio thread, read by the GUI).
+    static constexpr int NumResponseSnapshots = 16;
+    mutable std::mutex responseSnapshotMutex;
+    FirResponseSnapshot responseSnapshots[NumResponseSnapshots];
+    int responseSnapshotNext = 0;
+    void publishFirResponseSnapshot(const FIRState& state);
+    std::atomic<int> activeDesignVersion { 0 };
+
+    std::atomic<int> stateVersion { 0 };        // bumped on every publish/reset
+
+    // ---- Warm ring (2 slots) ----
+    static constexpr int NumWarmSlots = 2;
+    static constexpr int WarmSlotFree = 0;
+    static constexpr int WarmSlotReady = 1;
+    static constexpr int WarmSlotInUse = 2;
+    static constexpr int WarmSlotReserved = 3;
+
+    struct WarmSlot
+    {
+        WarmState state;
+    };
+    WarmSlot warmSlots[NumWarmSlots];
+    std::atomic<int> warmSlotStates[NumWarmSlots];
+    std::atomic<uint32_t> audioWarmMask { 0 };
+    int localWarmSlot = -1;                     // audio thread
+    int reserveFreeWarmSlot() noexcept;         // producer only
+    void updateAudioWarmMask() noexcept;        // audio thread
+    void releaseWarmSlot(int slot) noexcept;    // audio thread: -> Free
+    WarmState* getWarmStateForAudioThread(int designVersion);
+
     std::atomic<bool> warmRebuildRequested { false };
 
-    // Retirement rings (guarded by stateMutex): the audio thread hands every
-    // superseded design/warm state here instead of destroying it. The
-    // background drains them outside the lock. If a ring is full the audio
-    // thread keeps the value in its local cache and retries next block; it
-    // never drops a large object on the audio thread.
-    static constexpr int NumRetireSlots = 64;
-    static constexpr int NumWarmRetireSlots = 8;
-    mutable std::shared_ptr<const FIRState> pendingDestroy[NumRetireSlots];
-    mutable int pendingDestroyHead = 0;               // audio-thread append index
-    mutable std::shared_ptr<WarmState> pendingWarmDestroy[NumWarmRetireSlots];
-    mutable int pendingWarmDestroyHead = 0;
-
     // Bumped by prepare(); a design started before the latest prepare is
-    // stale (e.g. wrong sample rate) and must not be published. The validity
-    // re-check happens INSIDE the publish critical section (F-001): prepare()
-    // bumps the epoch before resetting currentState under the same lock, so
-    // a stale design can never be published over the just-reset state.
+    // stale (e.g. wrong sample rate) and must not be published. The worker
+    // re-checks the epoch before writing/publishing a slot.
     std::atomic<int> designEpoch { 0 };
 
     // Redesign request (audio thread -> background thread)
@@ -249,21 +454,25 @@ private:
     std::vector<OlaChannelState> activeStates;
     std::vector<OlaChannelState> oldStates;
     std::vector<std::complex<double>> fftWork;           // shared scratch, convFFTSize
+    TwiddleBank<double> twiddleBank;                     // read-only, prepared off the audio thread
 
     // convFFTSize/groupDelay of the design currently feeding the accumulators.
     int activeConvFFTSize = 0;
     int activeGroupDelay = 0;
-    int currentOlaBlockIndex = 0;
     std::atomic<int> reportedActiveLatency { 0 };
-    std::atomic<int> publishedLatency { 0 };
-    std::atomic<int> latencyAckVersion { 0 };
+    // Packed (epoch:32 | ackedVersion:32). Starts at epoch 1.
+    std::atomic<uint64_t> latencyAckState { uint64_t(1) << 32 };
+    std::atomic<bool> pdcGuardMirror { false };
+    std::atomic<int> hostLatencySamples { 0 };
     int latencyGuardVersion = 0;
     int latencyGuardSamples = 0;
-    std::atomic<int> latencyWaitVersion = 0;
-    int latencyWaitSamples = 0;
-    std::atomic<uint64_t> pendingTargetSample { 0 };
-    std::atomic<int> pendingAbortVersion { -1 };
-    double warmBuildSecondsEWMA = 0.012;
+
+    // Audio-thread view of the adopted warm candidate's target. The published
+    // WarmState is immutable: advancing its target in place from the audio
+    // thread raced the worker and made later candidates look stale.
+    const WarmState* audioWarmPtr = nullptr;
+    uint64_t audioWarmTargetSample = 0;
+    std::atomic<double> warmBuildSecondsEWMA { 0.012 };
 
     // stateVersion of the design last seen by process() (audio thread). A
     // newly published design starts a short crossfade from the previous
@@ -279,55 +488,38 @@ private:
 
     // Crossfade state (audio thread only).
     static constexpr int CrossfadeLen = 1024;               // ≈ 21 ms @ 48 kHz
-    std::shared_ptr<const FIRState> activeState;            // current design
-    std::shared_ptr<const FIRState> oldState;               // fading old design
+    const FIRState* activeState = nullptr;                  // pinned design slot
+    const FIRState* oldState = nullptr;                     // fading old design
     int fadeConvFFTSize = 0;                                // old convFFTSize
     int crossfadeRemaining = 0;                             // remaining fade samples
     juce::AudioBuffer<float> xfadeOld, xfadeNew;            // real-input convolution outputs
 
     // 音频线程惰性 twiddle 预热去重（F-010）：prepareToPlay 可能运行于其他
     // 线程（thread_local 缓存未命中），音频线程首块对实际尺寸惰性预热。
-    int twiddlePrewarmedSize = 0;
     bool audioTwiddlesPrewarmed = false;
 
     // Background warm-up scratch (never touched by the audio thread).
     std::vector<float> warmInput;
     std::vector<float> warmOutput;
     std::vector<std::complex<double>> warmScratch;
-    int warmFeedSamples = 0;
     std::atomic<int> preparedChannels { 2 };
-    int maxHostBlockSamples = 512;       // prepare: used only as an initial upper bound
     std::atomic<int> currentHostBlockSamples { 512 };  // audio: current block size for warm lead
     std::vector<float> prefixScratch;   // audio: replay p samples into a warm state
     std::vector<float> warmCatchUpOutput; // audio: discard output of a bounded warm catch-up
 
-    // Audio-thread deferred retirements (ring was full): retried next block.
-    mutable std::shared_ptr<const FIRState> deferredDesignRetire;
-    mutable std::shared_ptr<WarmState> deferredWarmRetire;
-
-    // Hand superseded designs/warm states to the background; never destroy a
-    // large object on the audio thread. Returns false when the ring is full
-    // (the caller keeps its local reference and retries next block).
-    bool retireState(std::shared_ptr<const FIRState>& stateToRetire) const;
-    bool retireWarm(std::shared_ptr<WarmState>& warmToRetire) const;
-    std::shared_ptr<WarmState> getWarmStateForAudioThread(int designVersion) const;
 
     // Background: build the exact OLA state at a future OLA boundary from the
     // input history (overlap-save at T-M, then replay the last M samples).
     // Waits for captured history; aborts when expectedEpoch changes or the
     // worker is asked to exit. No audio-thread catch-up is ever performed.
-    bool buildWarmState(const FIRState& design, std::shared_ptr<WarmState>& out,
+    bool buildWarmState(const FIRState& design, WarmState& out,
                         int expectedEpoch, uint64_t targetSample);
 
     // Offline path: synchronously build the design coefficients and an exact
     // warm state at the current committed boundary.
-    std::shared_ptr<FIRState> buildDesignSnapshot(int& outEpoch);
-    bool buildWarmAtCurrentBoundary(const FIRState& design,
-                                    std::shared_ptr<WarmState>& out);
+    std::unique_ptr<FIRState> buildDesignSnapshot(int& outEpoch);
+    bool buildWarmAtCurrentBoundary(const FIRState& design, WarmState& out);
     bool ensureOfflineReady();
-
-    // Flush the active OLA accumulators (delay-changing switch).
-    void flushConvolvers();
 
     std::atomic<double> sampleRate { 48000.0 };   // written by audio thread, read by bg thread
     double preparedSampleRate = 0.0;              // audio thread: sr of the last full prepare

@@ -23,6 +23,154 @@
 using namespace SubEQLookAndFeel;
 
 //==============================================================================
+// Accessibility
+//==============================================================================
+
+class FrequencyResponse::NodeAccessibilityHandler final : public juce::AccessibilityHandler
+{
+public:
+    NodeAccessibilityHandler (juce::Component& componentToWrap,
+                              FrequencyResponse& ownerToUse,
+                              int indexToUse)
+        : AccessibilityHandler (componentToWrap,
+                                juce::AccessibilityRole::slider,
+                                juce::AccessibilityActions(),
+                                Interfaces { std::make_unique<ValueInterface> (ownerToUse, indexToUse) }),
+          owner (ownerToUse),
+          nodeIndex (indexToUse)
+    {
+    }
+
+    juce::String getTitle() const override
+    {
+        return "Node " + juce::String (nodeIndex + 1) + ": " + typeName();
+    }
+
+    juce::String getDescription() const override
+    {
+        const float freq = owner.getNodeParamValue (nodeIndex, SubEQ::ParamID::Freq);
+        const float gain = owner.getNodeParamValue (nodeIndex, SubEQ::ParamID::Gain);
+        const float q = owner.getNodeParamValue (nodeIndex, SubEQ::ParamID::Q);
+
+        juce::String description = FrequencyResponse::formatFreq (freq) + " Hz";
+        if (owner.isGainSensitiveType (nodeIndex))
+            description << ", " << (gain >= 0.0f ? "+" : "") << juce::String (gain, 1) << " dB";
+        description << ", Q " << juce::String (q, 2);
+        return description;
+    }
+
+    juce::String getHelp() const override
+    {
+        return "Left/Right change frequency, Up/Down change gain (or Q for filter types), "
+               "Page Up/Down change Q, Ctrl gives fine steps, Enter opens the type menu, "
+               "Delete removes the node, R toggles the spectrum range.";
+    }
+
+private:
+    class ValueInterface final : public juce::AccessibilityValueInterface
+    {
+    public:
+        ValueInterface (FrequencyResponse& ownerToUse, int indexToUse)
+            : owner (ownerToUse), nodeIndex (indexToUse) {}
+
+        bool isReadOnly() const override  { return false; }
+
+        double getCurrentValue() const override
+        {
+            return static_cast<double> (owner.getNodeParamValue (nodeIndex, SubEQ::ParamID::Freq));
+        }
+
+        void setValue (double newValue) override
+        {
+            const auto value = static_cast<float> (juce::jlimit (0.5, 500.0, newValue));
+
+            // UIA setters can run on the COM/UIA thread; parameter edits and
+            // repaints belong on the message thread.
+            juce::MessageManager::callAsync (
+                [safe = juce::Component::SafePointer<FrequencyResponse> (&owner),
+                 index = nodeIndex, value]
+                {
+                    if (auto* self = safe.getComponent())
+                    {
+                        self->beginNodeGesture (index, SubEQ::ParamID::Freq);
+                        self->setNodeParamValue (index, SubEQ::ParamID::Freq, value);
+                        self->endNodeGesture (index, SubEQ::ParamID::Freq);
+                        self->parametersChanged.store (true);
+                        self->repaint();
+                    }
+                });
+        }
+
+        juce::String getCurrentValueAsString() const override
+        {
+            return FrequencyResponse::formatFreq (static_cast<float> (getCurrentValue())) + " Hz";
+        }
+
+        void setValueAsString (const juce::String& newValue) override
+        {
+            setValue (newValue.getDoubleValue());
+        }
+
+        AccessibleValueRange getRange() const override
+        {
+            // 0.1 Hz is a meaningful UIA small step; the 0.01 Hz interval
+            // made an assistive increment inaudible.
+            return { { 0.5, 500.0 }, 0.1 };
+        }
+
+    private:
+        FrequencyResponse& owner;
+        int nodeIndex;
+    };
+
+    juce::String typeName() const
+    {
+        const int typeIdx = juce::roundToInt (
+            owner.getNodeParamValue (nodeIndex, SubEQ::ParamID::Type));
+        const auto choices = SubEQ::getFilterTypeChoices();
+        return juce::isPositiveAndBelow (typeIdx, choices.size())
+                   ? choices[typeIdx] : juce::String ("Bell");
+    }
+
+    FrequencyResponse& owner;
+    int nodeIndex;
+};
+
+class FrequencyResponse::ResponseAccessibilityHandler final : public juce::AccessibilityHandler
+{
+public:
+    explicit ResponseAccessibilityHandler (FrequencyResponse& ownerToUse)
+        : AccessibilityHandler (ownerToUse, juce::AccessibilityRole::group),
+          owner (ownerToUse)
+    {
+    }
+
+    juce::String getDescription() const override
+    {
+        int selectedMode = 0;
+        if (auto* v = owner.apvts.getRawParameterValue ("eq_mode"))
+            selectedMode = juce::roundToInt (v->load());
+
+        if (selectedMode != 0 && ! owner.processor.isFirActive())
+            return "FIR warming; the latency-compensated IIR bridge is audible.";
+
+        if (owner.selectedNode >= 0 && owner.isNodeEnabled (owner.selectedNode))
+            return "Selected node " + juce::String (owner.selectedNode + 1) + ". "
+                   + "Tab moves between nodes; arrow keys adjust the selected node.";
+        return "No node selected. Press Enter to create a node, or Tab to move through existing nodes.";
+    }
+
+    juce::String getHelp() const override
+    {
+        return "Left/Right change frequency, Up/Down change gain (or Q), Page Up/Down change Q, "
+               "Ctrl gives fine steps, Delete removes the selected node, R toggles the spectrum range.";
+    }
+
+private:
+    FrequencyResponse& owner;
+};
+
+//==============================================================================
 // Construction / Destruction
 //==============================================================================
 
@@ -31,8 +179,21 @@ FrequencyResponse::FrequencyResponse(SubEQAudioProcessor& proc)
 {
     setOpaque(true);
     setTitle ("EQ Response");
-    setDescription ("Drag a node to adjust frequency and gain; mouse wheel adjusts Q");
+    setDescription ("Drag a node to adjust frequency and gain; mouse wheel adjusts Q. "
+                    "Keyboard: Tab moves between nodes, arrow keys adjust the selected node, "
+                    "Enter creates a node or opens its type menu, Delete removes it, "
+                    "R toggles the spectrum range.");
     setWantsKeyboardFocus (true);
+    setTooltip ("Drag nodes to adjust frequency and gain; wheel adjusts Q; "
+                "Tab focuses nodes; R toggles the spectrum range.");
+
+    // Transparent focusable proxies: one per node, for Tab traversal and
+    // screen-reader access. They never intercept mouse events.
+    for (int i = 0; i < SubEQ::NumNodes; ++i)
+    {
+        nodeComponents[i] = std::make_unique<NodeComponent> (*this, i);
+        addAndMakeVisible (*nodeComponents[i]);
+    }
 
     // 频谱缓冲区初值 = 显示地板，取自 SubEQ_SpectrumMath.h 的单一来源
     // kDisplayFloorDb（原先此处硬写 -60.0f，与范围常量无派生关系——R3-F5）
@@ -105,6 +266,92 @@ FrequencyResponse::~FrequencyResponse()
 }
 
 //==============================================================================
+// Keyboard/Accessibility Node Proxies
+//==============================================================================
+
+FrequencyResponse::NodeComponent::NodeComponent (FrequencyResponse& ownerToUse, int indexToUse)
+    : owner (ownerToUse), nodeIndex (indexToUse)
+{
+    setOpaque (false);
+    setInterceptsMouseClicks (false, false);
+    setWantsKeyboardFocus (true);
+    setTitle ("Node " + juce::String (nodeIndex + 1));
+    setDescription ("EQ node; arrow keys adjust frequency and gain");
+}
+
+void FrequencyResponse::NodeComponent::focusGained (FocusChangeType)
+{
+    owner.selectNode (nodeIndex);
+    owner.repaint();
+}
+
+void FrequencyResponse::NodeComponent::focusLost (FocusChangeType)
+{
+    owner.repaint();
+}
+
+std::unique_ptr<juce::AccessibilityHandler>
+FrequencyResponse::NodeComponent::createAccessibilityHandler()
+{
+    return std::make_unique<NodeAccessibilityHandler> (*this, owner, nodeIndex);
+}
+
+std::unique_ptr<juce::AccessibilityHandler> FrequencyResponse::createAccessibilityHandler()
+{
+    return std::make_unique<ResponseAccessibilityHandler> (*this);
+}
+
+void FrequencyResponse::updateNodeComponentBounds()
+{
+    if (getWidth() <= 0 || getHeight() <= 0)
+        return;
+
+    const int size = juce::roundToInt (NodeHitRadius * 2.0f);
+
+    for (int i = 0; i < SubEQ::NumNodes; ++i)
+    {
+        auto* child = nodeComponents[i].get();
+        if (child == nullptr)
+            continue;
+
+        // Disabled nodes are removed from the focus order and the accessibility
+        // tree: they have no on-screen target and cannot be edited.
+        const bool enabled = isNodeEnabled (i);
+        if (child->isAccessible() != enabled)
+            child->setAccessible (enabled);
+        if (child->getWantsKeyboardFocus() != enabled)
+            child->setWantsKeyboardFocus (enabled);
+
+        // An automation-driven disable must not strand focus on a node that
+        // just left the accessible focus order.
+        if (! enabled && child->hasKeyboardFocus (false))
+            grabKeyboardFocus();
+
+        const auto bounds = juce::Rectangle<int> (size, size)
+                                .withCentre (getNodeScreenPos (i).roundToInt());
+        if (child->getBounds() != bounds)
+            child->setBounds (bounds);
+    }
+}
+
+void FrequencyResponse::visibilityChanged()
+{
+    // A hidden editor must not keep repainting (or running the node physics
+    // timer) at full rate; the host may keep the window alive for a long time.
+    if (isVisible())
+    {
+        if (!isTimerRunning())
+            startTimerHz (currentTimerHz > 0 ? currentTimerHz : 30);
+        ensurePhysicsTimerRunning();
+    }
+    else
+    {
+        stopTimer();
+        physicsTimer.stopTimer();
+    }
+}
+
+//==============================================================================
 // APVTS Listener
 //==============================================================================
 
@@ -164,18 +411,20 @@ void FrequencyResponse::timerCallback()
         parametersChanged = true;
     }
 
-    // FIR 模式的设计由后台线程异步发布：版本号变化即说明新系数已就绪（新建
-    // 计、参数重设计或切入 FIR 后的首份设计），置脏以重建相位曲线——否则
-    // 相位会一直停留在“设计未就绪”的空曲线上。
+    // Track the design actually feeding the audio path. The published version
+    // may run ahead of adoption; the response snapshot is keyed by the active
+    // version, so only that change needs a curve rebuild.
     if (selectedMode != 0)
     {
-        const int firDesignVersion = processor.getFirDesignVersion();
-        if (firDesignVersion != lastFirDesignVersion)
+        const int activeFirVersion = processor.getActiveFirDesignVersion();
+        if (activeFirVersion != lastFirDesignVersion)
         {
-            lastFirDesignVersion = firDesignVersion;
+            lastFirDesignVersion = activeFirVersion;
             parametersChanged = true;
         }
     }
+
+    updateNodeComponentBounds();
 
     // Include a margin for hover-magnified nodes and label/shadow overhang.
     repaint (getResponseArea().expanded (20.0f).toNearestInt());
@@ -191,13 +440,14 @@ void FrequencyResponse::paint(juce::Graphics& g)
     drawBackground(g);
     drawGrid(g);
     drawFirResolutionWarning(g);
+    drawFirWarmStatus(g);
     drawSpectrum(g);
     if (shouldShowPhaseCurve())
         drawPhaseCurve(g);
     drawResponseCurve(g);
     drawNodes(g);
 
-    if (hasKeyboardFocus (false))
+    if (hasKeyboardFocus (true))
     {
         g.setColour (DesignColours::accent().withAlpha (0.55f));
         g.drawRoundedRectangle (getResponseArea().reduced (1.0f),
@@ -220,6 +470,7 @@ bool FrequencyResponse::shouldShowPhaseCurve() const
 void FrequencyResponse::resized()
 {
     parametersChanged = true;
+    updateNodeComponentBounds();
     repaint();
 
     // Reposition text editor if active
@@ -250,13 +501,9 @@ void FrequencyResponse::drawBackground(juce::Graphics& g)
 
 juce::Rectangle<float> FrequencyResponse::getResponseArea() const
 {
-    const float marginTop = 20.0f;
-    const float marginBottom = 20.0f;
-    const float marginLeft = 20.0f;
-    const float marginRight = 55.0f;
-    return juce::Rectangle<float>(marginLeft, marginTop,
-                                   static_cast<float>(getWidth()) - marginLeft - marginRight,
-                                   static_cast<float>(getHeight()) - marginTop - marginBottom);
+    return juce::Rectangle<float>(PlotMarginLeft, PlotMarginTop,
+                                  static_cast<float>(getWidth()) - PlotMarginLeft - PlotMarginRight,
+                                  static_cast<float>(getHeight()) - PlotMarginTop - PlotMarginBottom);
 }
 
 float FrequencyResponse::freqToX(float freq) const
@@ -337,10 +584,16 @@ void FrequencyResponse::drawGrid(juce::Graphics& g)
     const double spectrumRange = getSpectrumDisplayRangeDb();
     if (spectrumRange > 30.0)
     {
+        // Same 4 px endpoint inset as drawSpectrum(), so the 0 dB tick sits on
+        // the 0 dB trace rather than on the plot border.
+        constexpr float tickInset = 4.0f;
+        const float tickTop = area.getY() + tickInset;
+        const float tickBottom = area.getBottom() - tickInset;
         for (float db : { 0.0f, -12.0f, -24.0f, -36.0f, -48.0f, -60.0f })
         {
-            const float y = area.getY()
-                          + static_cast<float> (-db / spectrumRange) * area.getHeight();
+            const float y = tickTop
+                          + static_cast<float> (-db / spectrumRange)
+                                * (tickBottom - tickTop);
             g.setColour(DesignColours::morandiGrey().withAlpha(0.18f));
             g.drawHorizontalLine(static_cast<int>(y),
                                  area.getRight() - 16.0f, area.getRight());
@@ -421,6 +674,37 @@ void FrequencyResponse::drawFirResolutionWarning(juce::Graphics& g)
     g.setColour (DesignColours::morandiBrown());
     g.drawText ("FIR resolution too low - increase FIR length or use Zero Latency",
                 textArea, juce::Justification::left, true);
+}
+
+void FrequencyResponse::drawFirWarmStatus(juce::Graphics& g)
+{
+    int selectedMode = 0;
+    if (auto* v = apvts.getRawParameterValue ("eq_mode"))
+        selectedMode = juce::roundToInt (v->load());
+    if (selectedMode == 0)
+        return;
+
+    if (auto* bypass = apvts.getRawParameterValue ("bypass");
+        bypass != nullptr && bypass->load() > 0.5f)
+        return;
+
+    // A FIR mode is selected but the design/warm is not feeding the audio yet:
+    // the audible path is the latency-compensated IIR bridge. Say so instead
+    // of leaving the response looking like the FIR request was lost.
+    if (processor.isFirActive())
+        return;
+
+    auto area = getResponseArea();
+    // Bottom-left: clear of the frequency labels at the top and the In/Out
+    // legend + 24/60 dB chip at the bottom right.
+    auto chip = juce::Rectangle<float> (area.getX() + 8.0f,
+                                        area.getBottom() - 28.0f, 182.0f, 20.0f);
+    g.setColour (DesignColours::surface().withAlpha (0.72f));
+    g.fillRoundedRectangle (chip, 4.0f);
+    g.setColour (DesignColours::morandiBrown());
+    g.setFont (DesignFonts::caption());
+    g.drawText ("FIR warming - IIR bridge active", chip.reduced (6.0f, 0.0f),
+                juce::Justification::centredLeft, false);
 }
 
 void FrequencyResponse::drawSpectrum(juce::Graphics& g)
@@ -530,7 +814,9 @@ void FrequencyResponse::drawSpectrum(juce::Graphics& g)
 juce::Rectangle<float> FrequencyResponse::getSpectrumRangeChipBounds() const
 {
     auto area = getResponseArea();
-    return { area.getRight() - 154.0f, area.getBottom() - 20.0f, 52.0f, 14.0f };
+    // 68 x 24: at least MinChipSize tall so the chip is a valid pointer target;
+    // it sits left of the In/Out legend.
+    return { area.getRight() - 164.0f, area.getBottom() - 28.0f, 68.0f, MinChipSize };
 }
 
 double FrequencyResponse::getSpectrumDisplayRangeDb() const
@@ -591,9 +877,46 @@ void FrequencyResponse::updateResponsePaths()
     // Only draw the FIR response once that plan is actually feeding the audio
     // path; while a design is pending/warming, show the audible IIR bridge.
     const bool firMode = selectedMode != 0 && processor.isFirActive();
-    // One snapshot per rebuild: magnitude and phase come from the same design
-    // version and the state mutex is taken once, not once per pixel.
-    const auto firSnapshot = firMode ? processor.getFirDesignSnapshot() : nullptr;
+
+    // 1024-point response table published by the FIR designer. The GUI never
+    // holds a published design object; it interpolates this immutable table.
+    SubEQ::FFTProcessor::FirResponseSnapshot firResponse;
+    const bool haveFirResponse = firMode
+        && processor.getFirResponseSnapshot (firResponse,
+                                             processor.getActiveFirDesignVersion())
+        && std::abs (firResponse.sampleRate - sampleRate) < 0.5
+        && firResponse.count > 1;
+
+    auto sampleFirResponse = [&] (double freq, double& gainDb,
+                                  double& phaseDeg, bool& phaseValid)
+    {
+        const double t = std::log (std::max (0.5, freq) / 0.5)
+                       / std::log (500.0 / 0.5)
+                       * static_cast<double> (firResponse.count - 1);
+        const int i0 = juce::jlimit (0, firResponse.count - 1,
+                                     static_cast<int> (std::floor (t)));
+        const int i1 = juce::jmin (i0 + 1, firResponse.count - 1);
+        const double frac = juce::jlimit (0.0, 1.0, t - static_cast<double> (i0));
+
+        gainDb = firResponse.magnitudeDb[i0]
+               + frac * (firResponse.magnitudeDb[i1] - firResponse.magnitudeDb[i0]);
+
+        const bool v0 = firResponse.phaseValid[i0];
+        const bool v1 = firResponse.phaseValid[i1];
+        phaseValid = v0 || v1;
+        if (phaseValid)
+        {
+            const double p0 = v0 ? firResponse.phaseDeg[i0] : firResponse.phaseDeg[i1];
+            const double p1 = v1 ? firResponse.phaseDeg[i1] : firResponse.phaseDeg[i0];
+
+            // The table stores wrapped phase; don't interpolate across a
+            // ±180° wrap (that would paint a false 0° segment).
+            if (std::abs (p1 - p0) > 180.0)
+                phaseDeg = (frac < 0.5) ? p0 : p1;
+            else
+                phaseDeg = p0 + frac * (p1 - p0);
+        }
+    };
 
     bool firstGainPoint = true;
     bool firstPhasePoint = true;
@@ -603,8 +926,12 @@ void FrequencyResponse::updateResponsePaths()
         double w = juce::MathConstants<double>::twoPi * static_cast<double>(freq) / sampleRate;
 
         double gainDb = 0.0;
-        const bool firGain = firMode && firSnapshot != nullptr
-                          && SubEQ::FFTProcessor::computeFirMagnitudeDb(*firSnapshot, w, gainDb);
+        double snapshotPhaseDeg = 0.0;
+        bool snapshotPhaseValid = false;
+        const bool firGain = haveFirResponse;
+        if (firGain)
+            sampleFirResponse (static_cast<double>(freq), gainDb,
+                               snapshotPhaseDeg, snapshotPhaseValid);
         if (firGain)
         {
             // The FIR target excludes master gain/bypass (they are applied
@@ -630,7 +957,7 @@ void FrequencyResponse::updateResponsePaths()
             double phaseDeg = 0.0;
             bool havePhase = false;
 
-            if (firMode && firSnapshot != nullptr)
+            if (firGain)
             {
                 if (eqEngine.isBypassed())
                 {
@@ -642,8 +969,8 @@ void FrequencyResponse::updateResponsePaths()
                     // A single undefined point (zero magnitude) must not erase
                     // the whole curve; skip it and break the path into a new
                     // subpath.
-                    havePhase = SubEQ::FFTProcessor::computeFirPhaseResponseDegrees(
-                        *firSnapshot, w, phaseDeg);
+                    phaseDeg = snapshotPhaseDeg;
+                    havePhase = snapshotPhaseValid;
                 }
             }
             else
@@ -895,6 +1222,18 @@ void FrequencyResponse::drawNode(juce::Graphics& g, int index)
             g.fillEllipse(whitePos.x - r, whitePos.y - r, r * 2.0f, r * 2.0f);
         }
     }
+
+    // Keyboard focus ring: drawn outside the body so the selected node is
+    // identifiable while tabbing through nodes (the idle selected state is
+    // otherwise deliberately ring-free).
+    if (isSelected && nodeComponents[index] != nullptr
+        && nodeComponents[index]->hasKeyboardFocus (false))
+    {
+        const float focusR = r + 5.0f;
+        g.setColour (DesignColours::accent().withAlpha (0.85f));
+        g.drawEllipse (exactPos.x - focusR, exactPos.y - focusR,
+                       focusR * 2.0f, focusR * 2.0f, 2.0f);
+    }
 }
 
 void FrequencyResponse::drawNodeCurve(juce::Graphics& g, int nodeIndex, bool isSelected)
@@ -936,6 +1275,8 @@ void FrequencyResponse::updateNodePhysics()
         if (!isDragging && dist < 0.3f && std::abs(pp.filtVelX) < 0.3f && std::abs(pp.filtVelY) < 0.3f)
             pp.active = false;
     }
+
+    updateNodeComponentBounds();
 }
 
 bool FrequencyResponse::needsPhysicsTimer() const
@@ -1180,6 +1521,8 @@ void FrequencyResponse::mouseDown(const juce::MouseEvent& event)
         if (node >= 0)
         {
             selectNode(node);
+            if (nodeComponents[node] != nullptr)
+                nodeComponents[node]->grabKeyboardFocus();
             nodePressed = true;
             isDragging = true;
             draggedNode = node;
@@ -1218,6 +1561,7 @@ void FrequencyResponse::mouseDown(const juce::MouseEvent& event)
             // is under the cursor.
             if (getSpectrumRangeChipBounds().contains(pos))
             {
+                grabKeyboardFocus();
                 toggleSpectrumRange();
                 return;
             }
@@ -1225,7 +1569,10 @@ void FrequencyResponse::mouseDown(const juce::MouseEvent& event)
             // Only the plot area creates nodes; margins and the phase label
             // column are not part of the graph.
             if (!getResponseArea().contains(pos))
+            {
+                grabKeyboardFocus();
                 return;
+            }
 
             // Click on empty area: create new node
             float freq = xToFreq(pos.x);
@@ -1384,6 +1731,14 @@ void FrequencyResponse::mouseMove(const juce::MouseEvent& event)
         hoveredNode = newHover;
         repaint();
     }
+
+    const juce::String tip = getSpectrumRangeChipBounds().contains (event.position)
+        ? juce::String ("Spectrum display range; click or press R to switch 24 / 60 dB")
+        : juce::String ("Drag nodes to adjust frequency and gain; wheel adjusts Q; "
+                        "Tab focuses nodes; R toggles the spectrum range");
+    if (getTooltip() != tip)
+        setTooltip (tip);
+
     updateNodeScales();
     ensurePhysicsTimerRunning();
 }
@@ -1391,6 +1746,8 @@ void FrequencyResponse::mouseMove(const juce::MouseEvent& event)
 void FrequencyResponse::mouseExit(const juce::MouseEvent&)
 {
     hoveredNode = -1;
+    setTooltip ("Drag nodes to adjust frequency and gain; wheel adjusts Q; "
+                "Tab focuses nodes; R toggles the spectrum range");
     updateNodeScales();
     ensurePhysicsTimerRunning();
     repaint();
@@ -1453,7 +1810,48 @@ void FrequencyResponse::mouseWheelMove(const juce::MouseEvent& event,
 
 bool FrequencyResponse::keyPressed(const juce::KeyPress& key)
 {
-    if (selectedNode < 0 || !isNodeEnabled(selectedNode))
+    const int code = key.getKeyCode();
+    const auto mods = key.getModifiers();
+    const bool fine = mods.isCtrlDown() || mods.isCommandDown();
+
+    // R toggles the spectrum display range (keyboard equivalent of the chip).
+    // Deliberately independent of node selection so it also works with no EQ
+    // node present, when the plot itself owns keyboard focus.
+    if (! fine && (code == 'R' || code == 'r'))
+    {
+        toggleSpectrumRange();
+        return true;
+    }
+
+    if (code == juce::KeyPress::escapeKey)
+    {
+        if (selectedNode >= 0)
+        {
+            deselectNode();
+            grabKeyboardFocus();
+            return true;
+        }
+        return false;
+    }
+
+    const bool hasSelection = selectedNode >= 0 && isNodeEnabled (selectedNode);
+
+    // Enter: create the first node when nothing is selected, otherwise open
+    // the selected node's type menu (the keyboard path to the "T:" row).
+    if (code == juce::KeyPress::returnKey)
+    {
+        if (! hasSelection)
+        {
+            createNodeAt (40.0f, 0.0f);
+            return true;
+        }
+
+        menuAnchor = localPointToGlobal (getNodeScreenPos (selectedNode).roundToInt());
+        startTypeMenu (selectedNode);
+        return true;
+    }
+
+    if (! hasSelection)
         return false;
 
     const int node = selectedNode;
@@ -1466,31 +1864,45 @@ bool FrequencyResponse::keyPressed(const juce::KeyPress& key)
         repaint();
     };
 
-    if (key == juce::KeyPress (juce::KeyPress::leftKey)
-        || key == juce::KeyPress (juce::KeyPress::rightKey))
+    if (code == juce::KeyPress::deleteKey || code == juce::KeyPress::backspaceKey)
     {
-        const float factor = (key == juce::KeyPress (juce::KeyPress::leftKey))
-                                 ? 1.0f / 1.02f : 1.02f;
+        deleteNode (node);
+        return true;
+    }
+
+    if (code == juce::KeyPress::pageUpKey || code == juce::KeyPress::pageDownKey)
+    {
+        const float sign = (code == juce::KeyPress::pageUpKey) ? 1.0f : -1.0f;
+        const float q = SubEQ::stepLogQ (getNodeParamValue (node, SubEQ::ParamID::Q),
+                                         sign * (fine ? 0.02f : 0.1f));
+        apply (SubEQ::ParamID::Q, q);
+        return true;
+    }
+
+    if (code == juce::KeyPress::leftKey || code == juce::KeyPress::rightKey)
+    {
+        const float step = fine ? 1.002f : 1.02f;
+        const float factor = (code == juce::KeyPress::leftKey) ? 1.0f / step : step;
         const float freq = juce::jlimit (0.5f, 500.0f,
             getNodeParamValue (node, SubEQ::ParamID::Freq) * factor);
         apply (SubEQ::ParamID::Freq, freq);
         return true;
     }
 
-    if (key == juce::KeyPress (juce::KeyPress::upKey)
-        || key == juce::KeyPress (juce::KeyPress::downKey))
+    if (code == juce::KeyPress::upKey || code == juce::KeyPress::downKey)
     {
-        const float sign = (key == juce::KeyPress (juce::KeyPress::upKey)) ? 1.0f : -1.0f;
+        const float sign = (code == juce::KeyPress::upKey) ? 1.0f : -1.0f;
         if (isGainSensitiveType (node))
         {
             const float gain = juce::jlimit (-24.0f, 24.0f,
-                getNodeParamValue (node, SubEQ::ParamID::Gain) + sign * 0.5f);
+                getNodeParamValue (node, SubEQ::ParamID::Gain)
+                    + sign * (fine ? 0.1f : 0.5f));
             apply (SubEQ::ParamID::Gain, gain);
         }
         else
         {
             const float q = SubEQ::stepLogQ (getNodeParamValue (node, SubEQ::ParamID::Q),
-                                             sign * 0.05f);
+                                             sign * (fine ? 0.01f : 0.05f));
             apply (SubEQ::ParamID::Q, q);
         }
         return true;
@@ -1602,6 +2014,11 @@ void FrequencyResponse::createNodeAt(float freq, float gain)
     qParam->endChangeGesture();
 
     selectNode(slot);
+    updateNodeComponentBounds();
+    if (nodeComponents[slot] != nullptr)
+        nodeComponents[slot]->grabKeyboardFocus();
+    if (auto* handler = getAccessibilityHandler())
+        handler->notifyAccessibilityEvent (juce::AccessibilityEvent::structureChanged);
     parametersChanged = true;
     repaint();
 }
@@ -1616,10 +2033,18 @@ void FrequencyResponse::deleteNode(int index)
     if (selectedNode == index)
         deselectNode();
 
+    // The deleted node's proxy leaves the focus order; move focus back to the
+    // plot so keyboard users are not stranded on an inaccessible child.
+    if (nodeComponents[index] != nullptr && nodeComponents[index]->hasKeyboardFocus (false))
+        grabKeyboardFocus();
+
     // Reset the visual/physics state so a node later re-created in this slot
     // does not inherit a stale magnified scale or spring position.
     nodeScale[index].setValueImmediate(1.0f);
     physPos[index].active = false;
+    updateNodeComponentBounds();
+    if (auto* handler = getAccessibilityHandler())
+        handler->notifyAccessibilityEvent (juce::AccessibilityEvent::structureChanged);
 
     parametersChanged = true;
     repaint();
@@ -1655,6 +2080,17 @@ void FrequencyResponse::setNodeParamValue(int nodeIndex, SubEQ::ParamID param, f
 {
     auto* p = getNodeParam(nodeIndex, param);
     p->setValueNotifyingHost(p->convertTo0to1(value));
+    notifyNodeValueChanged(nodeIndex);
+}
+
+void FrequencyResponse::notifyNodeValueChanged(int nodeIndex)
+{
+    if (nodeIndex < 0 || nodeIndex >= SubEQ::NumNodes
+        || nodeComponents[nodeIndex] == nullptr)
+        return;
+
+    if (auto* handler = nodeComponents[nodeIndex]->getAccessibilityHandler())
+        handler->notifyAccessibilityEvent (juce::AccessibilityEvent::valueChanged);
 }
 
 void FrequencyResponse::beginNodeGesture(int nodeIndex, SubEQ::ParamID param)

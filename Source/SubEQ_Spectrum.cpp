@@ -21,7 +21,7 @@ SpectrumAnalyzer::SpectrumAnalyzer()
 {
     for (int i = 0; i < MaxBands; ++i)
     {
-        bandData[i].store(-RangeDb);
+        displayBands[i] = static_cast<double> (kDisplayFloorDb);
         // 两个功率缓冲都从**地板等效功率**起步（而非 0，SPC-06）：跨层边界的邻段
         // 在本层首次分析前读到的是它们的复位值，取 0 会把平滑结果拽向 0（在贴近
         // 地板的读数上可见若干 dB）；取地板等效功率则与显示下限自洽。与
@@ -30,6 +30,7 @@ SpectrumAnalyzer::SpectrumAnalyzer()
         envPowers[i] = kDisplayFloorPower;
         bandDbScratch[i] = static_cast<double> (kDisplayFloorDb);
     }
+    publishFrame();
 }
 
 int SpectrumAnalyzer::kernelSetIndex (int resolutionIndex, int bandCount, WindowType window) const noexcept
@@ -40,25 +41,48 @@ int SpectrumAnalyzer::kernelSetIndex (int resolutionIndex, int bandCount, Window
     return (w * kNumBandDensities + d) * NumResolutionLevels + r;
 }
 
-void SpectrumAnalyzer::prepare (double sr)
+void SpectrumAnalyzer::prepare (double sr,
+                                const std::shared_ptr<const VQTKernelBank>& bank)
 {
-    // Same sample rate: all 24 kernel combinations and the decimator chain
-    // are already built; transport stop/start must not rebuild them.
-    if (sr == sampleRate && !kernelSets.empty())
+    // A shared bank can die when a new sample rate replaces it. Clear this
+    // thread's raw pointer before any prewarm can dereference a stale bank;
+    // process() re-points it at the live bank on the audio thread.
+    setActiveTwiddleBank<double> (nullptr);
+
+    const bool validSharedBank = bank != nullptr
+                              && bank->sampleRate == sr
+                              && ! bank->sets.empty();
+
+    // Same sample rate and same kernel source: all 24 kernel combinations and
+    // the decimator chain are already built; transport stop/start must not
+    // rebuild them.
+    if (sr == sampleRate
+        && ((validSharedBank && kernelBank == bank)
+            || (! validSharedBank && kernelBank == nullptr && ! kernelSets.empty())))
         return;
 
     sampleRate = sr;
 
-    // 全量构建 24 个核组合（窗 × 密度 × 分辨率）：O(N) 三角函数只发生在
-    // 本线程（F-011 的推广——configure() 之后只切 activeSet 指针）。
-    kernelSets.clear();
-    kernelSets.reserve (NumKernelSets);
-    for (int w = 0; w < kNumWindowTypes; ++w)
-        for (int d = 0; d < kNumBandDensities; ++d)
-            for (int r = 0; r < NumResolutionLevels; ++r)
-                kernelSets.push_back (buildVQTKernelSet (
-                    sr, kBandsByDensity[d],
-                    vqtFilterScale (r), static_cast<WindowType> (w)));
+    if (validSharedBank)
+    {
+        kernelBank = bank;
+        kernelSets.clear();
+    }
+    else
+    {
+        kernelBank.reset();
+
+        // 全量构建 24 个核组合（窗 × 密度 × 分辨率）：O(N) 三角函数只发生在
+        // 本线程（F-011 的推广——configure() 之后只切 activeSet 指针）。
+        kernelSets.clear();
+        kernelSets.reserve (NumKernelSets);
+        for (int w = 0; w < kNumWindowTypes; ++w)
+            for (int d = 0; d < kNumBandDensities; ++d)
+                for (int r = 0; r < NumResolutionLevels; ++r)
+                    kernelSets.push_back (buildVQTKernelSet (
+                        sr, kBandsByDensity[d],
+                        vqtFilterScale (r), static_cast<WindowType> (w)));
+    }
 
     // 抽取链系数（与核组合无关，只随采样率变化）。级数 = 顶层降采样指数
     // （已被 vqtTopDecimationExponent 钳在 VQTMaxTopDecimationExponent）+ 层数，
@@ -75,10 +99,11 @@ void SpectrumAnalyzer::prepare (double sr)
     dcPole = vqtDcBlockerPole (sr);
 
     // 各层缓冲按全组合最大帧长分配（音频线程不再分配）
+    const auto& sets = kernelSetList();
     for (int t = 0; t < VQTNumTiers; ++t)
     {
         int maxF = VQTMinTierFftSize;
-        for (const auto& set : kernelSets)
+        for (const auto& set : sets)
             maxF = std::max (maxF, set.tiers[t].fftSize);
         maxF = std::max (maxF, nextPowerOfTwo (maxF));
 
@@ -91,20 +116,25 @@ void SpectrumAnalyzer::prepare (double sr)
 
     // 重新指向当前配置对应的核组合：kernelSets 刚重建，旧指针已失效——必须
     // 每次重指向（prepare 重入于同会话 transport stop/start 时保持用户配置）。
-    activeSet = &kernelSets[static_cast<size_t> (
+    activeSet = &sets[static_cast<size_t> (
         kernelSetIndex (lastResolutionIndex, activeNumBands, lastWindow))];
 
-    // Best-effort twiddle prewarm for every tier size on the prepare thread.
-    // prepareToPlay normally runs before/around the audio thread; if the host
-    // uses a different thread, analyzeTier's lazy fallback still covers it.
-    for (const auto& set : kernelSets)
-        for (int t = 0; t < VQTNumTiers; ++t)
-            prewarmTwiddleTable<double> (set.tiers[t].fftSize);
+    // Build every tier's twiddle table once, off the audio thread, unless the
+    // shared bank already carries the identical tables. The audio thread only
+    // points its thread-local active bank at the chosen object.
+    if (kernelBank == nullptr)
+    {
+        std::vector<int> sizes;
+        for (const auto& set : kernelSets)
+            for (int t = 0; t < VQTNumTiers; ++t)
+                sizes.push_back (set.tiers[t].fftSize);
+        twiddleBank.prepare (sizes);
+    }
 }
 
 void SpectrumAnalyzer::resetRuntimeState()
 {
-    generation.fetch_add(1, std::memory_order_release);
+    resetEpoch.fetch_add(1, std::memory_order_release);
 
     for (int k = 0; k < numStages; ++k)
     {
@@ -120,14 +150,14 @@ void SpectrumAnalyzer::resetRuntimeState()
     }
     for (int i = 0; i < MaxBands; ++i)
     {
-        bandData[i].store(-RangeDb);
+        displayBands[i] = static_cast<double> (kDisplayFloorDb);
         // 与构造器同口径：两个功率缓冲都从地板等效功率起步（SPC-06，见构造器注释）
         bandPowers[i] = kDisplayFloorPower;
         envPowers[i] = kDisplayFloorPower;
         bandDbScratch[i] = static_cast<double> (kDisplayFloorDb);
     }
 
-    generation.fetch_add(1, std::memory_order_release);
+    publishFrame();
 }
 
 void SpectrumAnalyzer::configure (int resolutionIndex, int numBandsIn, int hopSizeIn,
@@ -143,6 +173,18 @@ void SpectrumAnalyzer::configure (int resolutionIndex, int numBandsIn, int hopSi
                               || (resolutionIndex != lastResolutionIndex)
                               || (window != lastWindow);
     const bool hopChanged = (hop != hopSize.load());
+
+    // 状态全部一致后才发布新配置
+    activeNumBands = bands;
+    lastResolutionIndex = (resolutionIndex >= 0 && resolutionIndex < NumResolutionLevels) ? resolutionIndex : 1;
+    lastWindow = window;
+    smoothRadius = smoothingRadiusBands (smoothingIndex, bands);
+    if (! kernelSetList().empty())
+        activeSet = &kernelSetList()[static_cast<size_t> (
+            kernelSetIndex (lastResolutionIndex, bands, window))];
+    numBands.store (bands);
+    hopSize.store (hop);
+
     if (analysisChanged)
     {
         resetRuntimeState();
@@ -152,23 +194,15 @@ void SpectrumAnalyzer::configure (int resolutionIndex, int numBandsIn, int hopSi
         for (int t = 0; t < VQTNumTiers; ++t)
             tier[t].sinceAnalysis = 0;
     }
-
-    // 状态全部一致后才发布新配置
-    activeNumBands = bands;
-    lastResolutionIndex = (resolutionIndex >= 0 && resolutionIndex < NumResolutionLevels) ? resolutionIndex : 1;
-    lastWindow = window;
-    smoothRadius = smoothingRadiusBands (smoothingIndex, bands);
-    if (! kernelSets.empty())
-        activeSet = &kernelSets[static_cast<size_t> (
-            kernelSetIndex (lastResolutionIndex, bands, window))];
-    numBands.store (bands);
-    hopSize.store (hop);
 }
 
 void SpectrumAnalyzer::process (const float* samples, int numSamples)
 {
     if (activeSet == nullptr || numStages <= 0)
         return;
+
+    setActiveTwiddleBank<double>(kernelBank != nullptr ? &kernelBank->twiddles
+                                                       : &twiddleBank);
 
     // 抽取级联（直流阻断 + 逐级 ↓2）与离线原型共用 SubEQ_VQTDesign.h 的
     // vqtDecimationStep——该级联决定进入分析的样本序列与速率，属数值路径。
@@ -232,9 +266,25 @@ void SpectrumAnalyzer::analyzeTier (int t)
                                    activeSet->kernels[t][static_cast<size_t> (i)]);
                            });
 
-    // 逐段发布到原子输出（GUI 线程经 getSpectrum 读取；dB 在发布边界收窄 float）
-    for (int i = 0; i < T.numBandsInTier; ++i)
-        bandData[T.firstBand + i].store (static_cast<float> (bandDbScratch[T.firstBand + i]));
+    for (int i = 0; i < MaxBands; ++i)
+        displayBands[i] = bandDbScratch[i];
+
+    publishFrame();
+}
+
+void SpectrumAnalyzer::publishFrame() noexcept
+{
+    const uint32_t next = (readyFrame.load (std::memory_order_relaxed) + 1u) % 3u;
+    auto& frame = frames[next];
+
+    frame.seq.fetch_add (1, std::memory_order_release);   // odd: writing
+    frame.resetEpoch = resetEpoch.load (std::memory_order_acquire);
+    frame.bands = activeNumBands;
+    for (int i = 0; i < MaxBands; ++i)
+        frame.values[i] = static_cast<float> (displayBands[i]);
+    frame.seq.fetch_add (1, std::memory_order_release);   // even: complete
+
+    readyFrame.store (next, std::memory_order_release);
 }
 
 int SpectrumAnalyzer::getSpectrum (float* outputBands) const
@@ -242,20 +292,36 @@ int SpectrumAnalyzer::getSpectrum (float* outputBands) const
     if (outputBands == nullptr)
         return 0;
 
-    // Retry if a reconfiguration lands during the copy. Per-band atomics keep
-    // the read UB-free; the generation counter removes the mixed-frame case.
-    for (int attempt = 0; attempt < 2; ++attempt)
-    {
-        const uint32_t gen = generation.load(std::memory_order_acquire);
-        const int bands = numBands.load(std::memory_order_acquire);
-        for (int i = 0; i < bands && i < MaxBands; ++i)
-            outputBands[i] = bandData[i].load(std::memory_order_relaxed);
+    const int fallbackBands = numBands.load (std::memory_order_acquire);
+    const uint32_t floorUntil = floorUntilResetEpoch.load (std::memory_order_acquire);
 
-        if (generation.load(std::memory_order_acquire) == gen)
+    for (int attempt = 0; attempt < 5; ++attempt)
+    {
+        const uint32_t index = readyFrame.load (std::memory_order_acquire);
+        const auto& frame = frames[index % 3u];
+        const uint32_t seq = frame.seq.load (std::memory_order_acquire);
+        if ((seq & 1u) != 0)
+            continue;
+
+        const int bands = juce::jlimit (0, MaxBands, frame.bands);
+
+        if (frame.resetEpoch < floorUntil)
+        {
+            for (int i = 0; i < fallbackBands && i < MaxBands; ++i)
+                outputBands[i] = -RangeDb;
+            return fallbackBands;
+        }
+
+        for (int i = 0; i < bands; ++i)
+            outputBands[i] = frame.values[i];
+
+        if (frame.seq.load (std::memory_order_acquire) == seq)
             return bands;
     }
 
-    return numBands.load(std::memory_order_acquire);
+    for (int i = 0; i < fallbackBands && i < MaxBands; ++i)
+        outputBands[i] = -RangeDb;
+    return fallbackBands;
 }
 
 } // namespace SubEQ

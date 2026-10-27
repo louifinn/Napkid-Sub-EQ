@@ -37,6 +37,13 @@ FFTProcessor::FFTProcessor()  : juce::Thread ("SubEQ FIR Designer")
     // The background design engine must always evaluate exact target
     // coefficients, so disable smoothing on it.
     designEngine.setSmoothingEnabled(false);
+
+    for (auto& state : designSlotStates)
+        state.store(DesignSlotFree, std::memory_order_relaxed);
+    for (auto& state : warmSlotStates)
+        state.store(WarmSlotFree, std::memory_order_relaxed);
+    planMeta.slot.store (-1, std::memory_order_relaxed);
+    planMeta.warmSlot.store (-1, std::memory_order_relaxed);
 }
 
 FFTProcessor::~FFTProcessor()
@@ -56,8 +63,281 @@ FFTProcessor::~FFTProcessor()
 }
 
 //==============================================================================
+// Design ring / PlanMeta seqlock
+//==============================================================================
+
+void FFTProcessor::writePlanMeta(int slot, int warmSlot, int version, int latency,
+                                 uint64_t target, int epoch) noexcept
+{
+    std::lock_guard<std::mutex> lock (planMetaMutex);
+
+    // A slower producer (worker vs offline) must not overwrite a newer plan
+    // with an older design or a plan from an older reset epoch. Equal versions
+    // are warm updates and are allowed.
+    const int publishedEpoch = planMeta.epoch.load (std::memory_order_relaxed);
+    if (epoch < publishedEpoch)
+        return;
+    if (epoch == publishedEpoch
+        && version < planMeta.version.load (std::memory_order_relaxed))
+        return;
+
+    const uint32_t seq = planMetaSeq.load (std::memory_order_relaxed);
+    planMetaSeq.store (seq + 1, std::memory_order_release);   // odd: writer active
+    std::atomic_thread_fence (std::memory_order_release);     // fields before even seq
+
+    planMeta.slot.store (slot, std::memory_order_relaxed);
+    planMeta.warmSlot.store (warmSlot, std::memory_order_relaxed);
+    planMeta.version.store (version, std::memory_order_relaxed);
+    planMeta.latency.store (latency, std::memory_order_relaxed);
+    planMeta.target.store (target, std::memory_order_relaxed);
+    planMeta.epoch.store (epoch, std::memory_order_relaxed);
+
+    std::atomic_thread_fence (std::memory_order_release);
+    planMetaSeq.store (seq + 2, std::memory_order_release);   // even: stable
+}
+
+bool FFTProcessor::readPlanMeta(PlanMeta& out) const noexcept
+{
+    // A torn read is transient (the writer holds the odd sequence for a few
+    // instructions). Retry a few times so the audio thread does not mistake a
+    // torn record for "no plan" and abort a live PDC transition.
+    for (int attempt = 0; attempt < 4; ++attempt)
+    {
+        const uint32_t seq1 = planMetaSeq.load (std::memory_order_acquire);
+        if ((seq1 & 1u) != 0)
+            continue;
+
+        out.slot = planMeta.slot.load (std::memory_order_relaxed);
+        out.warmSlot = planMeta.warmSlot.load (std::memory_order_relaxed);
+        out.version = planMeta.version.load (std::memory_order_relaxed);
+        out.latency = planMeta.latency.load (std::memory_order_relaxed);
+        out.target = planMeta.target.load (std::memory_order_relaxed);
+        out.epoch = planMeta.epoch.load (std::memory_order_relaxed);
+
+        std::atomic_thread_fence (std::memory_order_acquire);
+        const uint32_t seq2 = planMetaSeq.load (std::memory_order_acquire);
+        if (seq1 == seq2 && (seq2 & 1u) == 0)
+            return true;
+    }
+    return false;
+}
+
+int FFTProcessor::reserveFreeDesignSlot() noexcept
+{
+    PlanMeta meta;
+    if (! readPlanMeta (meta))
+        return -1;   // torn publish: retry later, never reuse the live slot
+
+    const int publishedSlot = meta.slot;
+    const uint32_t mask = audioDesignMask.load (std::memory_order_acquire);
+
+    for (int i = 0; i < NumDesignSlots; ++i)
+    {
+        if (i == publishedSlot || (mask & (1u << i)) != 0)
+            continue;
+
+        int state = designSlotStates[i].load (std::memory_order_acquire);
+        if (state != DesignSlotFree && state != DesignSlotReady)
+            continue;
+
+        // Reserve atomically so the worker and the offline renderer can never
+        // build into the same slot.
+        if (designSlotStates[i].compare_exchange_strong (
+                state, DesignSlotReserved,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+            return i;
+    }
+    return -1;
+}
+
+void FFTProcessor::updateAudioDesignMask() noexcept
+{
+    uint32_t mask = 0;
+    if (localDesignSlot >= 0)
+        mask |= 1u << localDesignSlot;
+    if (activeDesignSlot >= 0)
+        mask |= 1u << activeDesignSlot;
+    if (oldDesignSlot >= 0)
+        mask |= 1u << oldDesignSlot;
+    audioDesignMask.store (mask, std::memory_order_release);
+}
+
+void FFTProcessor::releaseDesignSlot(int slot) noexcept
+{
+    if (slot >= 0 && slot < NumDesignSlots
+        && slot != activeDesignSlot && slot != oldDesignSlot
+        && slot != localDesignSlot)
+    {
+        designSlotStates[slot].store (DesignSlotFree, std::memory_order_release);
+    }
+}
+
+const FFTProcessor::FIRState* FFTProcessor::getPublishedStateForAudioThread()
+{
+    const int minimumVersion = minimumPlanVersion.load (std::memory_order_acquire);
+
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+        PlanMeta meta;
+        if (! readPlanMeta (meta))
+        {
+            // Torn writer window: do NOT release the current pin, or the
+            // producer could recycle the slot while the meta still names it.
+            return localDesignSlot >= 0 ? &designSlots[localDesignSlot].state
+                                        : activeState;
+        }
+
+        if (meta.slot < 0 || meta.slot >= NumDesignSlots
+            || meta.version < minimumVersion
+            || meta.epoch != designEpoch.load (std::memory_order_acquire))
+        {
+            if (localDesignSlot >= 0
+                && localDesignSlot != activeDesignSlot
+                && localDesignSlot != oldDesignSlot)
+            {
+                const int oldLocal = localDesignSlot;
+                localDesignSlot = -1;
+                updateAudioDesignMask();
+                releaseDesignSlot (oldLocal);
+            }
+            return nullptr;
+        }
+
+        const int slot = meta.slot;
+        if (localDesignSlot == slot)
+            return &designSlots[slot].state;
+
+        int expected = DesignSlotReady;
+        if (! designSlotStates[slot].compare_exchange_strong (
+                expected, DesignSlotInUse,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+            // The meta may point at a slot whose Ready store has not landed
+            // yet (Ready is published last). Keep the currently active FIR
+            // for this block instead of dropping to the IIR bridge.
+            if (activeState != nullptr)
+                return activeState;
+            continue;   // producer took/rewrote it; re-read the meta
+        }
+
+        // Re-validate after pinning: a newer meta may have landed between the
+        // seqlock read and the CAS, or the slot may hold a different version.
+        PlanMeta check;
+        if (! readPlanMeta (check) || check.slot != slot
+            || check.version != meta.version
+            || designSlots[slot].state.version != meta.version)
+        {
+            designSlotStates[slot].store (DesignSlotReady, std::memory_order_release);
+            if (activeState != nullptr)
+                return activeState;
+            continue;
+        }
+
+        const int oldLocal = localDesignSlot;
+        localDesignSlot = slot;
+        updateAudioDesignMask();
+        if (oldLocal >= 0 && oldLocal != activeDesignSlot && oldLocal != oldDesignSlot)
+            releaseDesignSlot (oldLocal);
+
+        return &designSlots[slot].state;
+    }
+
+    return activeState;
+}
+
+int FFTProcessor::reserveFreeWarmSlot() noexcept
+{
+    PlanMeta meta;
+    if (! readPlanMeta (meta))
+        return -1;
+
+    const int publishedSlot = meta.warmSlot;
+    const uint32_t mask = audioWarmMask.load (std::memory_order_acquire);
+
+    for (int i = 0; i < NumWarmSlots; ++i)
+    {
+        if (i == publishedSlot || (mask & (1u << i)) != 0)
+            continue;
+
+        int state = warmSlotStates[i].load (std::memory_order_acquire);
+        if (state != WarmSlotFree && state != WarmSlotReady)
+            continue;
+
+        if (warmSlotStates[i].compare_exchange_strong (
+                state, WarmSlotReserved,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+            return i;
+    }
+    return -1;
+}
+
+void FFTProcessor::updateAudioWarmMask() noexcept
+{
+    const uint32_t mask = localWarmSlot >= 0 ? (1u << localWarmSlot) : 0u;
+    audioWarmMask.store (mask, std::memory_order_release);
+}
+
+void FFTProcessor::releaseWarmSlot(int slot) noexcept
+{
+    if (slot >= 0 && slot < NumWarmSlots && slot != localWarmSlot)
+        warmSlotStates[slot].store (WarmSlotFree, std::memory_order_release);
+}
+
+FFTProcessor::WarmState* FFTProcessor::getWarmStateForAudioThread(int designVersion)
+{
+    PlanMeta meta;
+    if (! readPlanMeta (meta))
+    {
+        // Torn writer window: keep the pinned warm and its progressed target.
+        return localWarmSlot >= 0 ? &warmSlots[localWarmSlot].state : nullptr;
+    }
+
+    if (meta.warmSlot < 0 || meta.warmSlot >= NumWarmSlots
+        || meta.version != designVersion
+        || meta.version < minimumPlanVersion.load (std::memory_order_acquire)
+        || meta.epoch != designEpoch.load (std::memory_order_acquire))
+    {
+        return nullptr;
+    }
+
+    const int slot = meta.warmSlot;
+    if (localWarmSlot == slot)
+        return &warmSlots[slot].state;
+
+    int expected = WarmSlotReady;
+    if (! warmSlotStates[slot].compare_exchange_strong (
+            expected, WarmSlotInUse,
+            std::memory_order_acq_rel, std::memory_order_acquire))
+    {
+        return nullptr;
+    }
+
+    PlanMeta check;
+    if (! readPlanMeta (check) || check.warmSlot != slot
+        || check.version != designVersion
+        || warmSlots[slot].state.version != designVersion)
+    {
+        warmSlotStates[slot].store (WarmSlotReady, std::memory_order_release);
+        return nullptr;
+    }
+
+    const int oldSlot = localWarmSlot;
+    localWarmSlot = slot;
+    updateAudioWarmMask();
+    if (oldSlot >= 0 && oldSlot != slot)
+        releaseWarmSlot (oldSlot);
+
+    return &warmSlots[slot].state;
+}
+
+//==============================================================================
 void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
 {
+    // getTwiddles() prefers the thread-local active bank. A previous spectrum
+    // bank may already have been released after an SR change; clear the raw
+    // pointer before the twiddle prewarm below can dereference it.
+    setActiveTwiddleBank<double>(nullptr);
+
     sampleRate.store(sr, std::memory_order_release);
     preparedChannels.store(std::max(1, channels), std::memory_order_release);
 
@@ -92,95 +372,105 @@ void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
     xfadeNew.setSize(numChannels, xfadeSamples);
 
     fftWork.assign(static_cast<size_t>(maxL), {});
-    if (static_cast<int>(warmScratch.size()) < maxL)
-        warmScratch.assign(static_cast<size_t>(maxL), {});
-    prefixScratch.assign(static_cast<size_t>(ConvBlockLen), 0.0f);
-    warmCatchUpOutput.assign(static_cast<size_t>(ConvBlockLen), 0.0f);
-    maxHostBlockSamples = std::max(1, maxBlockSize);
-    currentHostBlockSamples.store(maxHostBlockSamples, std::memory_order_release);
 
-    // Enough history to warm the longest FIR with two extra OLA blocks of
-    // margin; power-of-two capacity keeps modulo cheap.
-    const int warmBlocks = (MaxFirLength + ConvBlockLen - 1) / ConvBlockLen + 2;
-    warmFeedSamples = warmBlocks * ConvBlockLen;
-    if (static_cast<int>(warmInput.size()) < warmFeedSamples)
-        warmInput.assign(static_cast<size_t>(warmFeedSamples), 0.0f);
-    if (static_cast<int>(warmOutput.size()) < ConvBlockLen)
-        warmOutput.assign(static_cast<size_t>(ConvBlockLen), 0.0f);
+    {
+        // An in-flight background warm build reads warmInput/warmOutput/
+        // warmScratch and the history ring. The epoch bump above makes it
+        // abort at its 1 ms wait checkpoint; take the build mutex so these
+        // reallocations cannot race a build that is still inside an FFT.
+        std::lock_guard<std::mutex> warmBuildLock (warmBuildMutex);
 
-    // Allocate the history ring for the maximum channel count ONCE. The
-    // background warm builder may read it concurrently, so prepare() must not
-    // reallocate or clear it on ordinary sample-rate/channel-count changes.
-    // Samples before historyValidFrom belong to a previous session and are
-    // never used for warm-up.
-    const int historyCapacity = nextPowerOfTwo(MaxFirLength + ConvBlockLen);
-    if (history.capacity() != historyCapacity
-        || history.numChannels() < SubEQ::EQNode::MaxChannels)
-        history.prepare(SubEQ::EQNode::MaxChannels, historyCapacity);
+        if (static_cast<int>(warmScratch.size()) < maxL)
+            warmScratch.assign(static_cast<size_t>(maxL), {});
+        prefixScratch.assign(static_cast<size_t>(ConvBlockLen), 0.0f);
+        warmCatchUpOutput.assign(static_cast<size_t>(ConvBlockLen), 0.0f);
+
+        // Enough history to warm the longest FIR with two extra OLA blocks of
+        // margin; power-of-two capacity keeps modulo cheap.
+        const int warmBlocks = (MaxFirLength + ConvBlockLen - 1) / ConvBlockLen + 2;
+        const int warmFeedSamples = warmBlocks * ConvBlockLen;
+        if (static_cast<int>(warmInput.size()) < warmFeedSamples)
+            warmInput.assign(static_cast<size_t>(warmFeedSamples), 0.0f);
+        if (static_cast<int>(warmOutput.size()) < ConvBlockLen)
+            warmOutput.assign(static_cast<size_t>(ConvBlockLen), 0.0f);
+
+        // Allocate the history ring for the maximum channel count ONCE. The
+        // background warm builder may read it concurrently, so prepare() must
+        // not reallocate or clear it on ordinary sample-rate/channel-count
+        // changes. Samples before historyValidFrom belong to a previous
+        // session and are never used for warm-up.
+        const int leadSamples = static_cast<int>(0.35 * sr)
+                              + std::max(1, maxBlockSize);
+        const int historyCapacity = nextPowerOfTwo(MaxFirLength + ConvBlockLen
+                                                    + leadSamples);
+        if (history.capacity() != historyCapacity
+            || history.numChannels() < SubEQ::EQNode::MaxChannels)
+            history.prepare(SubEQ::EQNode::MaxChannels, historyCapacity);
+    }
+
+    {
+        std::vector<int> sizes;
+        sizes.reserve(static_cast<size_t>(NumFirLengthChoices));
+        for (int i = 0; i < NumFirLengthChoices; ++i)
+            sizes.push_back(convolutionFftSize(FirLengthChoices[i], ConvBlockLen));
+        twiddleBank.prepare(sizes);
+    }
+    currentHostBlockSamples.store(std::max(1, maxBlockSize), std::memory_order_release);
     historyValidFrom.store(history.capturedCount(), std::memory_order_release);
 
     activeConvFFTSize = 0;
     activeGroupDelay = 0;
     processedVersion = 0;
-    currentOlaBlockIndex = 0;
     reportedActiveLatency.store(0, std::memory_order_release);
-    publishedLatency.store(0, std::memory_order_release);
-    pendingTargetSample.store(0, std::memory_order_release);
-    pendingAbortVersion.store(-1, std::memory_order_release);
-    latencyAckVersion.store(0, std::memory_order_release);
+    invalidateLatencyAck();
+    pdcGuardMirror.store(false, std::memory_order_release);
     offlineDesignCooldown = 0;
     latencyGuardVersion = 0;
     latencyGuardSamples = 0;
-    latencyWaitVersion = 0;
-    latencyWaitSamples = 0;
-    warmBuildSecondsEWMA = 0.012;
+    warmBuildSecondsEWMA.store(0.012, std::memory_order_relaxed);
     crossfadeRemaining = 0;
     fadeConvFFTSize = 0;
-    twiddlePrewarmedSize = 0;
     audioTwiddlesPrewarmed = false;
 
-    // Drop all published/active designs and warm states. Moves are O(1);
-    // destruction happens on the background thread.
+    // Invalidate every design published before this prepare. The epoch bump
+    // above makes an in-flight worker abort; the version cutoff makes the
+    // audio thread ignore a meta that raced the reset.
+    const int cutoff = stateVersion.fetch_add(1, std::memory_order_acq_rel) + 1;
+    minimumPlanVersion.store(cutoff, std::memory_order_release);
+    for (auto& state : designSlotStates)
     {
-        std::lock_guard<std::mutex> lock(stateMutex);
-
-        auto dropDesign = [&](std::shared_ptr<const FIRState>& p)
+        // A producer may own a Reserved slot; preserve it so the worker and
+        // offline renderer can never build into the same slot during reset.
+        int expected = state.load (std::memory_order_acquire);
+        while (expected != DesignSlotReserved)
         {
-            if (p == nullptr)
-                return;
-            auto& slot = pendingDestroy[pendingDestroyHead];
-            if (slot == nullptr)
-            {
-                slot = std::move(p);
-                pendingDestroyHead = (pendingDestroyHead + 1) % NumRetireSlots;
-            }
-        };
-        auto dropWarm = [&](std::shared_ptr<WarmState>& w)
-        {
-            if (w == nullptr)
-                return;
-            auto& slot = pendingWarmDestroy[pendingWarmDestroyHead];
-            if (slot == nullptr)
-            {
-                slot = std::move(w);
-                pendingWarmDestroyHead = (pendingWarmDestroyHead + 1) % NumWarmRetireSlots;
-            }
-        };
-
-        dropDesign(currentState);
-        dropDesign(localState);
-        dropDesign(activeState);
-        dropDesign(oldState);
-        dropDesign(deferredDesignRetire);
-        dropWarm(currentWarm);
-        dropWarm(localWarm);
-        dropWarm(deferredWarmRetire);
+            if (state.compare_exchange_weak (expected, DesignSlotFree,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_acquire))
+                break;
+        }
     }
+    localDesignSlot = activeDesignSlot = oldDesignSlot = -1;
+    activeState = nullptr;
+    oldState = nullptr;
+    audioDesignMask.store(0, std::memory_order_release);
+    activeDesignVersion.store(0, std::memory_order_release);
 
-    lastSeenVersion = 0;
-    lastSeenWarmVersion = 0;
-    stateVersion.fetch_add(1, std::memory_order_release);
-    warmVersion.fetch_add(1, std::memory_order_release);
+    localWarmSlot = -1;
+    audioWarmMask.store(0, std::memory_order_release);
+    for (auto& state : warmSlotStates)
+    {
+        int expected = state.load (std::memory_order_acquire);
+        while (expected != WarmSlotReserved)
+        {
+            if (state.compare_exchange_weak (expected, WarmSlotFree,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_acquire))
+                break;
+        }
+    }
+    audioWarmPtr = nullptr;
+    audioWarmTargetSample = 0;
 
     for (int i = 0; i < NumFirLengthChoices; ++i)
         prewarmTwiddleTable<double>(convolutionFftSize(FirLengthChoices[i], ConvBlockLen));
@@ -195,85 +485,58 @@ void FFTProcessor::resetConvolution()
     activeConvFFTSize = 0;
     activeGroupDelay = 0;
     processedVersion = 0;
-    currentOlaBlockIndex = 0;
     reportedActiveLatency.store(0, std::memory_order_release);
-    publishedLatency.store(0, std::memory_order_release);
-    pendingTargetSample.store(0, std::memory_order_release);
-    pendingAbortVersion.store(-1, std::memory_order_release);
+    invalidateLatencyAck();
+    pdcGuardMirror.store(false, std::memory_order_release);
     latencyGuardVersion = 0;
     latencyGuardSamples = 0;
-    latencyWaitVersion = 0;
-    latencyWaitSamples = 0;
     offlineDesignCooldown = 0;
-    warmBuildSecondsEWMA = 0.012;
+    warmBuildSecondsEWMA.store(0.012, std::memory_order_relaxed);
 
     // Invalidate any design that is currently being computed. Without this,
     // a design started before a mode/length change could still publish and be
     // adopted after the clear.
     designEpoch.fetch_add(1, std::memory_order_release);
 
-    auto disposeDesign = [&](std::shared_ptr<const FIRState>& p) -> bool
+    // Release every design slot. This runs on the audio thread (mode change)
+    // or the setup thread (prepare); the ring state machine makes reuse safe.
+    localDesignSlot = activeDesignSlot = oldDesignSlot = -1;
+    activeState = nullptr;
+    oldState = nullptr;
+    audioDesignMask.store(0, std::memory_order_release);
+    for (auto& state : designSlotStates)
     {
-        if (p == nullptr)
-            return true;
-        if (retireState(p))
-            return true;
-        if (deferredDesignRetire == nullptr)
+        // A producer may own a Reserved slot; preserve it so the worker and
+        // offline renderer can never build into the same slot during reset.
+        int expected = state.load (std::memory_order_acquire);
+        while (expected != DesignSlotReserved)
         {
-            deferredDesignRetire = std::move(p);
-            return true;
-        }
-        return false;
-    };
-
-    // Retire active/old designs. The OLA vectors are swapped out when a warm
-    // state is adopted, so there is no large fill here.
-    disposeDesign(activeState);
-    disposeDesign(oldState);
-
-    if (localState != nullptr && retireState(localState))
-        localState.reset();
-    if (localWarm != nullptr && retireWarm(localWarm))
-        localWarm.reset();
-
-    {
-        // Audio-thread path: never block on the background publisher. If the
-        // lock is busy the warm is left for the next publish/retirement;
-        // correctness does not depend on clearing it synchronously.
-        std::unique_lock<std::mutex> lock (stateMutex, std::try_to_lock);
-        if (lock.owns_lock() && currentWarm != nullptr)
-        {
-            auto& slot = pendingWarmDestroy[pendingWarmDestroyHead];
-            if (slot == nullptr)
-            {
-                slot = std::move(currentWarm);
-                pendingWarmDestroyHead = (pendingWarmDestroyHead + 1) % NumWarmRetireSlots;
-            }
+            if (state.compare_exchange_weak (expected, DesignSlotFree,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_acquire))
+                break;
         }
     }
 
-    stateVersion.fetch_add(1, std::memory_order_release);
-    warmVersion.fetch_add(1, std::memory_order_release);
-}
-
-void FFTProcessor::clearPublishedState()
-{
-    resetConvolution();
-
+    localWarmSlot = -1;
+    audioWarmMask.store(0, std::memory_order_release);
+    for (auto& state : warmSlotStates)
     {
-        std::lock_guard<std::mutex> lock(stateMutex);
-        if (currentState != nullptr)
+        int expected = state.load (std::memory_order_acquire);
+        while (expected != WarmSlotReserved)
         {
-            auto& slot = pendingDestroy[pendingDestroyHead];
-            if (slot == nullptr)
-            {
-                slot = std::move(currentState);
-                pendingDestroyHead = (pendingDestroyHead + 1) % NumRetireSlots;
-            }
+            if (state.compare_exchange_weak (expected, WarmSlotFree,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_acquire))
+                break;
         }
     }
 
-    stateVersion.fetch_add(1, std::memory_order_release);
+    const int cutoff = stateVersion.fetch_add(1, std::memory_order_acq_rel) + 1;
+    minimumPlanVersion.store(cutoff, std::memory_order_release);
+    activeDesignVersion.store(0, std::memory_order_release);
+    audioWarmPtr = nullptr;
+    audioWarmTargetSample = 0;
 }
 
 void FFTProcessor::captureHistory(const float* const* channels, int numChannelsIn,
@@ -316,29 +579,16 @@ void FFTProcessor::invalidateDesigns()
 // OLA state from the input history (shadow convolution).
 void FFTProcessor::run()
 {
-    std::shared_ptr<FIRState> lastDesign;
+    int lastDesignSlot = -1;
+    int lastDesignVersion = 0;
     int lastDesignEpoch = -1;
     uint64_t lastDesignTarget = 0;
 
     while (!threadShouldExit())
     {
-        // Drain retirement rings outside the lock: no large object is ever
-        // destroyed while holding stateMutex or on the audio thread.
-        std::shared_ptr<const FIRState> toFree[NumRetireSlots];
-        std::shared_ptr<WarmState> warmToFree[NumWarmRetireSlots];
-        {
-            std::lock_guard<std::mutex> lock (stateMutex);
-            for (int i = 0; i < NumRetireSlots; ++i)
-                toFree[i] = std::move (pendingDestroy[i]);
-            for (int i = 0; i < NumWarmRetireSlots; ++i)
-                warmToFree[i] = std::move (pendingWarmDestroy[i]);
-        }
-        for (auto& p : toFree) p.reset();
-        for (auto& w : warmToFree) w.reset();
-
         redesignEvent.wait(20);
 
-        auto* source = parameterSource.load(std::memory_order_acquire);
+        auto* source = parameterSource.load (std::memory_order_acquire);
         if (source == nullptr)
             continue;
 
@@ -347,275 +597,197 @@ void FFTProcessor::run()
 
         // Offline rendering builds designs/warm states synchronously on the
         // audio thread; keep the worker out of the way.
-        if (nonRealtime.load(std::memory_order_acquire))
+        if (nonRealtime.load (std::memory_order_acquire))
             continue;
 
-        if (redesignRequested.load(std::memory_order_acquire))
-            warmRebuildRequested.store(false, std::memory_order_release);
+        if (redesignRequested.load (std::memory_order_acquire))
+            warmRebuildRequested.store (false, std::memory_order_release);
+
+        const bool haveLastDesign = lastDesignSlot >= 0
+            && lastDesignSlot < NumDesignSlots
+            && lastDesignEpoch == designEpoch.load (std::memory_order_acquire)
+            && lastDesignVersion >= minimumPlanVersion.load (std::memory_order_acquire)
+            && designSlotStates[lastDesignSlot].load (std::memory_order_acquire)
+                   != DesignSlotFree
+            && designSlots[lastDesignSlot].state.version == lastDesignVersion;
 
         // Retry a warm for an already-published design whose target is still
         // in the future. The design metadata was published early so the audio
         // coordinator could start its latency transition in time.
-        if (warmRebuildRequested.exchange(false, std::memory_order_acquire)
-            && lastDesign != nullptr && mode != EQMode::ZeroLatency
-            && lastDesign->version != 0
-            && lastDesign->version == stateVersion.load(std::memory_order_acquire))
+        if (warmRebuildRequested.exchange (false, std::memory_order_acquire)
+            && haveLastDesign && mode != EQMode::ZeroLatency
+            && lastDesignVersion == stateVersion.load (std::memory_order_acquire))
         {
+            const FIRState& design = designSlots[lastDesignSlot].state;
+
             // If the previous target was missed, choose a fresh future host
             // block for the SAME design instead of rebuilding coefficients.
             if (lastDesignTarget <= history.publishedCount())
             {
-                const int hostBlock = std::max(1, currentHostBlockSamples.load(std::memory_order_acquire));
-                const double sr = sampleRate.load(std::memory_order_acquire);
-                const uint64_t lead = warmLeadSamples(sr, hostBlock, warmBuildSecondsEWMA);
-                lastDesignTarget = planWarmTarget(history.capturedCount(), lead,
-                                                  hostBlock, ConvBlockLen).targetSample;
-                pendingTargetSample.store(lastDesignTarget, std::memory_order_release);
+                const int hostBlock = std::max (1, currentHostBlockSamples.load (std::memory_order_acquire));
+                const double sr = sampleRate.load (std::memory_order_acquire);
+                const uint64_t lead = warmLeadSamples (
+                    sr, hostBlock, warmBuildSecondsEWMA.load (std::memory_order_relaxed));
+                lastDesignTarget = planWarmTarget (history.capturedCount(), lead,
+                                                   hostBlock, ConvBlockLen).targetSample;
             }
 
-            auto warm = std::make_shared<WarmState>();
-            if (buildWarmState(*lastDesign, warm, lastDesignEpoch, lastDesignTarget))
+            const int warmSlot = reserveFreeWarmSlot();
+            if (warmSlot < 0)
             {
-                std::shared_ptr<WarmState> replacedWarm;
-                bool publish = false;
-                {
-                    std::lock_guard<std::mutex> lock (stateMutex);
-                    if (lastDesignEpoch == designEpoch.load(std::memory_order_acquire)
-                        && lastDesign->version == stateVersion.load(std::memory_order_acquire))
-                    {
-                        warm->version = lastDesign->version;
-                        replacedWarm = std::move (currentWarm);
-                        currentWarm = warm;
-                        pendingTargetSample.store(lastDesignTarget,
-                                                  std::memory_order_release);
-                        pendingAbortVersion.store(-1, std::memory_order_release);
-                        publish = true;
-                    }
-                }
-                if (publish)
-                    warmVersion.fetch_add(1, std::memory_order_release);
-                replacedWarm.reset();
-            }
-            else if (lastDesignEpoch != designEpoch.load(std::memory_order_acquire))
-            {
-                lastDesign.reset();
-                lastDesignEpoch = -1;
+                warmRebuildRequested.store (true, std::memory_order_release);
             }
             else
             {
-                warmRebuildRequested.store(true, std::memory_order_release);
+                WarmState& warm = warmSlots[warmSlot].state;
+                if (buildWarmState (design, warm, lastDesignEpoch, lastDesignTarget))
+                {
+                    warm.version = lastDesignVersion;
+                    warmSlotStates[warmSlot].store (WarmSlotReady,
+                                                    std::memory_order_release);
+                    writePlanMeta (lastDesignSlot, warmSlot, lastDesignVersion,
+                                   design.groupDelay + (ConvBlockLen - 1),
+                                   lastDesignTarget, lastDesignEpoch);
+                }
+                else
+                {
+                    warmSlotStates[warmSlot].store (WarmSlotFree,
+                                                    std::memory_order_release);
+                    if (lastDesignEpoch != designEpoch.load (std::memory_order_acquire))
+                    {
+                        lastDesignSlot = -1;
+                        lastDesignVersion = 0;
+                        lastDesignEpoch = -1;
+                    }
+                    else
+                    {
+                        warmRebuildRequested.store (true, std::memory_order_release);
+                    }
+                }
             }
         }
 
-        if (!redesignRequested.exchange(false, std::memory_order_acquire))
+        if (! redesignRequested.exchange (false, std::memory_order_acquire))
             continue;
 
         if (mode == EQMode::ZeroLatency)
             continue;
 
         int epoch = 0;
-        auto newState = buildDesignSnapshot(epoch);
+        auto newState = buildDesignSnapshot (epoch);
         if (newState == nullptr)
             continue;
 
-        const int hostBlock = std::max(1, currentHostBlockSamples.load(std::memory_order_acquire));
-        const double sr = sampleRate.load(std::memory_order_acquire);
-        const uint64_t lead = warmLeadSamples(sr, hostBlock, warmBuildSecondsEWMA);
-        const WarmTarget target = planWarmTarget(history.capturedCount(), lead,
-                                                 hostBlock, ConvBlockLen);
+        const int hostBlock = std::max (1, currentHostBlockSamples.load (std::memory_order_acquire));
+        const double sr = sampleRate.load (std::memory_order_acquire);
+        const uint64_t lead = warmLeadSamples (
+            sr, hostBlock, warmBuildSecondsEWMA.load (std::memory_order_relaxed));
+        const WarmTarget target = planWarmTarget (history.capturedCount(), lead,
+                                                  hostBlock, ConvBlockLen);
 
-        // Phase 1: publish design + target metadata immediately. The audio
-        // coordinator can now schedule the latency transition with a real
-        // lead; adoption still requires the matching warm state.
-        std::shared_ptr<const FIRState> replacedState;
-        int publishedVersion = 0;
+        // Wait for a free design slot (bounded; the audio mask keeps active,
+        // fading and local designs pinned, so one of four slots is normally
+        // free). Never blocks the audio thread.
+        int slot = -1;
+        for (int tries = 0; tries < 100 && slot < 0 && ! threadShouldExit(); ++tries)
         {
-            std::lock_guard<std::mutex> lock (stateMutex);
-            if (epoch != designEpoch.load(std::memory_order_acquire))
-                continue;
-
-            publishedVersion = stateVersion.fetch_add(1, std::memory_order_acq_rel) + 1;
-            newState->version = publishedVersion;
-            replacedState = std::move (currentState);
-            currentState = newState;
-            publishedLatency.store(newState->groupDelay + (ConvBlockLen - 1),
-                                   std::memory_order_release);
-            pendingTargetSample.store(target.targetSample, std::memory_order_release);
-            pendingAbortVersion.store(-1, std::memory_order_release);
+            if (epoch != designEpoch.load (std::memory_order_acquire))
+                break;
+            slot = reserveFreeDesignSlot();
+            if (slot < 0)
+                juce::Thread::sleep (2);
         }
-        replacedState.reset();
 
-        lastDesign = newState;
+        if (slot < 0)
+        {
+            redesignRequested.store (true, std::memory_order_release);
+            continue;
+        }
+
+        if (epoch != designEpoch.load (std::memory_order_acquire))
+        {
+            designSlotStates[slot].store (DesignSlotFree, std::memory_order_release);
+            continue;
+        }
+
+        // Phase 1: move the immutable design into the ring slot and publish
+        // (slot, version, latency, target) through the seqlock. The audio
+        // coordinator can now schedule the latency transition; adoption still
+        // requires the matching warm state.
+        const int publishedVersion = stateVersion.fetch_add (1, std::memory_order_acq_rel) + 1;
+        designSlots[slot].state = std::move (*newState);
+        designSlots[slot].state.version = publishedVersion;
+
+        // A reset may have landed while we were moving the payload into the
+        // reserved slot. Do not publish an old-epoch design; drop it.
+        if (epoch != designEpoch.load (std::memory_order_acquire))
+        {
+            designSlotStates[slot].store (DesignSlotFree, std::memory_order_release);
+            continue;
+        }
+
+        // Keep the slot Reserved until the payload, snapshot and meta are
+        // fully written. A reset can then only see Reserved (and preserve it)
+        // instead of freeing it while this thread is still reading it.
+        publishFirResponseSnapshot (designSlots[slot].state);
+        writePlanMeta (slot, -1, publishedVersion,
+                       designSlots[slot].state.groupDelay + (ConvBlockLen - 1),
+                       target.targetSample, epoch);
+        designSlotStates[slot].store (DesignSlotReady, std::memory_order_release);
+        pdcGuardMirror.store (false, std::memory_order_release);
+
+        lastDesignSlot = slot;
+        lastDesignVersion = publishedVersion;
         lastDesignEpoch = epoch;
         lastDesignTarget = target.targetSample;
 
         // Phase 2: build the exact warm state for the published target.
-        auto warm = std::make_shared<WarmState>();
-        if (!buildWarmState(*newState, warm, epoch, target.targetSample))
+        const int warmSlot = reserveFreeWarmSlot();
+        if (warmSlot < 0)
         {
-            if (epoch != designEpoch.load(std::memory_order_acquire))
+            warmRebuildRequested.store (true, std::memory_order_release);
+            continue;
+        }
+
+        WarmState& warm = warmSlots[warmSlot].state;
+        if (! buildWarmState (designSlots[slot].state, warm, epoch, target.targetSample))
+        {
+            warmSlotStates[warmSlot].store (WarmSlotFree, std::memory_order_release);
+            if (epoch != designEpoch.load (std::memory_order_acquire))
             {
-                lastDesign.reset();
+                lastDesignSlot = -1;
+                lastDesignVersion = 0;
                 lastDesignEpoch = -1;
             }
             else
             {
-                warmRebuildRequested.store(true, std::memory_order_release);
+                warmRebuildRequested.store (true, std::memory_order_release);
             }
             continue;
         }
 
-        std::shared_ptr<WarmState> replacedWarm;
-        bool publishWarm = false;
+        warm.version = publishedVersion;
+        warmSlotStates[warmSlot].store (WarmSlotReady, std::memory_order_release);
+
+        if (publishedVersion == stateVersion.load (std::memory_order_acquire)
+            && epoch == designEpoch.load (std::memory_order_acquire))
         {
-            std::lock_guard<std::mutex> lock (stateMutex);
-            if (publishedVersion == stateVersion.load(std::memory_order_acquire)
-                && epoch == designEpoch.load(std::memory_order_acquire))
-            {
-                warm->version = publishedVersion;
-                replacedWarm = std::move (currentWarm);
-                currentWarm = warm;
-                pendingTargetSample.store(target.targetSample,
-                                          std::memory_order_release);
-                pendingAbortVersion.store(-1, std::memory_order_release);
-                publishWarm = true;
-            }
-        }
-        if (publishWarm)
-            warmVersion.fetch_add(1, std::memory_order_release);
-        replacedWarm.reset();
-    }
-}
-
-//==============================================================================
-bool FFTProcessor::retireState(std::shared_ptr<const FIRState>& stateToRetire) const
-{
-    if (stateToRetire == nullptr)
-        return true;
-
-    std::unique_lock<std::mutex> lock(stateMutex, std::try_to_lock);
-    if (!lock.owns_lock())
-        return false;
-    auto& slot = pendingDestroy[pendingDestroyHead];
-    if (slot != nullptr)
-        return false;
-
-    slot = std::move(stateToRetire);
-    pendingDestroyHead = (pendingDestroyHead + 1) % NumRetireSlots;
-    return true;
-}
-
-bool FFTProcessor::retireWarm(std::shared_ptr<WarmState>& warmToRetire) const
-{
-    if (warmToRetire == nullptr)
-        return true;
-
-    std::unique_lock<std::mutex> lock(stateMutex, std::try_to_lock);
-    if (!lock.owns_lock())
-        return false;
-    auto& slot = pendingWarmDestroy[pendingWarmDestroyHead];
-    if (slot != nullptr)
-        return false;
-
-    slot = std::move(warmToRetire);
-    pendingWarmDestroyHead = (pendingWarmDestroyHead + 1) % NumWarmRetireSlots;
-    return true;
-}
-
-std::shared_ptr<const FFTProcessor::FIRState> FFTProcessor::getPublishedStateForAudioThread() const
-{
-    const int version = stateVersion.load(std::memory_order_acquire);
-    if (version != lastSeenVersion)
-    {
-        std::shared_ptr<const FIRState> next;
-        {
-            std::unique_lock<std::mutex> lock (stateMutex, std::try_to_lock);
-            if (!lock.owns_lock())
-                return localState;   // never block the audio thread on GUI/worker
-            next = currentState;
-        }
-
-        if (next != localState)
-        {
-            const int oldVersion = lastSeenVersion;
-            auto prev = std::move(localState);
-            localState = next;
-            lastSeenVersion = version;
-
-            if (prev != nullptr && !retireState(prev))
-            {
-                if (deferredDesignRetire == nullptr)
-                {
-                    deferredDesignRetire = std::move(prev);
-                }
-                else
-                {
-                    // Ring full and deferred slot occupied: keep the previous
-                    // design cached rather than destroying it on this thread.
-                    localState = std::move(prev);
-                    lastSeenVersion = oldVersion;
-                }
-            }
+            writePlanMeta (slot, warmSlot, publishedVersion,
+                           designSlots[slot].state.groupDelay + (ConvBlockLen - 1),
+                           target.targetSample, epoch);
         }
         else
         {
-            lastSeenVersion = version;
+            warmSlotStates[warmSlot].store (WarmSlotFree, std::memory_order_release);
         }
     }
-
-    return localState;
-}
-
-std::shared_ptr<FFTProcessor::WarmState> FFTProcessor::getWarmStateForAudioThread(int designVersion) const
-{
-    const int version = warmVersion.load(std::memory_order_acquire);
-    if (version != lastSeenWarmVersion)
-    {
-        std::shared_ptr<WarmState> next;
-        {
-            std::unique_lock<std::mutex> lock (stateMutex, std::try_to_lock);
-            if (!lock.owns_lock())
-                return localWarm;    // retry next block
-            next = currentWarm;
-        }
-
-        if (next != localWarm)
-        {
-            const int oldVersion = lastSeenWarmVersion;
-            auto prev = std::move(localWarm);
-            localWarm = next;
-            lastSeenWarmVersion = version;
-
-            if (prev != nullptr && !retireWarm(prev))
-            {
-                if (deferredWarmRetire == nullptr)
-                {
-                    deferredWarmRetire = std::move(prev);
-                }
-                else
-                {
-                    localWarm = std::move(prev);
-                    lastSeenWarmVersion = oldVersion;
-                }
-            }
-        }
-        else
-        {
-            lastSeenWarmVersion = version;
-        }
-    }
-
-    if (localWarm != nullptr && localWarm->version == designVersion)
-        return localWarm;
-
-    return nullptr;
 }
 
 //==============================================================================
 // Build FIR coefficients from the current APVTS snapshot. Safe to call from
 // the background worker or, in offline rendering, from the audio thread; the
 // designEngine is serialized by designMutex. Returns nullptr for ZL / failure.
-std::shared_ptr<FFTProcessor::FIRState> FFTProcessor::buildDesignSnapshot(int& outEpoch)
+std::unique_ptr<FFTProcessor::FIRState> FFTProcessor::buildDesignSnapshot(int& outEpoch)
 {
     auto* source = parameterSource.load(std::memory_order_acquire);
     if (source == nullptr)
@@ -644,7 +816,7 @@ std::shared_ptr<FFTProcessor::FIRState> FFTProcessor::buildDesignSnapshot(int& o
     }
     applyNodesToEngine(*source, designEngine);
 
-    auto newState = std::make_shared<FIRState>();
+    auto newState = std::make_unique<FIRState>();
     newState->firLength = firLength;
 
     // Master gain and bypass are applied after convolution by OutputStage;
@@ -700,10 +872,10 @@ std::shared_ptr<FFTProcessor::FIRState> FFTProcessor::buildDesignSnapshot(int& o
 // pending output FIFO and advances the accumulator to T. This is equivalent to
 // feeding from zero for the last N samples, but costs 4 FFTs per channel
 // instead of O(N/M) blocks, and never runs on the audio thread.
-bool FFTProcessor::buildWarmState(const FIRState& design, std::shared_ptr<WarmState>& out,
+bool FFTProcessor::buildWarmState(const FIRState& design, WarmState& out,
                                   int expectedEpoch, uint64_t targetSample)
 {
-    if (out == nullptr || design.freqCoeffs.empty()
+    if (design.freqCoeffs.empty()
         || design.convFFTSize <= 0 || design.firLength <= 0
         || static_cast<int>(warmInput.size()) < std::max(design.firLength, ConvBlockLen)
         || static_cast<int>(warmOutput.size()) < ConvBlockLen
@@ -724,15 +896,15 @@ bool FFTProcessor::buildWarmState(const FIRState& design, std::shared_ptr<WarmSt
     const int L = design.convFFTSize;
     const uint64_t validFrom = historyValidFrom.load(std::memory_order_acquire);
 
-    out->states.resize(static_cast<size_t>(std::max(1, channels)));
-    out->version = design.version;
-    out->convFFTSize = L;
-    out->groupDelay = design.groupDelay;
-    out->targetSample = targetSample;
+    out.states.resize(static_cast<size_t>(std::max(1, channels)));
+    out.version = design.version;
+    out.convFFTSize = L;
+    out.groupDelay = design.groupDelay;
+    out.targetSample = targetSample;
 
     const int maxL = convolutionFftSize(MaxFirLength, ConvBlockLen);
     for (int ch = 0; ch < channels; ++ch)
-        prepareOlaChannelState(out->states[static_cast<size_t>(ch)], M, maxL);
+        prepareOlaChannelState(out.states[static_cast<size_t>(ch)], M, maxL);
 
     double workSeconds = 0.0;
 
@@ -759,7 +931,7 @@ bool FFTProcessor::buildWarmState(const FIRState& design, std::shared_ptr<WarmSt
         {
             if (!olaSynthesizeOverlap(history, ch, S, validFrom, N, L, M,
                                       design.freqCoeffs.data(),
-                                      out->states[static_cast<size_t>(ch)],
+                                      out.states[static_cast<size_t>(ch)],
                                       warmInput, warmScratch))
                 return false;
         }
@@ -778,7 +950,7 @@ bool FFTProcessor::buildWarmState(const FIRState& design, std::shared_ptr<WarmSt
         {
             if (!olaReplayBlock(history, ch, S, validFrom, L, M,
                                 design.freqCoeffs.data(),
-                                out->states[static_cast<size_t>(ch)],
+                                out.states[static_cast<size_t>(ch)],
                                 warmInput, warmOutput, warmScratch))
                 return false;
         }
@@ -801,7 +973,7 @@ bool FFTProcessor::buildWarmState(const FIRState& design, std::shared_ptr<WarmSt
             if (!history.snapshotPadded(ch, boundary, prefix, validFrom,
                                         warmInput.data()))
                 return false;
-            processOlaChannel(out->states[static_cast<size_t>(ch)],
+            processOlaChannel(out.states[static_cast<size_t>(ch)],
                               warmInput.data(), warmOutput.data(), prefix,
                               M, L, design.freqCoeffs.data(), warmScratch);
         }
@@ -809,7 +981,9 @@ bool FFTProcessor::buildWarmState(const FIRState& design, std::shared_ptr<WarmSt
             std::chrono::steady_clock::now() - t0).count();
     }
 
-    warmBuildSecondsEWMA = 0.75 * warmBuildSecondsEWMA + 0.25 * workSeconds;
+    const double previousEWMA = warmBuildSecondsEWMA.load(std::memory_order_relaxed);
+    warmBuildSecondsEWMA.store(0.75 * previousEWMA + 0.25 * workSeconds,
+                               std::memory_order_relaxed);
     return true;
 }
 
@@ -817,8 +991,7 @@ bool FFTProcessor::buildWarmState(const FIRState& design, std::shared_ptr<WarmSt
 // Offline path: build the design and an exact warm state at the current
 // committed boundary. This runs on the audio thread only when the host marks
 // the processor non-realtime; there is no deadline to miss.
-bool FFTProcessor::buildWarmAtCurrentBoundary(const FIRState& design,
-                                               std::shared_ptr<WarmState>& out)
+bool FFTProcessor::buildWarmAtCurrentBoundary(const FIRState& design, WarmState& out)
 {
     const int M = ConvBlockLen;
     const uint64_t committed = history.publishedCount();
@@ -826,21 +999,21 @@ bool FFTProcessor::buildWarmAtCurrentBoundary(const FIRState& design,
     const int channels = preparedChannels.load(std::memory_order_acquire);
     const int N = design.firLength;
     const int L = design.convFFTSize;
-    if (out == nullptr || N <= 0 || L < M
+    if (N <= 0 || L < M
         || static_cast<int>(warmInput.size()) < std::max(N, M)
         || static_cast<int>(warmOutput.size()) < M
         || static_cast<int>(warmScratch.size()) < L)
         return false;
 
     const int maxL = convolutionFftSize(MaxFirLength, ConvBlockLen);
-    out->states.resize(static_cast<size_t>(std::max(1, channels)));
-    out->version = design.version;
-    out->convFFTSize = L;
-    out->groupDelay = design.groupDelay;
-    out->targetSample = committed;
+    out.states.resize(static_cast<size_t>(std::max(1, channels)));
+    out.version = design.version;
+    out.convFFTSize = L;
+    out.groupDelay = design.groupDelay;
+    out.targetSample = committed;
 
     for (int ch = 0; ch < channels; ++ch)
-        prepareOlaChannelState(out->states[static_cast<size_t>(ch)], M, maxL);
+        prepareOlaChannelState(out.states[static_cast<size_t>(ch)], M, maxL);
 
     const uint64_t validFrom = historyValidFrom.load(std::memory_order_acquire);
 
@@ -848,7 +1021,7 @@ bool FFTProcessor::buildWarmAtCurrentBoundary(const FIRState& design,
     {
         if (!olaSynthesizeAt(history, ch, committed, validFrom,
                              N, L, M, design.freqCoeffs.data(),
-                             out->states[static_cast<size_t>(ch)],
+                             out.states[static_cast<size_t>(ch)],
                              warmInput, warmOutput, warmScratch))
             return false;
     }
@@ -858,13 +1031,13 @@ bool FFTProcessor::buildWarmAtCurrentBoundary(const FIRState& design,
 
 bool FFTProcessor::ensureOfflineReady()
 {
-    if (!nonRealtime.load(std::memory_order_acquire))
+    if (! nonRealtime.load (std::memory_order_acquire))
         return false;
 
     // The live worker may still be finishing a warm build when the host flips
     // to offline. Never share its scratch buffers; skip this block and retry.
-    std::unique_lock<std::mutex> warmBuildLock(warmBuildMutex, std::try_to_lock);
-    if (!warmBuildLock.owns_lock())
+    std::unique_lock<std::mutex> warmBuildLock (warmBuildMutex, std::try_to_lock);
+    if (! warmBuildLock.owns_lock())
         return false;
 
     const uint64_t committed = history.publishedCount();
@@ -872,7 +1045,7 @@ bool FFTProcessor::ensureOfflineReady()
     auto published = getPublishedStateForAudioThread();
 
     const bool needDesign = published == nullptr
-                         || redesignRequested.load(std::memory_order_acquire);
+                         || redesignRequested.load (std::memory_order_acquire);
     if (needDesign)
     {
         if (offlineDesignCooldown > 0)
@@ -882,46 +1055,67 @@ bool FFTProcessor::ensureOfflineReady()
         else
         {
             int epoch = 0;
-            auto design = buildDesignSnapshot(epoch);
-            if (design != nullptr && epoch == designEpoch.load(std::memory_order_acquire))
+            auto design = buildDesignSnapshot (epoch);
+            if (design != nullptr
+                && epoch == designEpoch.load (std::memory_order_acquire))
             {
-                auto warm = std::make_shared<WarmState>();
-                if (buildWarmAtCurrentBoundary(*design, warm))
+                const int warmSlot = reserveFreeWarmSlot();
+                if (warmSlot >= 0
+                    && buildWarmAtCurrentBoundary (*design, warmSlots[warmSlot].state))
                 {
-                    std::shared_ptr<const FIRState> replacedState;
-                    std::shared_ptr<WarmState> replacedWarm;
+                    const int slot = reserveFreeDesignSlot();
+                    if (slot >= 0)
                     {
-                        std::lock_guard<std::mutex> lock (stateMutex);
-                        if (epoch == designEpoch.load(std::memory_order_acquire))
+                        if (epoch == designEpoch.load (std::memory_order_acquire))
                         {
-                            const int v = stateVersion.fetch_add(1, std::memory_order_acq_rel) + 1;
+                            const int v = stateVersion.fetch_add (1, std::memory_order_acq_rel) + 1;
                             design->version = v;
-                            warm->version = v;
-                            replacedState = std::move (currentState);
-                            replacedWarm = std::move (currentWarm);
-                            currentState = design;
-                            currentWarm = warm;
-                            publishedLatency.store(design->groupDelay + (ConvBlockLen - 1),
-                                                   std::memory_order_release);
-                            pendingTargetSample.store(warm->targetSample,
-                                                      std::memory_order_release);
-                            redesignRequested.store(false, std::memory_order_release);
-                            warmVersion.fetch_add(1, std::memory_order_release);
+                            warmSlots[warmSlot].state.version = v;
+
+                            designSlots[slot].state = std::move (*design);
+
+                            if (epoch != designEpoch.load (std::memory_order_acquire))
+                            {
+                                designSlotStates[slot].store (DesignSlotFree,
+                                                              std::memory_order_release);
+                                warmSlotStates[warmSlot].store (WarmSlotFree,
+                                                                std::memory_order_release);
+                                return false;
+                            }
+
+                            publishFirResponseSnapshot (designSlots[slot].state);
+                            writePlanMeta (slot, warmSlot, v,
+                                           designSlots[slot].state.groupDelay + (ConvBlockLen - 1),
+                                           warmSlots[warmSlot].state.targetSample, epoch);
+                            designSlotStates[slot].store (DesignSlotReady,
+                                                          std::memory_order_release);
+                            warmSlotStates[warmSlot].store (WarmSlotReady,
+                                                            std::memory_order_release);
+                            pdcGuardMirror.store (false, std::memory_order_release);
+
+                            redesignRequested.store (false, std::memory_order_release);
                             offlineDesignCooldown = 1;
+                            return true;
                         }
+
+                        designSlotStates[slot].store (DesignSlotFree,
+                                                      std::memory_order_release);
                     }
-                    // Offline: a one-off large-object release on this thread is
-                    // acceptable (no real-time deadline); steady-state uses the
-                    // retirement rings.
-                    replacedState.reset();
-                    replacedWarm.reset();
-                    return true;
+
+                    warmSlotStates[warmSlot].store (WarmSlotFree,
+                                                    std::memory_order_release);
+                }
+                else if (warmSlot >= 0)
+                {
+                    warmSlotStates[warmSlot].store (WarmSlotFree,
+                                                    std::memory_order_release);
                 }
             }
             offlineDesignCooldown = 8;
         }
     }
 
+    published = getPublishedStateForAudioThread();
     if (published == nullptr)
         return false;
 
@@ -930,28 +1124,35 @@ bool FFTProcessor::ensureOfflineReady()
     if (published->version == processedVersion)
         return false;
 
-    auto warm = getWarmStateForAudioThread(published->version);
+    auto warm = getWarmStateForAudioThread (published->version);
     if (warm == nullptr || warm->version != published->version
         || warm->targetSample != committed)
     {
-        auto rebuilt = std::make_shared<WarmState>();
-        if (!buildWarmAtCurrentBoundary(*published, rebuilt))
+        const int warmSlot = reserveFreeWarmSlot();
+        if (warmSlot < 0)
             return false;
 
-        std::shared_ptr<WarmState> replacedWarm;
+        if (! buildWarmAtCurrentBoundary (*published, warmSlots[warmSlot].state))
         {
-            std::lock_guard<std::mutex> lock (stateMutex);
-            if (published->version == stateVersion.load(std::memory_order_acquire))
-            {
-                rebuilt->version = published->version;
-                replacedWarm = std::move (currentWarm);
-                currentWarm = rebuilt;
-                pendingTargetSample.store(rebuilt->targetSample,
-                                          std::memory_order_release);
-                warmVersion.fetch_add(1, std::memory_order_release);
-            }
+            warmSlotStates[warmSlot].store (WarmSlotFree, std::memory_order_release);
+            return false;
         }
-        replacedWarm.reset();
+
+        warmSlots[warmSlot].state.version = published->version;
+        warmSlotStates[warmSlot].store (WarmSlotReady, std::memory_order_release);
+
+        if (published->version == stateVersion.load (std::memory_order_acquire)
+            && localDesignSlot >= 0)
+        {
+            writePlanMeta (localDesignSlot, warmSlot, published->version,
+                           published->groupDelay + (ConvBlockLen - 1),
+                           warmSlots[warmSlot].state.targetSample,
+                           designEpoch.load (std::memory_order_acquire));
+        }
+        else
+        {
+            warmSlotStates[warmSlot].store (WarmSlotFree, std::memory_order_release);
+        }
         return true;
     }
 
@@ -959,42 +1160,24 @@ bool FFTProcessor::ensureOfflineReady()
 }
 
 //==============================================================================
-void FFTProcessor::flushConvolvers()
-{
-    auto clear = [](std::vector<OlaChannelState>& list)
-    {
-        for (auto& st : list)
-        {
-            std::fill(st.inputBlock.begin(), st.inputBlock.end(), std::complex<double>(0.0, 0.0));
-            st.pos = 0;
-            std::fill(st.overlap.begin(), st.overlap.end(), 0.0);
-            st.outQueue.clear();
-            st.outRead = 0;
-        }
-    };
-
-    clear(activeStates);
-    clear(oldStates);
-    crossfadeRemaining = 0;
-    if (oldState != nullptr && !retireState(oldState) && deferredDesignRetire == nullptr)
-        deferredDesignRetire = std::move(oldState);
-}
-
-//==============================================================================
 bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
 {
+    // All twiddle tables were prepared off this thread; the pointer switch is
+    // O(1) and means the first audio FFT of every size performs no allocation.
+    setActiveTwiddleBank<double>(&twiddleBank);
+
     const int numSamples = buffer.getNumSamples();
     if (numSamples <= 0)
         return false;
 
-    // Retry deferred retirements; never destroy large objects on this thread.
-    if (deferredDesignRetire != nullptr && retireState(deferredDesignRetire))
-        deferredDesignRetire.reset();
-    if (deferredWarmRetire != nullptr && retireWarm(deferredWarmRetire))
-        deferredWarmRetire.reset();
-    if (oldState != nullptr && crossfadeRemaining <= 0
-        && retireState(oldState))
-        oldState.reset();
+    if (oldState != nullptr && crossfadeRemaining <= 0)
+    {
+        const int oldSlot = oldDesignSlot;
+        oldState = nullptr;
+        oldDesignSlot = -1;
+        updateAudioDesignMask();
+        releaseDesignSlot(oldSlot);
+    }
 
     if (nonRealtime.load(std::memory_order_acquire))
         ensureOfflineReady();
@@ -1015,7 +1198,6 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
         for (int i = 0; i < NumFirLengthChoices; ++i)
             prewarmTwiddleTable<double>(convolutionFftSize(FirLengthChoices[i], ConvBlockLen));
         audioTwiddlesPrewarmed = true;
-        twiddlePrewarmedSize = published->convFFTSize;
     }
 
     const int channelCount = std::min(buffer.getNumChannels(), numChannels);
@@ -1023,11 +1205,17 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
         return false;
 
     const uint64_t historyCount = history.publishedCount();
-    currentOlaBlockIndex = static_cast<int>(historyCount / ConvBlockLen);
 
     auto warm = getWarmStateForAudioThread(published->version);
-    const bool adoptionAborted = pendingAbortVersion.load(std::memory_order_acquire)
-                                 == published->version;
+
+    // Track the candidate's progressed target on the audio thread only. The
+    // published WarmState is immutable once published; writing its target in
+    // place raced the worker and made fresh candidates look stale.
+    if (warm != audioWarmPtr)
+    {
+        audioWarmPtr = warm;
+        audioWarmTargetSample = warm != nullptr ? warm->targetSample : 0;
+    }
 
     // A warm candidate is built at a target host block. Normally it is ready
     // exactly at that block; if the worker finished just after the boundary,
@@ -1037,11 +1225,11 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
         && warm->version == published->version
         && warm->convFFTSize == published->convFFTSize
         && warm->states.size() == activeStates.size()
-        && warm->targetSample <= historyCount;
+        && audioWarmTargetSample <= historyCount;
     int warmGap = 0;
     if (warmOk)
     {
-        warmGap = static_cast<int>(historyCount - warm->targetSample);
+        warmGap = static_cast<int>(historyCount - audioWarmTargetSample);
         // The worker may just miss the target when the host block is large.
         // Catch up at most the current host block (bounded by the caller's
         // block size); larger gaps are rebuilt rather than chased.
@@ -1058,7 +1246,7 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
             while (offset < warmGap)
             {
                 const int chunk = std::min(ConvBlockLen, warmGap - offset);
-                const uint64_t end = warm->targetSample
+                const uint64_t end = audioWarmTargetSample
                                    + static_cast<uint64_t>(offset + chunk);
                 if (!history.snapshot(ch, end, chunk, prefixScratch.data()))
                 {
@@ -1078,69 +1266,72 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
         }
 
         if (warmOk)
-            warm->targetSample = historyCount;
+            audioWarmTargetSample = historyCount;
     }
 
-    auto retireWarmSafely = [&](std::shared_ptr<WarmState>& w)
+    auto releaseWarm = [&](const WarmState* w)
     {
         if (w == nullptr)
             return;
-        if (retireWarm(w))
-            localWarm.reset();
-        // If the ring is full, localWarm still owns this object; the local
-        // copy released at scope end is not the last reference.
+        const int slot = localWarmSlot;
+        localWarmSlot = -1;
+        updateAudioWarmMask();
+        releaseWarmSlot (slot);
     };
 
     // ---- adopt a new design ----
-    if (published->version != processedVersion && crossfadeRemaining <= 0
-        && !adoptionAborted)
+    if (published->version != processedVersion && crossfadeRemaining <= 0)
     {
-        const bool latencyChanging = (activeState == nullptr)
-                                  || (published->groupDelay != activeGroupDelay);
+        const bool designChangedDelay = (activeState == nullptr)
+                                     || (published->groupDelay != activeGroupDelay);
+        const int publishedTotal = published->groupDelay + (ConvBlockLen - 1);
+        const bool hostAlreadyCompensates =
+            publishedTotal == hostLatencySamples.load (std::memory_order_acquire);
 
-        // PDC handshake: the host must be told the new latency before the
-        // audio switches to it. Wait/guard are measured in samples so the
-        // policy does not change with the host block size.
+        // PDC handshake: the host must be told a NEW latency before the audio
+        // switches to it. A new design at the latency the host already
+        // compensates needs no handshake (and must not wait for an ack that
+        // the coordinator will never request, e.g. after an SR re-prepare).
+        // Wait/guard are measured in samples so the policy does not change
+        // with the host block size.
         bool pdcBlocked = false;
-        if (latencyChanging && !nonRealtime.load(std::memory_order_acquire))
+        if (designChangedDelay
+            && ! hostAlreadyCompensates
+            && ! nonRealtime.load(std::memory_order_acquire))
         {
-            const int ack = latencyAckVersion.load(std::memory_order_acquire);
+            const int ack = getAckedLatencyVersion();
             const double sr = sampleRate.load(std::memory_order_acquire);
             if (ack < published->version)
             {
-                if (latencyWaitVersion != published->version)
-                {
-                    latencyWaitVersion = published->version;
-                    latencyWaitSamples = 0;
-                }
-
-                latencyWaitSamples += numSamples;
                 // Offline/headless hosts may never pump the message thread.
                 // Never switch a latency the host has not acknowledged: keep
-                // the old path and revert the host-facing latency instead.
-                // If the host later acknowledges, restore the new latency and
-                // resume the normal guard/switch path.
+                // the old path and let the PluginProcessor coordinator abort
+                // its bounded transition and report the old latency. The
+                // coordinator reads the design target from publishedPlan, so
+                // a retry can report it once acknowledgements resume. (The
+                // host-facing value is reportedLatency, not this atomic.)
                 pdcBlocked = true;
-                if (sr > 0.0 && static_cast<double>(latencyWaitSamples) >= sr)
-                    publishedLatency.store(reportedActiveLatency.load(std::memory_order_acquire),
-                                           std::memory_order_release);
             }
             else
             {
                 // The host has acknowledged this version (or a later one):
-                // restore the published target and run the sample-based guard.
-                publishedLatency.store(published->groupDelay + (ConvBlockLen - 1),
-                                       std::memory_order_release);
+                // run the sample-based guard before switching.
                 if (latencyGuardVersion != published->version)
                 {
                     latencyGuardVersion = published->version;
                     const int guardByTime = (sr > 0.0) ? static_cast<int>(0.05 * sr) : 0;
                     latencyGuardSamples = std::max(2 * numSamples, guardByTime);
+                    pdcGuardMirror.store(latencyGuardSamples > 0,
+                                         std::memory_order_release);
                 }
 
                 if (latencyGuardSamples > 0)
                 {
                     latencyGuardSamples -= numSamples;
+                    // Stay "guarding" until the design is actually adopted:
+                    // the switch happens on the block AFTER the counter hits
+                    // zero, and the coordinator must not abort in that gap.
+                    pdcGuardMirror.store(true, std::memory_order_release);
                     pdcBlocked = true;
                 }
             }
@@ -1160,6 +1351,20 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
             if (!haveCandidate || missed)
                 warmRebuildRequested.store(true, std::memory_order_release);
         }
+        else if (pdcBlocked)
+        {
+            // The warm is alive (possibly advanced by catch-up) but the PDC
+            // ack has not arrived. If its published target is already behind
+            // the playhead, the coordinator can never start a transition
+            // (it only reports near a FUTURE target). Ask the worker for a
+            // fresh future target so the report/ack cycle can resume.
+            PlanMeta meta;
+            if (readPlanMeta (meta) && meta.version == published->version
+                && meta.target <= historyCount)
+            {
+                warmRebuildRequested.store(true, std::memory_order_release);
+            }
+        }
 
         // No zero-state fallback: a design is published only together with a
         // matching warm state. If the candidate's boundary was missed, keep
@@ -1169,6 +1374,8 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
         {
             const bool sameDelay = activeState != nullptr
                                 && published->groupDelay == activeGroupDelay;
+            const int previousActiveSlot = activeDesignSlot;
+            const int newSlot = localDesignSlot;
 
             if (activeState == nullptr)
             {
@@ -1180,6 +1387,7 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
                 // Both sides share the same time axis: old state continues,
                 // new state starts from the exact warm snapshot.
                 oldState = activeState;
+                oldDesignSlot = activeDesignSlot;
                 oldStates.swap(activeStates);
                 activeStates.swap(warm->states);
                 fadeConvFFTSize = activeConvFFTSize;
@@ -1188,34 +1396,35 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
             else
             {
                 // Different group delay: flushing is the only time-aligned
-                // option. The old design is retired (never destroyed here).
-                if (activeState != nullptr && !retireState(activeState))
-                {
-                    if (deferredDesignRetire == nullptr)
-                        deferredDesignRetire = std::move(activeState);
-                    else
-                    {
-                        warmRebuildRequested.store(true, std::memory_order_release);
-                        buffer.clear();
-                        return true;   // FIR path owns this block; keep it silent
-                    }
-                }
-
+                // option. The old design slot is released below.
                 activeStates.swap(warm->states);
                 oldState = nullptr;
+                oldDesignSlot = -1;
                 crossfadeRemaining = 0;
             }
 
             activeState = published;
+            activeDesignSlot = newSlot;
             activeConvFFTSize = published->convFFTSize;
             activeGroupDelay = published->groupDelay;
             processedVersion = published->version;
+            activeDesignVersion.store(published->version, std::memory_order_release);
             reportedActiveLatency.store(published->groupDelay + (ConvBlockLen - 1),
                                         std::memory_order_release);
-            pendingTargetSample.store(0, std::memory_order_release);
-            pendingAbortVersion.store(-1, std::memory_order_release);
+            pdcGuardMirror.store(false, std::memory_order_release);
 
-            retireWarmSafely(warm);
+            updateAudioDesignMask();
+            if (previousActiveSlot >= 0
+                && previousActiveSlot != activeDesignSlot
+                && previousActiveSlot != oldDesignSlot
+                && previousActiveSlot != localDesignSlot)
+            {
+                releaseDesignSlot(previousActiveSlot);
+            }
+
+            releaseWarm(warm);
+            audioWarmPtr = nullptr;
+            audioWarmTargetSample = 0;
         }
     }
 
@@ -1259,8 +1468,11 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
         crossfadeRemaining = std::max(0, startRemaining - numSamples);
         if (crossfadeRemaining == 0 && oldState != nullptr)
         {
-            if (!retireState(oldState) && deferredDesignRetire == nullptr)
-                deferredDesignRetire = std::move(oldState);
+            const int oldSlot = oldDesignSlot;
+            oldState = nullptr;
+            oldDesignSlot = -1;
+            updateAudioDesignMask();
+            releaseDesignSlot(oldSlot);
         }
     }
     else
@@ -1272,8 +1484,11 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
             crossfadeRemaining = 0;
             if (oldState != nullptr)
             {
-                if (!retireState(oldState) && deferredDesignRetire == nullptr)
-                    deferredDesignRetire = std::move(oldState);
+                const int oldSlot = oldDesignSlot;
+                oldState = nullptr;
+                oldDesignSlot = -1;
+                updateAudioDesignMask();
+                releaseDesignSlot(oldSlot);
             }
         }
 
@@ -1297,28 +1512,83 @@ int FFTProcessor::getLatencySamples() const
 
 int FFTProcessor::getTailLengthSamples() const
 {
-    std::lock_guard<std::mutex> lock(stateMutex);
-    if (currentState == nullptr)
-        return MaxFirLength + ConvBlockLen;
-    return currentState->firLength + ConvBlockLen;
-}
-
-void FFTProcessor::abortPendingPlan() noexcept
-{
-    // The published plan is no longer wanted. Keep the active design (if any)
-    // playing; the audio thread ignores the aborted version and the worker
-    // will publish a fresh plan on the next request.
-    pendingAbortVersion.store(stateVersion.load(std::memory_order_acquire),
-                              std::memory_order_release);
-    pendingTargetSample.store(0, std::memory_order_release);
-    requestRedesign();
+    PlanMeta meta;
+    if (readPlanMeta (meta) && meta.slot >= 0 && meta.slot < NumDesignSlots
+        && meta.version >= minimumPlanVersion.load (std::memory_order_acquire)
+        && meta.epoch == designEpoch.load (std::memory_order_acquire))
+    {
+        return tailSamples (designSlots[meta.slot].state.firLength, ConvBlockLen);
+    }
+    return tailSamples (firActualTaps (MaxFirLength), ConvBlockLen);
 }
 
 //==============================================================================
-std::shared_ptr<const FFTProcessor::FIRState> FFTProcessor::getFirDesignSnapshot() const
+void FFTProcessor::publishFirResponseSnapshot (const FIRState& state)
 {
-    std::lock_guard<std::mutex> lock(stateMutex);
-    return currentState;
+    FirResponseSnapshot snapshot;
+    const double sr = sampleRate.load (std::memory_order_acquire);
+    snapshot.version = state.version;
+    snapshot.groupDelay = state.groupDelay;
+    snapshot.sampleRate = sr;
+    snapshot.count = NumResponsePoints;
+
+    constexpr double fMin = 0.5;
+    constexpr double fMax = 500.0;
+    const double logSpan = std::log (fMax / fMin);
+
+    for (int i = 0; i < NumResponsePoints; ++i)
+    {
+        const double t = static_cast<double> (i)
+                       / static_cast<double> (NumResponsePoints - 1);
+        const double freq = fMin * std::exp (t * logSpan);
+        const double w = juce::MathConstants<double>::twoPi * freq / sr;
+
+        double magDb = -120.0;
+        if (! computeFirMagnitudeDb (state, w, magDb))
+            magDb = -120.0;
+        snapshot.magnitudeDb[i] = static_cast<float> (magDb);
+
+        double phaseDeg = 0.0;
+        snapshot.phaseValid[i] = computeFirPhaseResponseDegrees (state, w, phaseDeg);
+        snapshot.phaseDeg[i] = static_cast<float> (phaseDeg);
+    }
+
+    std::lock_guard<std::mutex> lock (responseSnapshotMutex);
+
+    // Never evict the snapshot for the design that is actually audible: a
+    // burst of automation while PDC adoption is blocked could otherwise make
+    // the GUI fall back to the IIR curve.
+    const int activeVersion = activeDesignVersion.load (std::memory_order_acquire);
+    int target = responseSnapshotNext;
+    for (int i = 0; i < NumResponseSnapshots; ++i)
+    {
+        const int candidate = (responseSnapshotNext + i) % NumResponseSnapshots;
+        if (responseSnapshots[candidate].version != activeVersion)
+        {
+            target = candidate;
+            break;
+        }
+    }
+
+    responseSnapshots[target] = snapshot;
+    responseSnapshotNext = (target + 1) % NumResponseSnapshots;
+}
+
+bool FFTProcessor::getFirResponseSnapshot (FirResponseSnapshot& out, int version) const
+{
+    if (version <= 0)
+        return false;
+
+    std::lock_guard<std::mutex> lock (responseSnapshotMutex);
+    for (int i = 0; i < NumResponseSnapshots; ++i)
+    {
+        if (responseSnapshots[i].version == version)
+        {
+            out = responseSnapshots[i];
+            return true;
+        }
+    }
+    return false;
 }
 
 bool FFTProcessor::computeFirPhaseResponseDegrees(const FIRState& state,

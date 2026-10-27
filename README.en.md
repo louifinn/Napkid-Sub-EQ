@@ -46,7 +46,7 @@ It is particularly well suited to:
 - **24/60 dB spectrum axis (v0.5.0)**: 60 dB full range by default; the legend chip switches to a 24 dB zoom aligned with the EQ grid
 - **Convenient interaction**: click to create, drag to move, right-click to delete, scroll wheel to adjust Q (drag vertically to adjust Q for HP/LP/Notch/BP)
 - **Double-click reset**: Bell/Shelf/Tilt reset gain and Q to zero on double-click; HP/LP/Notch/BP only reset Q
-- **ASIO support**: low-latency audio interface compatibility
+- **ASIO (optional)**: disabled by default (`JUCE_ASIO=0`); enable it and configure the SDK yourself. WASAPI/DirectSound are unaffected.
 
 ---
 
@@ -180,6 +180,14 @@ Sub EQ/
 │   ├── SubEQ_NodeInteraction.h      # gain-sensitive types/type-switch reset/logarithmic Q stepping (shared pure computation)
 │   ├── SubEQ_Spring.h               # second-order spring integrator (shared pure computation)
 │   ├── SubEQ_FilterType.h           # FilterType enum + int↔enum mapping (shared pure computation)
+│   ├── SubEQ_OutputStage.h          # post master-gain ramp / latency-compensated bypass (shared pure computation)
+│   ├── SubEQ_FIRHistory.h           # T2 captured/committed input history ring
+│   ├── SubEQ_FIRSwitchState.h       # warm boundary / crossfade pure policy
+│   ├── SubEQ_WarmPlan.h             # host-block-aligned warm target planning (shared pure computation)
+│   ├── SubEQ_OlaBank.h              # exact-boundary OLA warm synthesis (shared pure computation)
+│   ├── SubEQ_FirResolution.h        # FIR resolution assessment (shared pure computation)
+│   ├── SubEQ_LatencyMath.h          # FIR taps/group delay/pipeline latency conversion
+│   ├── SubEQ_LatencyCoordinator.h   # bounded PDC transition state machine
 │   └── SubEQ_Editor/
 │       ├── SubEQLookAndFeel.h       # window/node/grid layout constants (legacy colours removed)
 │       ├── FrequencyResponse.h/.cpp # response curve drawing and node interaction
@@ -187,9 +195,10 @@ Sub EQ/
 │       ├── ModeSelector.h/.cpp      # bottom mode-selection panel (new in v0.2.0)
 │       └── DesignSystem/            # liquid-glass design system (colours/fonts/animation/glass effects/LookAndFeel)
 │   └── Fonts/                       # embedded Inter Regular/Bold (SIL OFL 1.1, compiled into BinaryData via the jucer resources)
+├── Tests/                           # 642 offline regression checks + JUCE runtime integration (66) + real VST3 bundle load (23)
 ├── Builds/VisualStudio2022/         # VS project output directory (gitignored)
 ├── Napkid Sub EQ.jucer              # Projucer project file
-└── README.md                        # Chinese README (this file is its English translation, README.en.md)
+└── README.md                        # Chinese README (this file is its English translation)
 ```
 
 ---

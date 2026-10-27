@@ -48,7 +48,7 @@ public:
     static_assert (static_cast<double> (RangeDb) == -kDisplayFloorDb,
                    "RangeDb mirror must stay exact and match the display floor");
 
-    static constexpr int NumResolutionLevels = 3;            // Fast / Balanced / Fine
+    static constexpr int NumResolutionLevels = VQTNumResolutionLevels;   // Fast / Balanced / Fine
     static constexpr int NumKernelSets = kNumWindowTypes * kNumBandDensities
                                        * NumResolutionLevels; // 24
 
@@ -56,7 +56,10 @@ public:
 
     // 构建本采样率下的全部核组合与抽取级联系数。
     // 仅 setup 线程（prepareToPlay）调用：内部分配并执行 O(N) 三角函数。
-    void prepare(double sampleRate);
+    // bank 非空且采样率匹配时直接共享该不可变内核库（输入/输出分析器共用
+    // 一份窗表/核/FFT twiddle，省掉整份重复内存）；空则自建私有副本。
+    void prepare(double sampleRate,
+                 const std::shared_ptr<const VQTKernelBank>& bank = {});
 
     // 运行时重配置（音频线程安全：只切指针、写普通整数与预分配缓冲——
     // 不分配、不加锁）。resolutionIndex: 0=Fast, 1=Balanced, 2=Fine；
@@ -72,10 +75,9 @@ public:
     // Push audio samples (called from audio thread)
     void process(const float* samples, int numSamples);
 
-    // Copy spectrum data to output buffer (called from GUI thread). Band
-    // count and data are read element-wise through atomics; a generation
-    // counter retries if a reconfiguration lands inside the copy window, so
-    // the GUI cannot observe a mixed old/new frame.
+    // Copy a complete spectrum frame to the GUI. Audio publishes immutable
+    // frames through a three-buffer seqlock; the GUI never sees a mixed
+    // half-updated frame or a half-cleared reset frame.
     int getSpectrum(float* outputBands) const;
 
     // Clear ring/envelope/display state without changing the configuration.
@@ -88,24 +90,28 @@ public:
     // where processBlock may never run to consume the audio-thread reset flag.
     void resetPublishedDisplay() noexcept
     {
-        generation.fetch_add(1, std::memory_order_release);
-        for (int i = 0; i < MaxBands; ++i)
-            bandData[i].store(-RangeDb, std::memory_order_relaxed);
-        generation.fetch_add(1, std::memory_order_release);
+        // Show the floor until the audio thread publishes a frame from a new
+        // reset epoch. Never writes the audio-owned frames from the GUI.
+        floorUntilResetEpoch.store (resetEpoch.load (std::memory_order_acquire) + 1,
+                                    std::memory_order_release);
     }
 
 private:
     void pushTierSample(int tier, double sample);
     void analyzeTier(int tier);
     void resetRuntimeState();
+    void publishFrame() noexcept;
     int kernelSetIndex(int resolutionIndex, int bandCount, WindowType window) const noexcept;
+    const std::vector<VQTKernelSet>& kernelSetList() const noexcept
+    {
+        return kernelBank != nullptr ? kernelBank->sets : kernelSets;
+    }
 
     double sampleRate = 48000.0;
 
     // Runtime config (atomic: written by configure() on the audio thread,
     // read by the GUI thread via the getters)
     std::atomic<int> numBands { 61 };
-    std::atomic<uint32_t> generation { 0 };   // configuration/reset generation
     std::atomic<int> hopSize  { 512 };  // ~10.7 ms @48kHz（顶层步距）
 
     // 音频线程用的非原子镜像（与 configure() 同线程）
@@ -114,8 +120,11 @@ private:
     WindowType lastWindow = WindowType::BlackmanHarris;
     const VQTKernelSet* activeSet = nullptr;   // 24 个预生成组合之一（或未 prepare）
 
-    // 核组合表：[window][density（kBandsByDensity 下标）][resolution]，prepare() 全量构建
+    // 核组合表：[window][density（kBandsByDensity 下标）][resolution]，prepare() 全量构建。
+    // kernelBank 非空时使用共享库，kernelSets 为空。
+    std::shared_ptr<const VQTKernelBank> kernelBank;
     std::vector<VQTKernelSet> kernelSets;
+    TwiddleBank<double> twiddleBank;   // private fallback when no shared bank
 
     // ---- 抽取链 + 各层运行时状态（全部在 prepare() 按最大尺寸分配）----
     // 级数来源：顶层降采样指数上限 + 每层向下再 ÷2 的 9 级（见
@@ -146,8 +155,20 @@ private:
     double dcPole = 0.0;
     double dcState = 0.0;
 
-    // Spectrum output (atomic for thread safety)
-    std::atomic<float> bandData[MaxBands];
+    // Three-buffer spectrum frames. Audio writes a back frame, publishes its
+    // index, and never writes the frame the GUI is currently reading.
+    struct SpectrumFrame
+    {
+        std::atomic<uint32_t> seq { 0 };
+        uint32_t resetEpoch = 0;
+        int bands = 0;
+        float values[MaxBands] {};
+    };
+    SpectrumFrame frames[3];
+    std::atomic<uint32_t> readyFrame { 0 };
+    std::atomic<uint32_t> resetEpoch { 1 };
+    std::atomic<uint32_t> floorUntilResetEpoch { 0 };
+    double displayBands[MaxBands] {};   // audio-thread source for the next frame
 
     // 显示平滑管线状态（v0.4.1，功率域——v0.4.0 的 dB 域包络已废弃；v0.4.2
     // 裁定起全程 double，仅在原子发布边界收窄到 float，与离线原型精度一致）：

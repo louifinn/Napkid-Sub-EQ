@@ -72,7 +72,10 @@ inline uint64_t warmLeadSamples(double sampleRate,
                          + std::max(0.0, slackSeconds);
     const uint64_t byTime = static_cast<uint64_t>(seconds * sr);
     const uint64_t byBlock = static_cast<uint64_t>(std::max(1, hostBlockSamples)) * 2u;
-    return std::max<uint64_t>(byTime, byBlock);
+    const uint64_t maxLead = static_cast<uint64_t>(0.35 * sr);
+    // Clamp runaway EWMA; still guarantee at least two host blocks of lead.
+    return std::min<uint64_t>(std::max<uint64_t>(byTime, byBlock),
+                              std::max<uint64_t>(maxLead, byBlock));
 }
 
 } // namespace SubEQ

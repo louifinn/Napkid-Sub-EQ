@@ -7,6 +7,7 @@
 */
 
 #include "PluginProcessor.h"
+#include "SubEQ_LatencyMath.h"
 #include "PluginEditor.h"
 
 #include <functional>
@@ -72,11 +73,32 @@ void SubEQAudioProcessor::timerCallback()
     // message queue lock, which must not happen on the audio thread.
     if (latencyDirty.exchange (false))
     {
+        // Capture the ack epoch before reading the request. If an abort lands
+        // between the read and the ack, acknowledgeLatency's epoch check
+        // rejects the superseded request; retry with the newer request then.
+        const uint64_t epoch = fftProcessor.getLatencyAckEpoch();
         const uint64_t packed = latencyRequest.load (std::memory_order_acquire);
+
+        if (fftProcessor.getLatencyAckEpoch() != epoch)
+        {
+            latencyDirty.store (true, std::memory_order_release);
+            return;
+        }
+
         const int desired = static_cast<int> (static_cast<int32_t> (packed & 0xffffffffu));
         const int version = static_cast<int> (static_cast<int32_t> (packed >> 32));
+
+        // Ack first: if an abort landed, the CAS fails and we must NOT tell the
+        // host a latency whose switch was cancelled. The 50 ms guard starts at
+        // the ack, so setLatencySamples (below) still lands well before the
+        // audio switches.
+        if (! fftProcessor.acknowledgeLatency (version, epoch))
+        {
+            latencyDirty.store (true, std::memory_order_release);
+            return;
+        }
+
         setLatencySamples (desired);
-        fftProcessor.acknowledgeLatency (version);
     }
 }
 
@@ -143,10 +165,10 @@ double SubEQAudioProcessor::getTailLengthSeconds() const
     return static_cast<double> (taps + SubEQ::FFTProcessor::ConvBlockLen) / sr;
 }
 
-std::shared_ptr<const SubEQ::FFTProcessor::FIRState>
-SubEQAudioProcessor::getFirDesignSnapshot() const
+bool SubEQAudioProcessor::getFirResponseSnapshot(
+    SubEQ::FFTProcessor::FirResponseSnapshot& out, int version) const
 {
-    return fftProcessor.getFirDesignSnapshot();
+    return fftProcessor.getFirResponseSnapshot (out, version);
 }
 
 int SubEQAudioProcessor::getFirDesignVersion() const
@@ -184,7 +206,6 @@ void SubEQAudioProcessor::changeProgramName (int index, const juce::String& newN
 void SubEQAudioProcessor::requestLatencyReport(int version, int latency) noexcept
 {
     reportedLatency.store (latency);
-    pendingLatencyVersion.store (version);
     const uint64_t packed = (static_cast<uint64_t> (static_cast<uint32_t> (version)) << 32)
                           | static_cast<uint64_t> (static_cast<uint32_t> (latency));
     latencyRequest.store (packed, std::memory_order_release);
@@ -198,16 +219,14 @@ int SubEQAudioProcessor::nominalLatencySamples() const noexcept
                          : static_cast<int> (SubEQ::EQMode::ZeroLatency);
     if (mode == static_cast<int> (SubEQ::EQMode::ZeroLatency))
         return 0;
-    if (mode == static_cast<int> (SubEQ::EQMode::MinimumPhase))
-        return SubEQ::FFTProcessor::ConvBlockLen - 1;
 
     const int choice = firLengthParam != nullptr
                            ? juce::roundToInt (firLengthParam->load())
                            : 0;
     const int index = juce::jlimit (0, SubEQ::FFTProcessor::NumFirLengthChoices - 1, choice);
     const int nominal = SubEQ::FFTProcessor::FirLengthChoices[index];
-    const int taps = std::max (1, nominal - 1);         // Type-I
-    return (taps - 1) / 2 + SubEQ::FFTProcessor::ConvBlockLen - 1;
+    return SubEQ::pipelineLatency (mode, nominal,
+                                   SubEQ::FFTProcessor::ConvBlockLen);
 }
 
 void SubEQAudioProcessor::delayIirPath(juce::AudioBuffer<float>& buffer,
@@ -283,9 +302,7 @@ void SubEQAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
         // First FIR entry is handled by the near-target coordinator; do not
         // mute the session start (offline in particular must start audible).
         switchGateHoldSamples = 0;
-        latencyTransitionActive = false;
-        latencyAbortCooldownSamples = 0;
-        latencyAbortVersion = -1;
+        latencyCoordinator.reset();
     }
     switchGateStep = 1.0f / static_cast<float> (std::max (1.0, 0.005 * sampleRate));
     firEntryFadeRemaining = 0;
@@ -295,8 +312,13 @@ void SubEQAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     // already resets it when the sample rate/channel count changes, and
     // dropping an active design here would force a needless re-warm + PDC
     // handshake on every transport stop/start.
-    spectrumAnalyzer.prepare (sampleRate);
-    inputAnalyzer.prepare (sampleRate);
+    // One immutable kernel/twiddle bank per sample rate, shared by the input
+    // and output analyzers (identical tables; building both duplicated tens of
+    // MB of window/kernel data).
+    if (vqtKernelBank == nullptr || vqtKernelBank->sampleRate != sampleRate)
+        vqtKernelBank = SubEQ::buildVQTKernelBank (sampleRate);
+    spectrumAnalyzer.prepare (sampleRate, vqtKernelBank);
+    inputAnalyzer.prepare (sampleRate, vqtKernelBank);
     // 不强制 currentMode/eqModeCache 归零：同会话重复 prepare 时 eq_mode
     // 参数未变，若清空缓存，updateEQParameters 会误报“模式变化”，触发一次
     // 多余的 FIR 重设计并在发布时冲刷卷积尾（播放中出现输出跳变）。仅当
@@ -304,6 +326,7 @@ void SubEQAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     modeChanged = false;
     eqParamsChanged = false;
     lastRequestedDesignVersion = -1;
+    firActiveMirror.store (false, std::memory_order_release);
     updateEQParameters();
     // Keep lastMode from the previous session: if updateEQParameters()
     // detected a real mode change, the first processBlock must see the old
@@ -420,6 +443,7 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
 {
     juce::ScopedNoDenormals noDenormals;
     juce::ignoreUnused (midiMessages);
+    hasProcessedAudio.store (true, std::memory_order_release);
 
     auto totalNumInputChannels  = getTotalNumInputChannels();
     auto totalNumOutputChannels = getTotalNumOutputChannels();
@@ -473,14 +497,13 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
 
         if (mode == SubEQ::EQMode::ZeroLatency)
         {
-            // Leaving FIR: flush its OLA state and restore the IIR chain. The
-            // IIR engine was not advanced while FIR was active, so reset it.
-            // Mute immediately before changing the time axis: a 5 ms fade
-            // after the switch would leak mistimed audio.
+            // Leaving FIR: flush its OLA state and fall back to the IIR chain.
+            // The always-on IIR shadow kept the engine current during FIR, so
+            // no biquad reset is needed. Mute immediately before changing the
+            // time axis: a 5 ms fade after the switch would leak mistimed audio.
             const bool leavingFir = reportedLatency.load() != 0;
             fftProcessor.resetConvolution();
-            eqEngine.reset();
-            latencyTransitionActive = false;
+            latencyCoordinator.reset();
 
             iirPathLatency = 0;
             if (leavingFir)
@@ -527,104 +550,74 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     if (spectrumEditorCount.load() > 0 && totalNumInputChannels > 0)
         inputAnalyzer.process (buffer.getReadPointer (0), buffer.getNumSamples());
 
-    // Bounded latency coordinator. It starts only when the pending plan's
+    // Bounded latency coordinator (pure state machine in
+    // SubEQ_LatencyCoordinator.h). It starts only when the pending plan's
     // target is close; the old path stays audible for the whole warm-build
     // lead. If the target is missed or the transition exceeds the deadline,
     // abort the candidate and restore the active latency — never gate forever.
-    const int designVersion = fftProcessor.getDesignVersion();
-    const int publishedL = fftProcessor.getPublishedLatencySamples();
-    const uint64_t pendingTarget = fftProcessor.getPendingTargetSample();
-    const uint64_t committed = fftProcessor.getCommittedSampleCount();
-    const int hostBlock = std::max (1, buffer.getNumSamples());
-    const double srForGate = getSampleRate() > 0.0 ? getSampleRate() : 48000.0;
-    const int nearWindowSamples = static_cast<int> (
-        std::max (0.10 * srForGate, 2.0 * hostBlock));
-    const int transitionMarginSamples = static_cast<int> (
-        std::max (0.12 * srForGate, 2.0 * hostBlock));
-    const int transitionHardCapSamples = static_cast<int> (
-        std::max (0.60 * srForGate, 8.0 * hostBlock));
-
-    if (latencyAbortCooldownSamples > 0)
-        latencyAbortCooldownSamples -= buffer.getNumSamples();
-
-    const bool canTransition = (mode != SubEQ::EQMode::ZeroLatency)
-                            && !isNonRealtime()
-                            && publishedL > 0
-                            && publishedL != iirPathLatency
-                            && latencyAbortCooldownSamples <= 0
-                            && latencyAbortVersion != designVersion;
-
-    if (canTransition && pendingTarget > committed
-        && (pendingTarget - committed) <= static_cast<uint64_t>(nearWindowSamples)
-        && !latencyTransitionActive
-        && latencyAbortVersion != designVersion)
+    SubEQ::LatencyCoordinator::BlockInput latencyInput;
+    latencyInput.hostBlockSamples = std::max (1, buffer.getNumSamples());
+    latencyInput.sampleRate = getSampleRate() > 0.0 ? getSampleRate() : 48000.0;
+    latencyInput.firMode = (mode != SubEQ::EQMode::ZeroLatency);
+    latencyInput.nonRealtime = isNonRealtime();
+    latencyInput.activeBridgeLatency = iirPathLatency;
+    // Read a stable (plan, target) pair: the worker stores the target before
+    // the packed plan, so a plan re-read catches a publication that landed
+    // between our two loads. Unstable after a retry: skip this block's
+    // transition rather than pair v8's target with v7's latency.
+    int planVersion = 0;
+    int planLatency = 0;
+    bool planWarmReady = false;
+    uint64_t planTarget = 0;
+    for (int attempt = 0; attempt < 2; ++attempt)
     {
-        latencyTransitionActive = true;
-        latencyTransitionVersion = designVersion;
-        latencyTransitionTargetLatency = publishedL;
-        latencyTransitionElapsedSamples = 0;
-        latencyTransitionTotalSamples = 0;
-        latencyTransitionLastTarget = pendingTarget;
-        latencyTransitionDeadlineSamples = static_cast<int> (
-            std::min<uint64_t>(static_cast<uint64_t>(transitionHardCapSamples),
-                               (pendingTarget - committed)
-                                   + static_cast<uint64_t>(transitionMarginSamples)));
-        latencyTransitionReported = false;
+        fftProcessor.getPublishedPlan (planVersion, planLatency, planWarmReady);
+        planTarget = fftProcessor.getPendingTargetSample();
+
+        int recheckVersion = 0;
+        int recheckLatency = 0;
+        bool recheckWarmReady = false;
+        fftProcessor.getPublishedPlan (recheckVersion, recheckLatency, recheckWarmReady);
+
+        if (recheckVersion == planVersion && recheckLatency == planLatency)
+            break;
+
+        if (attempt == 1)
+        {
+            planVersion = 0;
+            planLatency = 0;
+            planWarmReady = false;
+            planTarget = 0;
+        }
     }
 
-    if (latencyTransitionActive)
-    {
-        latencyTransitionElapsedSamples += buffer.getNumSamples();
-        latencyTransitionTotalSamples += buffer.getNumSamples();
+    latencyInput.pendingTarget = planTarget;
+    latencyInput.committed = fftProcessor.getCommittedSampleCount();
+    latencyInput.designVersion = planVersion;
+    latencyInput.publishedLatency = planLatency;
+    latencyInput.guardActive = fftProcessor.isPdcGuardActive();
+    latencyInput.warmReady = planWarmReady;
 
-        // The worker may publish a fresh warm target after a miss. Extend the
-        // deadline for that target rather than aborting at the old one.
-        if (pendingTarget != latencyTransitionLastTarget
-            && pendingTarget > committed)
-        {
-            latencyTransitionLastTarget = pendingTarget;
-            latencyTransitionElapsedSamples = 0;
-            latencyTransitionDeadlineSamples = static_cast<int> (
-                std::min<uint64_t>(static_cast<uint64_t>(transitionHardCapSamples),
-                                   (pendingTarget - committed)
-                                       + static_cast<uint64_t>(transitionMarginSamples)));
-        }
+    const auto latencyDecision = latencyCoordinator.evaluate (latencyInput);
 
-        if (!latencyTransitionReported)
-        {
-            requestLatencyReport (latencyTransitionVersion,
-                                  latencyTransitionTargetLatency);
-            latencyTransitionReported = true;
-        }
-
-        const bool missed = pendingTarget == 0
-                         || pendingTarget < committed;
-        const bool expired = latencyTransitionElapsedSamples
-                             > latencyTransitionDeadlineSamples
-                          || latencyTransitionTotalSamples
-                             > transitionHardCapSamples;
-        if (missed || expired)
-        {
-            // Keep the design, ask the worker for a fresh warm target, restore
-            // the active latency and open the gate. Report the old latency
-            // with an invalid version so the timer cannot acknowledge the
-            // still-pending design; it must be reported again when the new
-            // target is near.
-            fftProcessor.requestWarmRebuild();
-            fftProcessor.invalidateLatencyAck();
-            requestLatencyReport (0, iirPathLatency);
-            latencyTransitionActive = false;
-            latencyAbortVersion = -1;
-            latencyAbortCooldownSamples = static_cast<int> (
-                std::max (0.02 * srForGate, 1.0 * hostBlock));
-            switchGateHoldSamples = static_cast<int> (
-                std::max (1.0, 0.01 * srForGate));
-        }
-    }
+    // On abort: request a fresh warm target, then report the restored latency
+    // BEFORE invalidating the ack. The report updates latencyRequest first;
+    // a timer that observes the new ack epoch is then guaranteed to see the
+    // new (version 0) request instead of acknowledging the superseded design.
+    if (latencyDecision.requestWarmRebuild)
+        fftProcessor.requestWarmRebuild();
+    if (latencyDecision.reportLatency)
+        requestLatencyReport (latencyDecision.reportVersion,
+                              latencyDecision.reportSamples);
+    if (latencyDecision.invalidateAck)
+        fftProcessor.invalidateLatencyAck();
+    if (latencyDecision.gateHoldSamples > 0)
+        switchGateHoldSamples = latencyDecision.gateHoldSamples;
 
     // Process audio based on current mode
     if (mode == SubEQ::EQMode::ZeroLatency)
     {
+        firActiveMirror.store (false, std::memory_order_release);
         // IIR node chain, in place, advanced in 32-sample sub-blocks so node
         // enable/coefficient ramps are sample-rate independent of host blocks.
         float* channelPtrs[SubEQ::EQNode::MaxChannels] = {};
@@ -642,7 +635,9 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         // buffer; keep the IIR path alive so switching to FIR never mutes the
         // plugin for the warm-up period.
         const bool wasActive = fftProcessor.hasActiveDesign();
+        fftProcessor.setHostLatency (iirPathLatency);
         const bool firActive = fftProcessor.process (buffer);
+        firActiveMirror.store (firActive, std::memory_order_release);
         const int nch = std::min (totalNumInputChannels, SubEQ::EQNode::MaxChannels);
 
         // Update the bridge latency before the entry crossfade: both paths must
@@ -651,17 +646,38 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         if (firActive && activeL > 0)
         {
             iirPathLatency = activeL;
-            if (latencyTransitionActive
-                && activeL == latencyTransitionTargetLatency)
-            {
-                latencyTransitionActive = false;
-                switchGateHoldSamples = static_cast<int> (
-                    std::max (1.0, 0.02 * (getSampleRate() > 0.0
-                                               ? getSampleRate() : 48000.0)));
-            }
+
+            int completionHold = 0;
+            if (latencyCoordinator.notifyActiveLatency (
+                    activeL, latencyInput.sampleRate, completionHold))
+                switchGateHoldSamples = completionHold;
         }
 
-        if (!firActive)
+        // Always-on IIR shadow: the same engine advances on the raw input in
+        // FIR mode, so ZL<->FIR never needs a biquad reset and the bridge is
+        // always time-aligned. In ZL / not-yet-FIR mode its output is audible.
+        const bool haveShadow = haveDryCopy && nch > 0
+                             && buffer.getNumSamples() <= transitionBuffer.getNumSamples();
+        if (haveShadow)
+        {
+            for (int ch = 0; ch < nch; ++ch)
+                transitionBuffer.copyFrom (ch, 0, dryInput, ch, 0,
+                                           buffer.getNumSamples());
+
+            float* transitionPtrs[SubEQ::EQNode::MaxChannels] = {};
+            for (int ch = 0; ch < nch; ++ch)
+                transitionPtrs[ch] = transitionBuffer.getWritePointer (ch);
+            eqEngine.processChannels (transitionPtrs, nch, buffer.getNumSamples());
+            delayIirPath (transitionBuffer, nch, buffer.getNumSamples());
+
+            if (!firActive)
+            {
+                for (int ch = 0; ch < nch; ++ch)
+                    buffer.copyFrom (ch, 0, transitionBuffer, ch, 0,
+                                     buffer.getNumSamples());
+            }
+        }
+        else if (!firActive)
         {
             float* channelPtrs[SubEQ::EQNode::MaxChannels] = {};
             for (int ch = 0; ch < nch; ++ch)
@@ -669,27 +685,14 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
             eqEngine.processChannels (channelPtrs, nch, buffer.getNumSamples());
             delayIirPath (buffer, nch, buffer.getNumSamples());
         }
-        else
+
+        if (firActive)
         {
-            if (!wasActive && haveDryCopy && nch > 0)
+            if (!wasActive && haveShadow)
                 firEntryFadeRemaining = 1024;
 
-            if (firEntryFadeRemaining > 0 && haveDryCopy && nch > 0
-                && buffer.getNumSamples() <= transitionBuffer.getNumSamples())
+            if (firEntryFadeRemaining > 0 && haveShadow)
             {
-                // First FIR adoption: crossfade from the latency-aligned IIR
-                // bridge to the new FIR state. Both paths have the same
-                // nominal latency, so this is a pure response crossfade.
-                for (int ch = 0; ch < nch; ++ch)
-                    transitionBuffer.copyFrom (ch, 0, dryInput, ch, 0,
-                                               buffer.getNumSamples());
-
-                float* transitionPtrs[SubEQ::EQNode::MaxChannels] = {};
-                for (int ch = 0; ch < nch; ++ch)
-                    transitionPtrs[ch] = transitionBuffer.getWritePointer (ch);
-                eqEngine.processChannels (transitionPtrs, nch, buffer.getNumSamples());
-                delayIirPath (transitionBuffer, nch, buffer.getNumSamples());
-
                 const int numSamples = buffer.getNumSamples();
                 for (int n = 0; n < numSamples; ++n)
                 {
@@ -716,16 +719,18 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     if (mode == SubEQ::EQMode::ZeroLatency)
     {
         if (reportedLatency.load() != 0)
-            requestLatencyReport (designVersion, 0);
+            requestLatencyReport (latencyInput.designVersion, 0);
     }
     else if (isNonRealtime())
     {
-        const int desiredLatency = publishedL > 0 ? publishedL : iirPathLatency;
+        const int desiredLatency = latencyInput.publishedLatency > 0
+                                       ? latencyInput.publishedLatency
+                                       : iirPathLatency;
         if (desiredLatency != reportedLatency.load()
-            || designVersion != lastRequestedDesignVersion)
+            || latencyInput.designVersion != lastRequestedDesignVersion)
         {
-            requestLatencyReport (designVersion, desiredLatency);
-            lastRequestedDesignVersion = designVersion;
+            requestLatencyReport (latencyInput.designVersion, desiredLatency);
+            lastRequestedDesignVersion = latencyInput.designVersion;
         }
     }
 
@@ -749,7 +754,7 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     // 5 ms and holds silence for the handshake; it never lets mistimed audio
     // reach the host.
     {
-        bool pending = latencyTransitionActive;
+        bool pending = latencyCoordinator.isActive();
         if (!isNonRealtime() && switchGateHoldSamples > 0)
         {
             switchGateHoldSamples -= buffer.getNumSamples();
@@ -849,17 +854,15 @@ void SubEQAudioProcessor::setStateInformation (const void* data, int sizeInBytes
             ranged->setValueNotifyingHost (ranged->getDefaultValue());
     }
 
-    if (stateVersion < 2)
-    {
-        // v1: spectrum_fft_size used the pre-0.4.0 "FFT size" semantics; the
-        // parameter is now a resolution choice and its index is retained.
-    }
+    // v3 is current. The missing-parameter loop above is the active migration
+    // for v1/v2 sessions; semantic choice-index migrations remain versioned
+    // here when a future session format requires them.
+    juce::ignoreUnused (stateVersion);
 
     // Do not write modeChanged/eqParamsChanged/lastRequestedDesignVersion from
     // the message thread: those are audio-thread caches. updateEQParameters()
     // detects the parameter differences on the next block and applies the
     // change without an unconditional biquad reset/gate.
-    stateEpoch.fetch_add (1, std::memory_order_release);
 }
 
 //==============================================================================

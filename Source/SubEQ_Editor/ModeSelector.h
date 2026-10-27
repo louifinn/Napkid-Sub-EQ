@@ -12,6 +12,82 @@
 #include "../SubEQ_FFTProcessor.h"
 #include "SubEQLookAndFeel.h"
 
+// ComboBox whose accessibility name is the field caption instead of the
+// current value (JUCE's handler returns getText(), so setTitle() is ignored).
+// The role/actions/value interface mirror JUCE's own combo handler.
+class CaptionedComboBox final : public juce::ComboBox
+{
+public:
+    void setAccessibilityCaption (juce::String caption)
+    {
+        accessibilityCaption = std::move (caption);
+    }
+    const juce::String& getAccessibilityCaption() const noexcept
+    {
+        return accessibilityCaption;
+    }
+
+    std::unique_ptr<juce::AccessibilityHandler> createAccessibilityHandler() override
+    {
+        class Handler final : public juce::AccessibilityHandler
+        {
+        private:
+            class Value final : public juce::AccessibilityTextValueInterface
+            {
+            public:
+                explicit Value (CaptionedComboBox& box) : combo (box) {}
+                bool isReadOnly() const override  { return true; }
+                juce::String getCurrentValueAsString() const override
+                {
+                    return combo.getText();
+                }
+                void setValueAsString (const juce::String&) override {}
+
+            private:
+                CaptionedComboBox& combo;
+            };
+
+        public:
+            explicit Handler (CaptionedComboBox& box)
+                : AccessibilityHandler (
+                      box,
+                      juce::AccessibilityRole::comboBox,
+                      juce::AccessibilityActions()
+                          .addAction (juce::AccessibilityActionType::press,
+                                      [&box] { box.showPopup(); })
+                          .addAction (juce::AccessibilityActionType::showMenu,
+                                      [&box] { box.showPopup(); }),
+                      Interfaces { std::make_unique<Value> (box) }),
+                  combo (box)
+            {
+            }
+
+            juce::String getTitle() const override
+            {
+                return combo.getAccessibilityCaption();
+            }
+            juce::String getHelp() const override
+            {
+                return combo.getTooltip();
+            }
+            juce::AccessibleState getCurrentState() const override
+            {
+                auto state = AccessibilityHandler::getCurrentState().withExpandable();
+                return combo.isPopupActive() ? state.withExpanded()
+                                             : state.withCollapsed();
+            }
+
+        private:
+            CaptionedComboBox& combo;
+        };
+
+        return std::make_unique<Handler> (*this);
+    }
+
+private:
+    juce::String accessibilityCaption;
+};
+
 class ModeSelector : public juce::Component,
                      private juce::Timer,
                      private juce::AudioProcessorValueTreeState::Listener
@@ -26,20 +102,21 @@ public:
 
     void resized() override;
     void paint (juce::Graphics& g) override;
+    void visibilityChanged() override;
 
 private:
     void timerCallback() override;
     void refreshLatencyLabel();
 
     juce::AudioProcessorValueTreeState& apvts;
-    juce::ComboBox modeBox;
-    juce::ComboBox firLengthBox;
-    juce::ComboBox resolutionBox;   // spectrum VQT resolution（核长尺度）
-    juce::ComboBox windowBox;       // spectrum analysis window family
-    juce::ComboBox densityBox;      // spectrum band density
-    juce::ComboBox refreshBox;      // spectrum refresh rate
-    juce::ComboBox hopBox;          // spectrum analysis hop
-    juce::ComboBox smoothingBox;    // spectrum display smoothing（v0.4.1，功率域段间平滑）
+    CaptionedComboBox modeBox;
+    CaptionedComboBox firLengthBox;
+    CaptionedComboBox resolutionBox;   // spectrum VQT resolution（核长尺度）
+    CaptionedComboBox windowBox;       // spectrum analysis window family
+    CaptionedComboBox densityBox;      // spectrum band density
+    CaptionedComboBox refreshBox;      // spectrum refresh rate
+    CaptionedComboBox hopBox;          // spectrum analysis hop
+    CaptionedComboBox smoothingBox;    // spectrum display smoothing（v0.4.1，功率域段间平滑）
     juce::Label modeLabel;
     juce::Label firLabel;
     juce::Label resolutionLabel;
@@ -69,8 +146,8 @@ private:
     // 析构、boxForParameter 与 resized 五处全部遍历该表（STD-06）。
     struct SpectrumControl
     {
-        juce::ComboBox ModeSelector::* box;
-        juce::Label    ModeSelector::* label;
+        CaptionedComboBox ModeSelector::* box;
+        juce::Label        ModeSelector::* label;
         const char* labelText;
         const char* tooltip;
         juce::StringArray items;
@@ -80,8 +157,8 @@ private:
     static const SpectrumControl* spectrumControlTable (int& count) noexcept;
 
     // 表项 → 本实例控件
-    juce::ComboBox& spectrumBox   (const SpectrumControl& c) noexcept { return this->*(c.box); }
-    juce::Label&    spectrumLabel (const SpectrumControl& c) noexcept { return this->*(c.label); }
+    CaptionedComboBox& spectrumBox (const SpectrumControl& c) noexcept { return this->*(c.box); }
+    juce::Label&       spectrumLabel (const SpectrumControl& c) noexcept { return this->*(c.label); }
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ModeSelector)
 };

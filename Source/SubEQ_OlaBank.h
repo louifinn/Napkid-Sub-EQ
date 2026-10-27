@@ -40,7 +40,7 @@ inline bool olaSynthesizeOverlap(const FirHistoryRing& history, int channel,
 {
     const int N = firLength;
     const int L = convFFTSize;
-    if (N <= 0 || L < M || freqCoeffs == nullptr
+    if (N <= 0 || L < M || L < N + M - 1 || freqCoeffs == nullptr
         || static_cast<int>(inputScratch.size()) < N
         || static_cast<int>(scratch.size()) < L
         || static_cast<int>(state.overlap.size()) < L)
@@ -127,7 +127,8 @@ inline bool olaSynthesizeAt(const FirHistoryRing& history, int channel,
                             std::vector<std::complex<double>>& scratch)
 {
     if (M <= 0 || firLength <= 0
-        || convFFTSize < M || freqCoeffs == nullptr
+        || convFFTSize < M || convFFTSize < firLength + M - 1
+        || freqCoeffs == nullptr
         || static_cast<int>(inputScratch.size()) < std::max(firLength, M)
         || static_cast<int>(dummyOutput.size()) < M
         || static_cast<int>(scratch.size()) < convFFTSize

@@ -44,7 +44,7 @@ Napkid Sub EQ 是一款专为低频信号处理设计的参量均衡器插件。
 - **频谱纵轴 24/60 dB（v0.5.0）**：默认 60 dB 全动态范围；图例区 chip 可切到 24 dB 与 EQ 网格对齐的放大视图
 - **便捷交互**：点击创建、拖拽移动、右击删除、滚轮调 Q（HP/LP/Notch/BP 上下拖动调 Q）
 - **双击重置**：Bell/Shelf/Tilt 双击归零增益和 Q，HP/LP/Notch/BP 双击仅重置 Q
-- **ASIO 支持**：低延迟音频接口兼容
+- **ASIO（可选）**：默认关闭（`JUCE_ASIO=0`）；需自行启用并配置 SDK，WASAPI/DirectSound 不受影响
 
 ---
 
@@ -184,6 +184,8 @@ Sub EQ/
 │   ├── SubEQ_WarmPlan.h             # host-block 对齐的 warm 目标规划（共享纯计算）
 │   ├── SubEQ_OlaBank.h              # 精确边界 OLA warm 合成（共享纯计算）
 │   ├── SubEQ_FirResolution.h        # FIR 分辨率评估
+│   ├── SubEQ_LatencyMath.h          # FIR 抽头/群延迟/管线延迟统一换算
+│   ├── SubEQ_LatencyCoordinator.h   # 有界 PDC 迁移纯状态机
 │   └── SubEQ_Editor/
 │       ├── SubEQLookAndFeel.h       # 窗口/节点/网格布局常量（遗留颜色已删除）
 │       ├── FrequencyResponse.h/.cpp # 频响曲线绘制和节点交互
@@ -191,7 +193,7 @@ Sub EQ/
 │       ├── ModeSelector.h/.cpp      # 底部模式选择面板（v0.2.0 新增）
 │       └── DesignSystem/            # 液态玻璃设计系统（颜色/字体/动画/玻璃效果/LookAndFeel）
 │   └── Fonts/                       # 内嵌 Inter Regular/Bold（SIL OFL 1.1，经 jucer 资源编入 BinaryData）
-├── Tests/                           # 607 项离线回归 + JUCE runtime 集成测试
+├── Tests/                           # 642 项离线回归 + JUCE runtime 集成测试（66 项）+ 真实 VST3 装载（23 项）
 ├── scripts/package_release.ps1      # 发布打包（VST3/Standalone + 许可/OFL）
 ├── Builds/VisualStudio2022/         # VS 项目生成目录（gitignored）
 ├── Napkid Sub EQ.jucer              # Projucer 项目文件
@@ -239,6 +241,7 @@ Sub EQ/
 ## 已知限制
 
 - **GUI 仅限 Windows**：当前使用 Projucer 的 VS2022 导出目标
+- **未签名二进制**：Release 产物未做 Authenticode 签名，Windows SmartScreen 可能提示未知发布者；签名需要发布者代码签名证书，属发布流程的外部步骤（`scripts/package_release.ps1` 会报告签名状态但不阻断打包）
 - **频谱极低频段（0.5~1 Hz）的显示摆动**：v0.4.0 起 VQT 引擎在约 4~16 Hz 以上（随窗型/分辨率档）恢复满倍频程分辨；v0.5.0 把底部帧长从“≤2 s 的 2 的幂”改为“≥2 s 的 2 的幂”（48 kHz 约 2.73 s），0.5 Hz 段的周期覆盖改善，但窗内仍不足两个完整周期，读数存在慢速相位摆动（物理约束；不做镜像支撑抑制，仅靠包络平滑）。12 阶抽取链使低频显示相对音频滞后约 1.4 s@48k（4k 约 2.2 s），仅影响显示。详见 `Documentation/SubEQ_VQT_Feasibility.md` §8
 - **频谱噪声底口径**：VQT 段能量按窗 ENBW × 层带宽聚合（层间 2 倍阶梯），噪声底形状与旧"单 bin 取样"不同——更平（每倍频程恒定带宽比例），属预期行为
 - **44.1 kHz 下频谱 CPU 偏高**：2 的幂抽取整除约束使顶层过采样比偏高（约 2 倍于 48 kHz），成本回到旧引擎量级；48/96/192 kHz 不受影响

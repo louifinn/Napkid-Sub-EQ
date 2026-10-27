@@ -15,6 +15,45 @@ $zip = "$dist.zip"
 if (-not (Test-Path $vst3)) { throw "VST3 bundle not found: $vst3" }
 if (-not (Test-Path $standalone)) { throw "Standalone exe not found: $standalone" }
 
+# The bundle's moduleinfo must agree with the .jucer version; a stale bundle
+# would otherwise ship a version the host reports differently from the zip.
+$moduleInfoPath = Join-Path $vst3 "Contents/Resources/moduleinfo.json"
+if (Test-Path $moduleInfoPath)
+{
+    # JUCE writes moduleinfo.json with a trailing comma (not strict JSON), so
+    # ConvertFrom-Json rejects it; extract the version field directly.
+    $moduleInfoText = Get-Content -Raw $moduleInfoPath
+    if ($moduleInfoText -notmatch '"Version"\s*:\s*"([^"]+)"')
+    {
+        throw "Could not read Version from $moduleInfoPath"
+    }
+    $moduleVersion = $Matches[1]
+    if ($moduleVersion -ne $version)
+    {
+        throw "VST3 moduleinfo version $moduleVersion does not match .jucer version $version"
+    }
+}
+else
+{
+    throw "VST3 moduleinfo.json not found: $moduleInfoPath"
+}
+
+# Signing is an external release step (requires a code-signing certificate).
+# Report the current state loudly so an unsigned build is never mistaken for
+# a signed release.
+$vst3Dll = Join-Path $vst3 "Contents/x86_64-win/Napkid Sub EQ.vst3"
+foreach ($binary in @($standalone, $vst3Dll))
+{
+    if (Test-Path $binary)
+    {
+        $sig = Get-AuthenticodeSignature $binary
+        if ($sig.Status -ne "Valid")
+        {
+            Write-Warning "Unsigned/invalid signature: $binary ($($sig.Status))"
+        }
+    }
+}
+
 if (Test-Path $dist) { Remove-Item -Recurse -Force $dist }
 New-Item -ItemType Directory -Path $dist | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $dist "VST3") | Out-Null
@@ -29,4 +68,14 @@ Copy-Item -Force (Join-Path $root "Source/Fonts/OFL.txt") $dist
 
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path (Join-Path $dist "*") -DestinationPath $zip
+
+$hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+$shaFile = "$zip.sha256"
+# LF + ASCII (no BOM/CRLF) so `sha256sum -c` works unchanged.
+[System.IO.File]::WriteAllText(
+    $shaFile,
+    "$hash  $(Split-Path -Leaf $zip)`n",
+    (New-Object System.Text.ASCIIEncoding))
 Write-Host "Packaged: $zip"
+Write-Host "SHA256:   $hash"
+Write-Host "Checksum: $shaFile"

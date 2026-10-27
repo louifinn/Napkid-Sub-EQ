@@ -1,4 +1,4 @@
-// Standalone regression tests for the shared standalone DSP (18 header-only
+// Standalone regression tests for the shared standalone DSP (19 header-only
 // modules, included directly — no copy drift):
 //   - Source/SubEQ_DSPMath.h          (radix-2 FFT/IDFT, multi-slot twiddle cache)
 //   - Source/SubEQ_FIRDesign.h        (linear / minimum phase FIR design)
@@ -18,6 +18,7 @@
 //   - Source/SubEQ_OutputStage.h      (master ramp / latency-compensated bypass)
 //   - Source/SubEQ_FirResolution.h    (FIR resolution assessment)
 //   - Source/SubEQ_OlaBank.h          (fixed-capacity OLA + exact warm synthesis)
+//   - Source/SubEQ_LatencyCoordinator.h (bounded PDC transition state machine)
 //
 // Build (Windows, VS dev prompt; /utf-8 for the non-ASCII comments):
 //   cl /EHsc /std:c++17 /O2 /utf-8 Tests/subeq_fft_test.cpp /Fo:Tests\subeq_fft_test.obj /Fe:Tests\subeq_fft_test.exe
@@ -40,10 +41,11 @@
 #include "../Source/SubEQ_WarmPlan.h"
 #include "../Source/SubEQ_OutputStage.h"
 #include "../Source/SubEQ_FirResolution.h"
+#include "../Source/SubEQ_LatencyCoordinator.h"
 
 // Exact regression baseline: a silently shrinking test matrix must fail.
 // Update this only together with CHANGELOG/AGENTS after a verified run.
-static constexpr int kExpectedChecks = 607;
+static constexpr int kExpectedChecks = 642;
 
 #include <complex>
 #include <vector>
@@ -507,6 +509,41 @@ int main()
         for (int i = 0; i < 64; ++i)
             maxErr = std::max(maxErr, std::abs(fftResult[i] - ref[i]));
         check(maxErr < 1e-9, "FFT vs direct DFT N=64 (maxErr=" + std::to_string(maxErr) + ")");
+    }
+
+    // ---- Test 4b: explicit TwiddleBank matches the thread-local fallback ----
+    {
+        std::mt19937 rng(77);
+        std::uniform_real_distribution<double> dist(-1.0, 1.0);
+        std::vector<std::complex<double>> data(64);
+        for (auto& c : data) c = { dist(rng), dist(rng) };
+
+        auto reference = data;
+        setActiveTwiddleBank<double>(nullptr);
+        fftInPlace(reference.data(), 64);
+
+        TwiddleBank<double> bank;
+        bank.prepare({ 64 });
+        setActiveTwiddleBank<double>(&bank);
+        auto viaBank = data;
+        fftInPlace(viaBank.data(), 64);
+
+        double maxErr = 0.0;
+        for (int i = 0; i < 64; ++i)
+            maxErr = std::max(maxErr, std::abs(viaBank[i] - reference[i]));
+        check(maxErr < 1e-15, "explicit TwiddleBank matches thread-local FFT");
+
+        // Missing sizes must safely fall back rather than return a stale table.
+        TwiddleBank<double> partial;
+        partial.prepare({ 8 });
+        setActiveTwiddleBank<double>(&partial);
+        auto fallback = data;
+        fftInPlace(fallback.data(), 64);
+        double fallbackErr = 0.0;
+        for (int i = 0; i < 64; ++i)
+            fallbackErr = std::max(fallbackErr, std::abs(fallback[i] - reference[i]));
+        check(fallbackErr < 1e-15, "TwiddleBank miss falls back safely");
+        setActiveTwiddleBank<double>(nullptr);
     }
 
     // ---- Test 5: overlap-add convolution == direct convolution (N=4096) ----
@@ -1775,6 +1812,17 @@ int main()
         }
     }
 
+    // ---- Test 23b: bottom-tier window floor across sample rates ----
+    {
+        for (double rate : { 4000.0, 8000.0, 44100.0, 96000.0, 192000.0 })
+        {
+            const VQTTier bottom = vqtTierLayout (0, rate, 121, 1.0,
+                                                  WindowType::BlackmanHarris);
+            check (bottom.windowSeconds >= 1.999,
+                   "bottom-tier window >=2 s at " + std::to_string (static_cast<int> (rate)) + " Hz");
+        }
+    }
+
     // ---- Test 24: offline VQT engine (calibration / leakage / DC / benchmark) ----
     {
         const double fs = 48000.0;
@@ -1906,26 +1954,36 @@ int main()
             const int n = static_cast<int> (5.0 * fs);
             const double w = 2.0 * 3.14159265358979323846 * 55.0 / fs;
 
-            auto t0 = std::chrono::steady_clock::now();
-            for (int i = 0; i < n; ++i)
-                a.processSample (std::sin (w * i));
-            auto t1 = std::chrono::steady_clock::now();
-            const double vqtMs = std::chrono::duration<double, std::milli> (t1 - t0).count();
-
+            // Best-of-3: a single wall-clock run is sensitive to OS scheduling
+            // noise on a loaded CI machine. The claim is about achievable
+            // pipeline cost, so compare each side's fastest clean run.
             std::vector<std::complex<double>> legacy (8192);
-            auto t2 = std::chrono::steady_clock::now();
+            double vqtMs = 1.0e30;
+            double legacyMs = 1.0e30;
             int legacyFfts = 0;
-            for (int i = 0; i < n; i += 512)
-            {
-                for (int j = 0; j < 8192; ++j)
-                    legacy[static_cast<size_t> (j)] = { std::sin (w * (i + j)), 0.0 };
-                fftInPlace (legacy.data(), 8192);
-                ++legacyFfts;
-            }
-            auto t3 = std::chrono::steady_clock::now();
-            const double legacyMs = std::chrono::duration<double, std::milli> (t3 - t2).count();
 
-            std::printf ("BENCH: 5 s @48k  VQT(121 bands)=%.1f ms  legacy(8192-pt FFT/hop512)=%.1f ms  (%d FFTs)\n",
+            for (int trial = 0; trial < 3; ++trial)
+            {
+                auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < n; ++i)
+                    a.processSample (std::sin (w * i));
+                auto t1 = std::chrono::steady_clock::now();
+                vqtMs = std::min (vqtMs, std::chrono::duration<double, std::milli> (t1 - t0).count());
+
+                auto t2 = std::chrono::steady_clock::now();
+                legacyFfts = 0;
+                for (int i = 0; i < n; i += 512)
+                {
+                    for (int j = 0; j < 8192; ++j)
+                        legacy[static_cast<size_t> (j)] = { std::sin (w * (i + j)), 0.0 };
+                    fftInPlace (legacy.data(), 8192);
+                    ++legacyFfts;
+                }
+                auto t3 = std::chrono::steady_clock::now();
+                legacyMs = std::min (legacyMs, std::chrono::duration<double, std::milli> (t3 - t2).count());
+            }
+
+            std::printf ("BENCH: 5 s @48k  VQT(121 bands)=%.1f ms  legacy(8192-pt FFT/hop512)=%.1f ms  (%d FFTs, best of 3)\n",
                          vqtMs, legacyMs, legacyFfts);
             check(vqtMs < legacyMs, "VQT pipeline cheaper than legacy per-hop FFT");
         }
@@ -2211,7 +2269,8 @@ int main()
         const float* one[1] = { more.data() };
         ring.writeFrame(one, 1, 6);
         check(ring.publishedCount() == 16, "history ring advances after wrap");
-        check(ring.snapshot(0, 16, 6, got) && got[0] == 100.0f && got[5] == 105.0f,
+        float got6[6] = {};
+        check(ring.snapshot(0, 16, 6, got6) && got6[0] == 100.0f && got6[5] == 105.0f,
               "history ring snapshots across the wrap boundary");
 
         float big[32] = {};
@@ -2739,6 +2798,210 @@ int main()
               "12th-order VQT decimator gives >=60 dB at output Nyquist");
         check(cascadeDb(13200.0) < -70.0,
               "12th-order VQT decimator gives >=70 dB at 0.55x output rate");
+    }
+
+    // ---- Test 36: bounded PDC coordinator state machine ----
+    {
+        using SubEQ::LatencyCoordinator;
+        constexpr int kSr = 48000;
+        constexpr int kHost = 512;
+
+        auto makeInput = [=] (uint64_t committed, uint64_t pending)
+        {
+            LatencyCoordinator::BlockInput in;
+            in.hostBlockSamples = kHost;
+            in.sampleRate = kSr;
+            in.firMode = true;
+            in.nonRealtime = false;
+            in.publishedLatency = 2558;
+            in.activeBridgeLatency = 511;
+            in.pendingTarget = pending;
+            in.committed = committed;
+            in.designVersion = 7;
+            return in;
+        };
+
+        LatencyCoordinator c;
+        auto r = c.evaluate(makeInput(10000, 20000));
+        check(! r.gateClosed && ! r.reportLatency && ! c.isActive(),
+              "PDC coordinator stays open while target is far");
+
+        LatencyCoordinator staleWarm;
+        auto stale = makeInput(10000, 9000);
+        stale.warmReady = true;
+        r = staleWarm.evaluate(stale);
+        check(staleWarm.isActive() && r.gateClosed,
+              "PDC starts from a ready warm whose target has passed");
+        staleWarm.reset();
+        auto staleNoWarm = makeInput(10000, 9000);
+        r = staleWarm.evaluate(staleNoWarm);
+        check(! staleWarm.isActive() && ! r.gateClosed,
+              "PDC does not start from a passed target without a warm");
+
+        r = c.evaluate(makeInput(10000, 12000));
+        check(c.isActive() && r.gateClosed, "PDC coordinator gates when target is near");
+        check(r.reportLatency && r.reportVersion == 7 && r.reportSamples == 2558,
+              "PDC coordinator reports the new latency with the design version");
+
+        r = c.evaluate(makeInput(10512, 12000));
+        check(c.isActive() && r.gateClosed && ! r.reportLatency,
+              "PDC coordinator reports exactly once while waiting");
+
+        r = c.evaluate(makeInput(12512, 12000));
+        check(! c.isActive() && ! r.gateClosed, "PDC miss reopens the gate");
+        check(r.requestWarmRebuild && r.invalidateAck,
+              "PDC miss requests a fresh warm target and invalidates the ack");
+        check(r.reportLatency && r.reportVersion == 0 && r.reportSamples == 511,
+              "PDC abort reports the audible latency with an invalid version");
+        check(r.gateHoldSamples > 0, "PDC abort keeps a short output hold");
+
+        r = c.evaluate(makeInput(12512, 13000));
+        check(! c.isActive(), "PDC abort cooldown blocks immediate restart");
+
+        r = c.evaluate(makeInput(12512, 13000));
+        check(c.isActive() && r.gateClosed, "PDC coordinator retries after cooldown");
+
+        int hold = 0;
+        const bool completed = c.notifyActiveLatency(2558, kSr, hold);
+        check(completed && ! c.isActive() && hold > 0,
+              "PDC coordinator closes when the FIR path runs at the target latency");
+        check(! c.notifyActiveLatency(511, kSr, hold),
+              "PDC completion ignores a latency mismatch");
+
+        c.reset();
+        c.evaluate(makeInput(10000, 12000));
+        for (int i = 0; i < 11; ++i)
+            c.evaluate(makeInput(10000, 12000));
+        r = c.evaluate(makeInput(10000, 16000));
+        check(c.isActive() && ! r.requestWarmRebuild,
+              "PDC deadline extends for a fresh warm target");
+
+        // If the ack arrives late, the warm target passes during the 50 ms
+        // guard. That is not a miss: keep the acked candidate alive. Once the
+        // guard clears, a target still behind the playhead is a real miss.
+        LatencyCoordinator guardCase;
+        guardCase.evaluate(makeInput(10000, 12000));
+        auto guarded = makeInput(12512, 12000);
+        guarded.guardActive = true;
+        r = guardCase.evaluate(guarded);
+        check(guardCase.isActive() && ! r.requestWarmRebuild,
+              "PDC guard keeps an acked candidate past its warm target");
+        r = guardCase.evaluate(makeInput(12512, 12000));
+        check(! guardCase.isActive() && r.requestWarmRebuild,
+              "PDC aborts a missed target once the guard clears");
+
+        // A parameter edit publishes a newer design while the first is still
+        // transitioning: the coordinator must restart the handshake for the
+        // new version/latency instead of waiting for the hard cap.
+        LatencyCoordinator supersede;
+        supersede.evaluate(makeInput(10000, 12000));   // v7, latency 2558
+        auto newer = makeInput(10000, 16000);
+        newer.designVersion = 8;
+        newer.publishedLatency = 511;
+        r = supersede.evaluate(newer);
+        check(supersede.isActive() && r.reportLatency && r.reportVersion == 8
+                  && r.reportSamples == 511,
+              "PDC coordinator re-reports a newer design mid-transition");
+
+        c.reset();
+        auto offline = makeInput(10000, 12000);
+        offline.nonRealtime = true;
+        r = c.evaluate(offline);
+        check(! c.isActive() && ! r.gateClosed, "PDC is bypassed for offline renders");
+
+        c.reset();
+        auto zl = makeInput(10000, 12000);
+        zl.firMode = false;
+        r = c.evaluate(zl);
+        check(! c.isActive() && ! r.gateClosed, "PDC is bypassed in zero-latency mode");
+
+        c.reset();
+        auto same = makeInput(10000, 12000);
+        same.activeBridgeLatency = 2558;
+        r = c.evaluate(same);
+        check(! c.isActive() && ! r.gateClosed,
+              "PDC does not gate when the host already runs the target latency");
+    }
+
+    // ---- Test 37: shared VQT kernel bank ----
+    {
+        auto bank = buildVQTKernelBank(48000.0);
+        check(bank != nullptr && bank->sets.size() == 24,
+              "shared VQT bank builds all 24 kernel combinations");
+
+        bool twiddlesPresent = bank != nullptr
+                            && bank->twiddles.get(
+                                   bank->sets[0].tiers[0].fftSize) != nullptr
+                            && bank->twiddles.get(
+                                   bank->sets[0].tiers[VQTNumTiers - 1].fftSize) != nullptr;
+        check(twiddlesPresent, "shared VQT bank carries tier twiddle tables");
+
+        const auto direct = buildVQTKernelSet(48000.0, 61, vqtFilterScale(0),
+                                              WindowType::Hann);
+        bool sameContents = bank != nullptr && bank->sets.size() == 24;
+        if (sameContents)
+        {
+            const auto& set = bank->sets[0];
+            for (int t = 0; t < VQTNumTiers && sameContents; ++t)
+            {
+                const auto& a = set.tiers[t];
+                const auto& b = direct.tiers[t];
+                sameContents = a.fftSize == b.fftSize
+                            && a.rateHz == b.rateHz
+                            && a.firstBand == b.firstBand
+                            && a.numBandsInTier == b.numBandsInTier
+                            && set.frameWindow[t].size() == direct.frameWindow[t].size()
+                            && set.kernels[t].size() == direct.kernels[t].size();
+
+                for (size_t n = 0; n < set.frameWindow[t].size() && sameContents; ++n)
+                    sameContents = set.frameWindow[t][n] == direct.frameWindow[t][n];
+
+                for (size_t k = 0; k < set.kernels[t].size() && sameContents; ++k)
+                {
+                    const auto& ka = set.kernels[t][k];
+                    const auto& kb = direct.kernels[t][k];
+                    sameContents = ka.fftSize == kb.fftSize
+                                && ka.loBin == kb.loBin
+                                && ka.hiBin == kb.hiBin
+                                && ka.taps.size() == kb.taps.size();
+                    for (size_t j = 0; j < ka.taps.size() && sameContents; ++j)
+                        sameContents = ka.taps[j] == kb.taps[j];
+                }
+            }
+        }
+        check(sameContents, "shared VQT bank set matches a direct build exactly");
+    }
+
+    // ---- Test 38: 4 kHz tier layout (top-band decimation + >2 s bottom) ----
+    {
+        // 4 kHz is the lowest rate where the 0.5 Hz..500 Hz display still makes
+        // sense. The 2-power decimation rule picks d=1 (top tier 2 kHz), and
+        // the bottom tier's >=2 s frame quantises to 8 samples at 3.90625 Hz
+        // (2.048 s) rather than undershooting the physical minimum.
+        check(vqtTopDecimationExponent(4000.0) == 1,
+              "4 kHz picks a 2-power top decimation of 2");
+
+        const auto top = vqtTierLayout(VQTNumTiers - 1, 4000.0, 61, 1.0,
+                                       WindowType::Hann);
+        check(std::abs(top.rateHz - 2000.0) < 1e-9 && top.decimation == 2,
+              "4 kHz top tier runs at 2 kHz");
+
+        const auto bottom = vqtTierLayout(0, 4000.0, 61, 1.0, WindowType::Hann);
+        check(bottom.fftSize >= VQTMinTierFftSize
+                  && (bottom.fftSize & (bottom.fftSize - 1)) == 0
+                  && std::abs(bottom.windowSeconds - 2.048) < 1e-9,
+              "4 kHz bottom frame is a 2.048 s power of two");
+
+        int expectedFirst = 0;
+        bool contiguous = true;
+        for (int t = 0; t < VQTNumTiers; ++t)
+        {
+            const auto layout = vqtTierLayout(t, 4000.0, 61, 1.0, WindowType::Hann);
+            contiguous = contiguous && layout.firstBand == expectedFirst;
+            expectedFirst += layout.numBandsInTier;
+        }
+        check(contiguous && expectedFirst == 61,
+              "4 kHz tier ranges are contiguous and cover all 61 bands");
     }
 
     std::printf("TOTAL CHECKS RUN: %d\n", checksRun);

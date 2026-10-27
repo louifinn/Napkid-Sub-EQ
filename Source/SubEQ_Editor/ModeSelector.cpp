@@ -48,6 +48,8 @@ ModeSelector::ModeSelector (juce::AudioProcessorValueTreeState& apvtsRef)
     auto choices = SubEQ::FFTProcessor::getModeChoices();
     modeBox.addItemList (choices, 1); // IDs start at 1
     modeBox.setSelectedId (1, juce::dontSendNotification);
+    modeBox.setTitle ("Mode");
+    modeBox.setAccessibilityCaption ("Mode");
     modeBox.setTooltip ("Processing mode: Zero Latency (IIR), Minimum Phase FIR or Linear Phase FIR");
 
     // Style ComboBox to match the warm ivory design system (the LookAndFeel
@@ -62,6 +64,8 @@ ModeSelector::ModeSelector (juce::AudioProcessorValueTreeState& apvtsRef)
     // FIR length selector (Linear / Minimum Phase modes only)
     firLengthBox.addItemList ({ "4096", "16384", "65536" }, 1); // IDs start at 1
     firLengthBox.setSelectedId (1, juce::dontSendNotification);
+    firLengthBox.setTitle ("FIR Length");
+    firLengthBox.setAccessibilityCaption ("FIR Length");
     firLengthBox.setTooltip ("FIR length (Linear / Minimum Phase modes). Longer FIR improves low-frequency accuracy but adds latency and CPU.");
     firLengthBox.setColour (juce::ComboBox::outlineColourId, juce::Colours::transparentBlack);
     firLengthBox.setColour (juce::ComboBox::textColourId, DesignColours::textPrimary());
@@ -77,11 +81,13 @@ ModeSelector::ModeSelector (juce::AudioProcessorValueTreeState& apvtsRef)
     for (int i = 0; i < numControls; ++i)
     {
         const SpectrumControl& c = controls[i];
-        juce::ComboBox& box = spectrumBox (c);
+        CaptionedComboBox& box = spectrumBox (c);
         juce::Label& label = spectrumLabel (c);
 
         box.addItemList (c.items, 1);
         box.setSelectedId (1, juce::dontSendNotification);
+        box.setTitle (c.labelText);
+        box.setAccessibilityCaption (c.labelText);
         box.setTooltip (c.tooltip);
         box.setColour (juce::ComboBox::outlineColourId, juce::Colours::transparentBlack);
         box.setColour (juce::ComboBox::textColourId, DesignColours::textPrimary());
@@ -108,6 +114,7 @@ ModeSelector::ModeSelector (juce::AudioProcessorValueTreeState& apvtsRef)
     firLabel.setText ("FIR", juce::dontSendNotification);
 
     latencyLabel.setText ("Latency: 0 ms (0 samples)", juce::dontSendNotification);
+    latencyLabel.setTitle ("Reported Latency");
     latencyLabel.setFont (DesignFonts::label());
     latencyLabel.setColour (juce::Label::textColourId, DesignColours::textSecondary());
     latencyLabel.setJustificationType (juce::Justification::centred);
@@ -194,6 +201,19 @@ juce::ComboBox* ModeSelector::boxForParameter (const juce::String& parameterID)
             return &spectrumBox (controls[i]);
 
     return nullptr;
+}
+
+void ModeSelector::visibilityChanged()
+{
+    if (isVisible())
+    {
+        if (!isTimerRunning())
+            startTimerHz (10);
+    }
+    else
+    {
+        stopTimer();
+    }
 }
 
 void ModeSelector::timerCallback()

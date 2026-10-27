@@ -22,6 +22,7 @@
 class SubEQAudioProcessor;
 
 class FrequencyResponse : public juce::Component,
+                          public juce::SettableTooltipClient,
                           public juce::AudioProcessorValueTreeState::Listener,
                           public juce::Timer
 {
@@ -31,6 +32,8 @@ public:
 
     void paint(juce::Graphics& g) override;
     void resized() override;
+    void visibilityChanged() override;
+    std::unique_ptr<juce::AccessibilityHandler> createAccessibilityHandler() override;
 
     // Mouse interaction
     void mouseDown(const juce::MouseEvent& event) override;
@@ -64,8 +67,8 @@ private:
     SubEQ::EQEngine responseEngine;
     double responseSampleRate = 0.0;
 
-    // 上一次看到的 FIR 设计版本号（只由 GUI 线程读写）：FIR 模式下版本变化
-    // 说明后台设计已异步发布，需要重建相位曲线。-1 表示从未同步过。
+    // 上一次看到的“正在接管音频”的 FIR 设计版本号（只由 GUI 线程读写）：
+    // GUI 按 active 版本取 1024 点响应快照。-1 表示从未同步过。
     int lastFirDesignVersion = -1;
     bool lastFirActive = false;
 
@@ -171,6 +174,7 @@ private:
     void drawBackground(juce::Graphics& g);
     void drawGrid(juce::Graphics& g);
     void drawFirResolutionWarning(juce::Graphics& g);
+    void drawFirWarmStatus(juce::Graphics& g);
     void drawSpectrum(juce::Graphics& g);
     juce::Rectangle<float> getSpectrumRangeChipBounds() const;
     double getSpectrumDisplayRangeDb() const;
@@ -185,6 +189,31 @@ private:
     juce::Rectangle<float> getGainValueBounds(int nodeIndex) const;
     juce::Rectangle<float> getQValueBounds(int nodeIndex) const;
     juce::Rectangle<float> getTypeValueBounds(int nodeIndex) const;
+
+    // Keyboard-accessible node proxies: transparent children that own keyboard
+    // focus and expose one accessibility element (role=slider) per node. They
+    // do not intercept mouse input; the parent keeps all pointer handling.
+    class NodeComponent : public juce::Component
+    {
+    public:
+        NodeComponent (FrequencyResponse& ownerToUse, int indexToUse);
+        void paint (juce::Graphics&) override {}
+        void focusGained (FocusChangeType) override;
+        void focusLost (FocusChangeType) override;
+        std::unique_ptr<juce::AccessibilityHandler> createAccessibilityHandler() override;
+        int getNodeIndex() const noexcept { return nodeIndex; }
+
+    private:
+        FrequencyResponse& owner;
+        int nodeIndex;
+
+        JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (NodeComponent)
+    };
+
+    class NodeAccessibilityHandler;
+    class ResponseAccessibilityHandler;
+    std::unique_ptr<NodeComponent> nodeComponents[SubEQ::NumNodes];
+    void updateNodeComponentBounds();
 
     // Node management
     int findNodeAtPosition(juce::Point<float> pos) const;
@@ -208,6 +237,7 @@ private:
     void setNodeParamValue(int nodeIndex, SubEQ::ParamID param, float value);
     void beginNodeGesture(int nodeIndex, SubEQ::ParamID param);
     void endNodeGesture(int nodeIndex, SubEQ::ParamID param);
+    void notifyNodeValueChanged(int nodeIndex);
 
     // Editing
     void startTextEdit(EditTarget target, int nodeIndex);

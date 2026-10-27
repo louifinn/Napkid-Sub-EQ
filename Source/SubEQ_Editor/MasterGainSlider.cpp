@@ -17,6 +17,94 @@
 using namespace SubEQLookAndFeel;
 
 //==============================================================================
+// Accessibility: expose the custom-drawn fader as a standard slider so screen
+// readers can announce and set the gain (plain juce::Component is invisible
+// to accessibility clients).
+//==============================================================================
+
+class MasterGainSlider::AccessibilityHandlerImpl final : public juce::AccessibilityHandler
+{
+public:
+    explicit AccessibilityHandlerImpl (MasterGainSlider& sliderToWrap)
+        : AccessibilityHandler (sliderToWrap,
+                                juce::AccessibilityRole::slider,
+                                juce::AccessibilityActions(),
+                                Interfaces { std::make_unique<ValueInterface> (sliderToWrap) }),
+          slider (sliderToWrap)
+    {
+    }
+
+    juce::String getTitle() const override
+    {
+        return "Master Gain";
+    }
+
+    juce::String getDescription() const override
+    {
+        return juce::String (slider.getCurrentValue(), 1) + " dB";
+    }
+
+    juce::String getHelp() const override
+    {
+        return "Up/Down change gain by 0.5 dB, Page Up/Down by 3 dB, Home resets to 0 dB.";
+    }
+
+private:
+    class ValueInterface final : public juce::AccessibilityValueInterface
+    {
+    public:
+        explicit ValueInterface (MasterGainSlider& sliderToWrap) : slider (sliderToWrap) {}
+
+        bool isReadOnly() const override  { return false; }
+
+        double getCurrentValue() const override
+        {
+            return static_cast<double> (slider.getCurrentValue());
+        }
+
+        void setValue (double newValue) override
+        {
+            const auto value = static_cast<float> (juce::jlimit (-24.0, 24.0, newValue));
+
+            // UIA setters can run on the COM/UIA thread; parameter edits and
+            // repaints belong on the message thread.
+            juce::MessageManager::callAsync (
+                [safe = juce::Component::SafePointer<MasterGainSlider> (&slider), value]
+                {
+                    if (auto* self = safe.getComponent(); self != nullptr
+                        && self->gainParam != nullptr)
+                    {
+                        self->gainParam->beginChangeGesture();
+                        self->setValue (value);
+                        self->gainParam->endChangeGesture();
+                        self->repaint();
+                    }
+                });
+        }
+
+        juce::String getCurrentValueAsString() const override
+        {
+            return juce::String (slider.getCurrentValue(), 1) + " dB";
+        }
+
+        void setValueAsString (const juce::String& newValue) override
+        {
+            setValue (newValue.getDoubleValue());
+        }
+
+        AccessibleValueRange getRange() const override
+        {
+            return { { -24.0, 24.0 }, 0.1 };
+        }
+
+    private:
+        MasterGainSlider& slider;
+    };
+
+    MasterGainSlider& slider;
+};
+
+//==============================================================================
 MasterGainSlider::MasterGainSlider(juce::AudioProcessorValueTreeState& apvtsRef)
     : apvts(apvtsRef)
 {
@@ -40,6 +128,36 @@ MasterGainSlider::~MasterGainSlider()
 
     stopTimer();
     apvts.removeParameterListener("master_gain", this);
+}
+
+std::unique_ptr<juce::AccessibilityHandler> MasterGainSlider::createAccessibilityHandler()
+{
+    return std::make_unique<AccessibilityHandlerImpl> (*this);
+}
+
+void MasterGainSlider::focusGained(FocusChangeType)
+{
+    repaint();
+}
+
+void MasterGainSlider::focusLost(FocusChangeType)
+{
+    repaint();
+}
+
+void MasterGainSlider::visibilityChanged()
+{
+    // The idle 20 Hz poll exists only to surface host automation; a hidden
+    // editor does not need it.
+    if (isVisible())
+    {
+        if (!isTimerRunning())
+            startTimerHz (20);
+    }
+    else
+    {
+        stopTimer();
+    }
 }
 
 void MasterGainSlider::parameterChanged(const juce::String& parameterID, float newValue)
@@ -127,6 +245,9 @@ void MasterGainSlider::setValue(float value)
         return;
     value = juce::jlimit(-24.0f, 24.0f, value);
     gainParam->setValueNotifyingHost(gainParam->convertTo0to1(value));
+
+    if (auto* handler = getAccessibilityHandler())
+        handler->notifyAccessibilityEvent (juce::AccessibilityEvent::valueChanged);
 }
 
 //==============================================================================
@@ -204,6 +325,15 @@ void MasterGainSlider::paint(juce::Graphics& g)
         // Resting: solid white circle
         g.setColour(DesignColours::white());
         g.fillEllipse(cx - r, thumbY - r, r * 2.0f, r * 2.0f);
+    }
+
+    // Keyboard focus ring: the fader is focusable (arrows/Home), so show it.
+    if (hasKeyboardFocus (false))
+    {
+        const float focusR = r + 4.0f;
+        g.setColour (DesignColours::accent().withAlpha (0.85f));
+        g.drawEllipse (cx - focusR, thumbY - focusR,
+                       focusR * 2.0f, focusR * 2.0f, 1.5f);
     }
 
     // Value label: floats with the thumb (above it, or below when cramped)
@@ -456,6 +586,12 @@ void MasterGainSlider::mouseDoubleClick(const juce::MouseEvent& event)
 
 bool MasterGainSlider::keyPressed(const juce::KeyPress& key)
 {
+    if (key.getKeyCode() == juce::KeyPress::homeKey)
+    {
+        resetToZero();
+        return true;
+    }
+
     float delta = 0.0f;
     if (key == juce::KeyPress (juce::KeyPress::upKey))          delta = 0.5f;
     else if (key == juce::KeyPress (juce::KeyPress::downKey))   delta = -0.5f;

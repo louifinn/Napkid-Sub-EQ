@@ -30,6 +30,7 @@
 
 #include <cmath>
 #include <complex>
+#include <memory>
 #include <vector>
 
 #include "SubEQ_DSPMath.h"
@@ -288,6 +289,44 @@ inline VQTKernelSet buildVQTKernelSet (double sampleRateHz, int numBands,
         }
     }
     return set;
+}
+
+// Resolution choices (Fast / Balanced / Fine). Lives here so the shared bank
+// factory and SpectrumAnalyzer use the same count.
+constexpr int VQTNumResolutionLevels = 3;
+
+// Immutable set of all 24 kernel combinations for one sample rate, plus the
+// FFT twiddles for every tier size. The input and output analyzers share one
+// bank instead of each building ~50 MB of identical window/kernel tables.
+struct VQTKernelBank
+{
+    double sampleRate = 0.0;
+    std::vector<VQTKernelSet> sets;   // ordering: [window][density][resolution]
+    TwiddleBank<double> twiddles;
+};
+
+inline std::shared_ptr<const VQTKernelBank> buildVQTKernelBank (double sampleRateHz)
+{
+    auto bank = std::make_shared<VQTKernelBank>();
+    bank->sampleRate = sampleRateHz;
+    bank->sets.reserve (static_cast<size_t> (kNumWindowTypes * kNumBandDensities
+                                              * VQTNumResolutionLevels));
+
+    for (int w = 0; w < kNumWindowTypes; ++w)
+        for (int d = 0; d < kNumBandDensities; ++d)
+            for (int r = 0; r < VQTNumResolutionLevels; ++r)
+                bank->sets.push_back (buildVQTKernelSet (
+                    sampleRateHz, kBandsByDensity[d],
+                    vqtFilterScale (r), static_cast<WindowType> (w)));
+
+    std::vector<int> twiddleSizes;
+    twiddleSizes.reserve (bank->sets.size() * static_cast<size_t> (VQTNumTiers));
+    for (const auto& set : bank->sets)
+        for (int t = 0; t < VQTNumTiers; ++t)
+            twiddleSizes.push_back (set.tiers[t].fftSize);
+
+    bank->twiddles.prepare (twiddleSizes);
+    return bank;
 }
 
 //==============================================================================

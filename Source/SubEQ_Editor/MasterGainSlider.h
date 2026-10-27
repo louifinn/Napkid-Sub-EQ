@@ -35,6 +35,10 @@ public:
     ~MasterGainSlider() override;
 
     void paint(juce::Graphics& g) override;
+    void visibilityChanged() override;
+    void focusGained(FocusChangeType) override;
+    void focusLost(FocusChangeType) override;
+    std::unique_ptr<juce::AccessibilityHandler> createAccessibilityHandler() override;
     void mouseDown(const juce::MouseEvent& event) override;
     void mouseDrag(const juce::MouseEvent& event) override;
     void mouseUp(const juce::MouseEvent& event) override;
@@ -53,6 +57,7 @@ public:
     void timerCallback() override;
 
 private:
+    class AccessibilityHandlerImpl;
     juce::AudioProcessorValueTreeState& apvts;
     juce::RangedAudioParameter* gainParam = nullptr;
 
@@ -81,9 +86,9 @@ private:
     };
     FillPhysics fillPhys;
 
-    // Layout helpers — the travel range [20, height-20] mirrors the plot area
-    float getTravelTop() const    { return 20.0f; }
-    float getTravelBottom() const { return static_cast<float>(getHeight()) - 20.0f; }
+    // Layout helpers — the travel range mirrors the plot's top/bottom insets
+    float getTravelTop() const    { return SubEQLookAndFeel::PlotMarginTop; }
+    float getTravelBottom() const { return static_cast<float>(getHeight()) - SubEQLookAndFeel::PlotMarginBottom; }
     float valueToY(float value) const;
     float yToValue(float y) const;
     float getThumbRadius() const;

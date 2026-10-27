@@ -1,0 +1,53 @@
+Napkid Sub EQ test baseline
+===========================
+
+offline_regression_checks = 642
+runtime_checks            = 66
+vst3_bundle_checks        = 23
+soak_checks               = 4
+asan_offline_checks       = 642
+asan_command              = cl /EHsc /std:c++17 /O1 /utf-8 /fsanitize=address Tests/subeq_fft_test.cpp (MSVC 14.51 clang_rt.asan_dynamic-x86_64.dll beside exe); GUI edits after this run are editor-only
+runtime_test_failures     = 0
+last_verified             = 2026-10-27
+
+Real VST3 bundle load (JUCE VST3 hosting, not a direct processor link):
+- Tests/subeq_runtime_test.exe --vst3 "Builds/VisualStudio2022/x64/Release/VST3/Napkid Sub EQ.vst3"
+  (COM factory scan, one plugin with name/version/manufacturer/identifier,
+   51 params + host bypass, stereo buses, default ZL 0 latency, editor
+   creation, Linear 65536 finite+audible processing, PDC 33278, state
+   save/restore). Result: 23/23 pass on 2026-10-27.
+
+Real host (JUCE AudioPluginHost, Release, 2026-10-27):
+- Loaded the packaged VST3 bundle in a filtergraph with Audio Input ->
+  Napkid Sub EQ -> Audio Output; editor attached, rendered, and its timers
+  ran (latency chip, spectrum, combo sync).
+- Zero Latency -> Linear + 65536: host received and compensated 33278
+  samples; chip showed "693.3 ms (33278 samples)".
+- This exposed and verified the fix for peerless VST3 embed views stopping
+  `isShowing()`-gated timers (now gated on `isVisible()`), plus the
+  never-processed edit-controller nominal-latency fallback.
+
+Soak:
+- 60 s offline soak is part of the 66 runtime checks (passed).
+- Extended host-simulated soak: `--soak 20` completed 20/20 simulated minutes
+  on 2026-10-27 with 0 failures (latency 33278, FIR active, finite/audible).
+  The 512/10 ms Linear 65536 + periodic node automation stress keeps the FIR
+  designer saturated, so wall time is several times the simulated time.
+
+Runtime matrix (JUCE integration test):
+- host block: 128, 512, 1000, 4096
+- sample rate: 44100 (mono), 48000, 96000
+- modes: Zero Latency, Minimum Phase, Linear Phase
+- FIR: 4096, 65536
+- ZL<->FIR, Min<->Linear, bypass, PDC report/ack, offline first block,
+  no-PDC-ack recovery, mid-session sample-rate change, rapid
+  mode/FIR/prepareToPlay stress, 60 s offline soak,
+  state migration with missing spectrum_range.
+
+Release build: VST3 + Standalone x64 (MSBuild Release).
+
+UI automation (Windows UIA, 2026-10-27):
+- Standalone exposes group "EQ Response" + per-node role=slider elements.
+- "Node 1: Bell" reports focusable, accepts focus, and RangeValuePattern
+  SetValue(60) updates the parameter (verified 16.03 -> 60.00 Hz).
+- Captioned combo boxes expose "Mode", "FIR Length", "Resolution", ... as names.

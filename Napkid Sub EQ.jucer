@@ -27,6 +27,8 @@
       <FILE id="sEqFs1" name="SubEQ_FIRSwitchState.h" compile="0" resource="0" file="Source/SubEQ_FIRSwitchState.h"/>
       <FILE id="sEqWp1" name="SubEQ_WarmPlan.h" compile="0" resource="0" file="Source/SubEQ_WarmPlan.h"/>
       <FILE id="sEqFr1" name="SubEQ_FirResolution.h" compile="0" resource="0" file="Source/SubEQ_FirResolution.h"/>
+      <FILE id="sEqLm1" name="SubEQ_LatencyMath.h" compile="0" resource="0" file="Source/SubEQ_LatencyMath.h"/>
+      <FILE id="sEqLc1" name="SubEQ_LatencyCoordinator.h" compile="0" resource="0" file="Source/SubEQ_LatencyCoordinator.h"/>
       <FILE id="sEqNi1" name="SubEQ_NodeInteraction.h" compile="0" resource="0" file="Source/SubEQ_NodeInteraction.h"/>
       <FILE id="sEqOs1" name="SubEQ_OutputStage.h" compile="0" resource="0" file="Source/SubEQ_OutputStage.h"/>
       <FILE id="sEqSc1" name="SubEQ_SpectrumConfig.h" compile="0" resource="0" file="Source/SubEQ_SpectrumConfig.h"/>

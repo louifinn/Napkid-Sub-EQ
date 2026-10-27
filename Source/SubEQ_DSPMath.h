@@ -17,11 +17,86 @@
 
 #include <complex>
 #include <cmath>
+#include <initializer_list>
 #include <utility>   // std::swap（F-022：自包含性）
 #include <vector>
 
 namespace SubEQ
 {
+
+// Explicit, read-only twiddle table bank. The audio thread points its
+// thread-local "active bank" at a bank prepared during setup, so the first FFT
+// of every size never allocates or runs O(n) trigonometry in the callback.
+// A null/active bank miss falls back to the legacy thread_local cache.
+template <typename T>
+class TwiddleBank
+{
+public:
+    void prepare(std::initializer_list<int> sizes)
+    {
+        std::vector<int> list(sizes.begin(), sizes.end());
+        prepare(list);
+    }
+
+    void prepare(const std::vector<int>& sizes)
+    {
+        tables.assign(21, {});
+
+        for (int n : sizes)
+        {
+            if (n < 8)
+                continue;
+
+            int slot = 0;
+            while (slot < 20 && (1 << (slot + 1)) <= n)
+                ++slot;
+
+            if ((1 << slot) != n)
+                continue;   // not a power of two
+
+            auto& table = tables[static_cast<size_t>(slot)];
+            table.resize(static_cast<size_t>(n) / 2);
+            for (int m = 0; m < n / 2; ++m)
+            {
+                const double ang = -2.0 * 3.14159265358979323846 * m / n;
+                table[static_cast<size_t>(m)] = { static_cast<T>(std::cos(ang)),
+                                                  static_cast<T>(std::sin(ang)) };
+            }
+        }
+    }
+
+    const std::complex<T>* get(int n) const noexcept
+    {
+        if (n < 8)
+            return nullptr;
+
+        int slot = 0;
+        while (slot < 20 && (1 << (slot + 1)) <= n)
+            ++slot;
+
+        if (slot >= static_cast<int>(tables.size()))
+            return nullptr;
+
+        const auto& table = tables[static_cast<size_t>(slot)];
+        return table.size() == static_cast<size_t>(n) / 2 ? table.data() : nullptr;
+    }
+
+private:
+    std::vector<std::vector<std::complex<T>>> tables;
+};
+
+template <typename T>
+inline const TwiddleBank<T>*& activeTwiddleBank() noexcept
+{
+    static thread_local const TwiddleBank<T>* bank = nullptr;
+    return bank;
+}
+
+template <typename T>
+inline void setActiveTwiddleBank(const TwiddleBank<T>* bank) noexcept
+{
+    activeTwiddleBank<T>() = bank;
+}
 
 namespace detail
 {
@@ -51,6 +126,10 @@ namespace detail
     template <typename T>
     inline const std::complex<T>* getTwiddles(int n)
     {
+        if (auto* bank = activeTwiddleBank<T>())
+            if (auto* table = bank->get(n))
+                return table;
+
         static thread_local TwiddleCache<T> cache;
 
         int slot = 0;

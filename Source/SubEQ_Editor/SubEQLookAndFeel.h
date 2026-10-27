@@ -21,9 +21,19 @@ namespace SubEQLookAndFeel
     constexpr int ResponseAreaWidth = WindowWidth - MasterGainSliderWidth; // 980
     constexpr int BottomPanelHeight = 60;
 
+    // Plot insets (single source for the response plot AND the master fader
+    // travel, which must line up with the plot's +24/-24 dB edges)
+    constexpr float PlotMarginTop = 20.0f;
+    constexpr float PlotMarginBottom = 20.0f;
+    constexpr float PlotMarginLeft = 20.0f;
+    constexpr float PlotMarginRight = 55.0f;
+
     // Node visual constants
     constexpr float NodeRadius = 8.0f;
     constexpr float NodeHitRadius = 14.0f;
+
+    // Minimum pointer/touch target for interactive chips (accessibility)
+    constexpr float MinChipSize = 24.0f;
 
     // Frequency grid labels
     inline const std::vector<float> freqGridLabels = { 0.5f, 1.0f, 2.0f, 5.0f, 10.0f, 20.0f, 50.0f, 100.0f, 200.0f, 500.0f };
