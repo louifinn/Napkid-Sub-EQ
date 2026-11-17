@@ -32,3 +32,14 @@ Napkid Sub EQ is licensed under the GNU General Public License version 3 only
 - Website: https://github.com/rsms/inter
 
 Release packages must include `LICENSE`, `OFL.txt` (package root) and this file.
+
+## Corresponding Source
+
+Napkid Sub EQ is distributed under GPLv3. The Corresponding Source for every
+published binary is available at:
+
+- https://github.com/louifinn/Napkid-Sub-EQ
+
+Use the tag or commit recorded in the release notes for the exact source that
+produced the binary. If a release is distributed without a source archive, this
+written offer is the GPLv3 source offer; keep it with the release.

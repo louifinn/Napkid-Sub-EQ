@@ -13,7 +13,7 @@
 //   - Source/SubEQ_FilterType.h       (FilterType enum <-> int mapping)
 //   - Source/SubEQ_WindowFunctions.h  (Hann/Blackman/BH-4/Nuttall window family)
 //   - Source/SubEQ_VQTDesign.h        (multi-rate VQT tier/kernel design + offline engine math)
-//   - Source/SubEQ_FIRSwitchState.h   (warm boundary / crossfade policy)
+//   - Source/SubEQ_FIRSwitchState.h   (FIR crossfade weights)
 //   - Source/SubEQ_FIRHistory.h       (T2 input history ring)
 //   - Source/SubEQ_OutputStage.h      (master ramp / latency-compensated bypass)
 //   - Source/SubEQ_FirResolution.h    (FIR resolution assessment)
@@ -21,7 +21,7 @@
 //   - Source/SubEQ_LatencyCoordinator.h (bounded PDC transition state machine)
 //
 // Build (Windows, VS dev prompt; /utf-8 for the non-ASCII comments):
-//   cl /EHsc /std:c++17 /O2 /utf-8 Tests/subeq_fft_test.cpp /Fo:Tests\subeq_fft_test.obj /Fe:Tests\subeq_fft_test.exe
+//   cl /EHsc /std:c++17 /O2 /utf-8 Tests/subeq_fft_test.cpp Source/SubEQ_Core.cpp /Fo:Tests\ /Fe:Tests\subeq_fft_test.exe
 #include "../Source/SubEQ_DSPMath.h"
 #include "../Source/SubEQ_FIRDesign.h"
 #include "../Source/SubEQ_FFTConvolver.h"
@@ -36,6 +36,7 @@
 #include "../Source/SubEQ_BiquadDesign.h"
 #include "../Source/SubEQ_WindowFunctions.h"
 #include "../Source/SubEQ_VQTDesign.h"
+#include "../Source/SubEQ_Core.h"
 #include "../Source/SubEQ_FIRSwitchState.h"
 #include "../Source/SubEQ_FIRHistory.h"
 #include "../Source/SubEQ_WarmPlan.h"
@@ -45,7 +46,7 @@
 
 // Exact regression baseline: a silently shrinking test matrix must fail.
 // Update this only together with CHANGELOG/AGENTS after a verified run.
-static constexpr int kExpectedChecks = 642;
+static constexpr int kExpectedChecks = 651;
 
 #include <complex>
 #include <vector>
@@ -1015,6 +1016,8 @@ int main()
         if (!worstFullCell.empty())
             std::printf("      Test 11c single-node: full-band >6 dB cells (last) %s\n",
                         worstFullCell.c_str());
+        check(worstMinPhaseErr < 4.0,
+              "Test 11c single-node: absolute in-band error < 4 dB");
 
         // ---- Test 11c 单节点 LP / BP 矩阵：Nyquist 与 DC+Nyquist 零点 ----
         // 补齐高通之外的拓扑：LowPass 在 Nyquist 有 2 阶传输零点；BandPass
@@ -1116,6 +1119,8 @@ int main()
                         "worst full-band %.3f dB\n",
                         singleRun, singleSkipped, worstSingleIn, worstSingleLin,
                         worstSingleLegacy, worstSingleFull);
+            check(worstSingleIn < 3.0,
+                  "Test 11c single-node LP/BP: absolute in-band error < 3 dB");
         }
 
         // ---- Test 11c 多节点矩阵：级联传输零点（dc+nyq ≥ 4） ----
@@ -1279,6 +1284,8 @@ int main()
                         "worst full-band %.3f dB, worst peak %.3e\n",
                         multiRun, multiSkipped, worstMultiErr, worstMultiLinErr,
                         worstMultiLegacyErr, worstMultiFullErr, worstMultiPeak);
+            check(worstMultiErr < 3.0,
+                  "Test 11c multi-node: absolute in-band error < 3 dB");
         }
 
         // ---- 65536 点抽查：高采样率低频 HP、低 Q HP、Nyquist 零点 LP ----
@@ -1579,6 +1586,11 @@ int main()
         check(spectrumSmoothingChoiceToIndex(2) == 2, "smoothing choice 2 -> 1/3 oct");
         check(spectrumSmoothingChoiceToIndex(3) == 3, "smoothing choice 3 -> 2/3 oct");
         check(spectrumSmoothingChoiceToIndex(99) == 1, "smoothing choice invalid -> 1/6 oct");
+        check(spectrumRangeChoiceToDb(0) == 24.0, "spectrum range choice 0 -> 24 dB");
+        check(spectrumRangeChoiceToDb(1) == kDisplayRangeDb,
+              "spectrum range choice 1 -> full display range");
+        check(spectrumRangeChoiceToDb(99) == kDisplayRangeDb,
+              "spectrum range invalid -> full display range");
     }
 
     // ---- Test 19: biquad coefficients / state / response ----
@@ -1847,7 +1859,7 @@ int main()
                 const double fc = octaveBandCenterFreq (0.5f, band, numBands);
                 const int t = vqtBandTier (band, 12);
                 const double settle = 3.0 * set.tiers[t].windowSeconds + 1.0;
-                feedSignal (a, fc, 1.0, settle, fs);
+                feedSignal (a, fc, 0.5, settle, fs);
                 // v0.4.1：显示包络对底层帧摆动近乎透明（层 dt >> 包络 τ，读数
                 // 诚实跟随每帧功率），gamma 段馈末读数依赖摆动相位——校准改为对
                 // 尾段做功率域时间平均：测的是核的无偏性，与摆动相位解耦。
@@ -1858,7 +1870,7 @@ int main()
                 int pCount = 0;
                 for (int i = 0; i < measureN; ++i)
                 {
-                    a.processSample (std::sin (w * i));
+                    a.processSample (0.5 * std::sin (w * i));
                     if ((i & 511) == 511)   // 每 ~10.7 ms 采样一次显示值
                     {
                         pAcc += std::pow (10.0, a.bandDb[band] / 10.0);
@@ -1866,12 +1878,16 @@ int main()
                     }
                 }
                 const double reading = 10.0 * std::log10 (pAcc / pCount);
+                // -6.02 dBFS is below the 0 dB display clamp, so a positive
+                // gain error cannot hide behind the clamp (the old full-scale
+                // test was one-sided: any over-read looked like exactly 0 dB).
+                const double targetDb = 20.0 * std::log10 (0.5);
                 // gamma 区容差：窗内不足 ~2 个整周期的频段（2 s 封顶下的 0.5 Hz
                 // 段），实信号镜像项落在主瓣裙内，读数有 ±2 dB 量级的相位相依摆
                 // 动（物理后果，见调研报告）；其余频段容差 0.75 dB。
                 const double cycles = fc * set.tiers[t].windowSeconds;
                 const double tol = (cycles < 2.0) ? 3.5 : 0.75;
-                const double err = std::abs (reading);
+                const double err = std::abs (reading - targetDb);
                 std::printf ("      calib %-14s %7.2f Hz (band %3d, %.2f cyc/win): %+6.2f dB\n",
                              wt == WindowType::Hann ? "Hann" :
                              wt == WindowType::Blackman ? "Blackman" :
@@ -1880,7 +1896,7 @@ int main()
                 worst = std::max (worst, err);
                 if (err > tol) ok = false;
             }
-            check(ok, "full-scale sine at band centre reads 0 dB (+/-0.75)");
+            check(ok, "-6 dBFS sine at band centre reads -6 dB (0.75, gamma 3.5)");
             std::printf ("      window %-14s worst calibration error %.2f dB\n",
                          wt == WindowType::Hann ? "Hann" :
                          wt == WindowType::Blackman ? "Blackman" :
@@ -2220,21 +2236,8 @@ int main()
         }
     }
 
-    // ---- Test 27: FIR warm-boundary helpers ----
+    // ---- Test 27: FIR crossfade weights ----
     {
-        check(firWarmCatchUpAllowed(7, 7, 4),
-              "FIR warm: an exact boundary is adoptable");
-        check(firWarmCatchUpAllowed(6, 7, 4),
-              "FIR warm: one-block lag is catch-up adoptable");
-        check(firWarmCatchUpAllowed(3, 7, 4),
-              "FIR warm: catch-up window boundary is inclusive");
-        check(!firWarmCatchUpAllowed(2, 7, 4),
-              "FIR warm: larger lag is rejected");
-        check(!firWarmCatchUpAllowed(8, 7, 4),
-              "FIR warm: a state ahead of the audio boundary is rejected");
-        check(!firWarmCatchUpAllowed(-1, 7, 4),
-              "FIR warm: a negative block index is rejected");
-
         const float w0 = firCrossfadeWeight(0, 1024, 1024);
         const float w1 = firCrossfadeWeight(1023, 1024, 1024);
         check(std::abs(w0 - 1.0f / 1025.0f) < 1e-6f && w1 > 0.998f,
@@ -2737,10 +2740,78 @@ int main()
         check(p.targetSample == 3000, "warm target handles non-512 host blocks");
         check(p.olaBoundary == 2560 && p.prefixSamples == 440,
               "warm target exposes OLA boundary and prefix");
-        check(warmAdoptableAt(3000, 3000) && !warmAdoptableAt(3000, 3001),
-              "warm adoption is exact-boundary only");
         check(warmLeadSamples(48000.0, 512, 0.012) >= 5376,
               "warm lead covers estimated build time plus slack");
+
+        // Arbitrary OLA prefixes at a non-512 host block: T = k*512 + r.
+        const auto r1 = planWarmTarget(0, 1, 513, 512);
+        const auto r127 = planWarmTarget(0, 513LL * 127, 513, 512);
+        const auto r511 = planWarmTarget(0, 513LL * 511, 513, 512);
+        check(r1.prefixSamples == 1 && r1.targetSample % 512 == 1,
+              "warm plan supports prefix r = 1");
+        check(r127.prefixSamples == 127 && r127.targetSample % 512 == 127,
+              "warm plan supports prefix r = 127");
+        check(r511.prefixSamples == 511 && r511.targetSample % 512 == 511,
+              "warm plan supports prefix r = 511");
+    }
+
+    // ---- Test 33e: production-size warm synthesis (65535 taps, L = 131072) ----
+    {
+        const int M = 512;
+        const int N = 65535;
+        const int L = convolutionFftSize(N, M);
+        const int T = 4 * M;
+        check(L == 131072, "production FIR uses the 131072-point OLA FFT");
+
+        std::mt19937 rng(97531);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        std::vector<float> signal(static_cast<size_t>(T));
+        for (auto& v : signal) v = dist(rng);
+
+        FirHistoryRing history;
+        history.prepare(1, 4 * T);
+        const float* ptrs[1] = { signal.data() };
+        history.writeFrame(ptrs, 1, T, true);
+
+        std::vector<double> taps(static_cast<size_t>(N));
+        for (int i = 0; i < N; ++i)
+            taps[static_cast<size_t>(i)] = 0.25 / static_cast<double>(1 + (i % 97));
+        std::vector<std::complex<double>> freq(static_cast<size_t>(L), {});
+        for (int i = 0; i < N; ++i)
+            freq[static_cast<size_t>(i)] = { taps[static_cast<size_t>(i)], 0.0 };
+        fftInPlace(freq.data(), L);
+
+        OlaChannelState reference;
+        prepareOlaChannelState(reference, M, L);
+        std::vector<float> refOut(static_cast<size_t>(T), 0.0f);
+        std::vector<std::complex<double>> scratch(static_cast<size_t>(L));
+        processOlaChannel(reference, signal.data(), refOut.data(), T, M, L,
+                          freq.data(), scratch);
+
+        OlaChannelState warm;
+        prepareOlaChannelState(warm, M, L);
+        std::vector<float> inputScratch(static_cast<size_t>(std::max(N, M)), 0.0f);
+        std::vector<float> dummy(static_cast<size_t>(M), 0.0f);
+        const bool ok = olaSynthesizeAt(history, 0, static_cast<uint64_t>(T), 0,
+                                        N, L, M, freq.data(), warm,
+                                        inputScratch, dummy, scratch);
+        check(ok, "production-size warm synthesis succeeds");
+
+        double stateErr = 0.0;
+        for (int i = 0; i < L; ++i)
+            stateErr = std::max(stateErr,
+                                std::abs(reference.overlap[static_cast<size_t>(i)]
+                                       - warm.overlap[static_cast<size_t>(i)]));
+        const bool sameQueue = reference.outQueue.size() == warm.outQueue.size()
+                            && reference.outRead == warm.outRead
+                            && reference.pos == warm.pos;
+        double queueErr = 0.0;
+        if (sameQueue)
+            for (size_t i = 0; i < reference.outQueue.size(); ++i)
+                queueErr = std::max(queueErr,
+                                    std::abs(reference.outQueue[i] - warm.outQueue[i]));
+        check(stateErr < 1e-12 && sameQueue && queueErr < 1e-12,
+              "production-size warm state matches continuous OLA");
     }
 
     // ---- Test 34: DSP boundary hardening ----
@@ -2818,6 +2889,9 @@ int main()
             in.pendingTarget = pending;
             in.committed = committed;
             in.designVersion = 7;
+            // Simulate the next block, after the gate has fully closed: the
+            // coordinator only reports the new latency at that point.
+            in.gateAtZero = true;
             return in;
         };
 
@@ -2829,6 +2903,7 @@ int main()
         LatencyCoordinator staleWarm;
         auto stale = makeInput(10000, 9000);
         stale.warmReady = true;
+        stale.catchUpLimitSamples = 2048;
         r = staleWarm.evaluate(stale);
         check(staleWarm.isActive() && r.gateClosed,
               "PDC starts from a ready warm whose target has passed");
@@ -2847,18 +2922,19 @@ int main()
         check(c.isActive() && r.gateClosed && ! r.reportLatency,
               "PDC coordinator reports exactly once while waiting");
 
-        r = c.evaluate(makeInput(12512, 12000));
+        r = c.evaluate(makeInput(13000, 12000));
         check(! c.isActive() && ! r.gateClosed, "PDC miss reopens the gate");
         check(r.requestWarmRebuild && r.invalidateAck,
               "PDC miss requests a fresh warm target and invalidates the ack");
         check(r.reportLatency && r.reportVersion == 0 && r.reportSamples == 511,
               "PDC abort reports the audible latency with an invalid version");
-        check(r.gateHoldSamples > 0, "PDC abort keeps a short output hold");
+        check(r.gateHoldSamples >= static_cast<int> (0.04 * kSr),
+              "PDC abort holds the gate until the deferred restore report can land");
 
-        r = c.evaluate(makeInput(12512, 13000));
+        r = c.evaluate(makeInput(13000, 14000));
         check(! c.isActive(), "PDC abort cooldown blocks immediate restart");
 
-        r = c.evaluate(makeInput(12512, 13000));
+        r = c.evaluate(makeInput(13000, 14000));
         check(c.isActive() && r.gateClosed, "PDC coordinator retries after cooldown");
 
         int hold = 0;
@@ -2886,7 +2962,7 @@ int main()
         r = guardCase.evaluate(guarded);
         check(guardCase.isActive() && ! r.requestWarmRebuild,
               "PDC guard keeps an acked candidate past its warm target");
-        r = guardCase.evaluate(makeInput(12512, 12000));
+        r = guardCase.evaluate(makeInput(13000, 12000));
         check(! guardCase.isActive() && r.requestWarmRebuild,
               "PDC aborts a missed target once the guard clears");
 
@@ -3002,6 +3078,48 @@ int main()
         }
         check(contiguous && expectedFirst == 61,
               "4 kHz tier ranges are contiguous and cover all 61 bands");
+    }
+
+    // Core runtime state machine: 32-sample smoothing, enable fade, Tilt
+    // cascade and sample-rate coefficient refresh. These live in
+    // SubEQ_Core.h and were previously outside the offline binary.
+    {
+        EQNode node;
+        node.prepare(48000.0);
+        node.setSmoothingEnabled(false);
+        node.update(40.0, 12.0, 0.707, FilterType::Bell);
+        node.setEnabled(true);
+        bool finite = std::isfinite(node.process(1.0, 0));
+        for (int i = 0; i < 512; ++i)
+            finite = finite && std::isfinite(node.process(0.25 * std::sin(0.01 * i), 0));
+        check(finite, "Core: Bell node processes finite after enable");
+
+        node.update(40.0, 12.0, 0.707, FilterType::Tilt);
+        node.update(40.0, 12.0, 0.707, FilterType::Bell);
+        for (int i = 0; i < 512; ++i)
+            finite = finite && std::isfinite(node.process(0.25 * std::sin(0.01 * i), 0));
+        check(finite, "Core: Tilt->Bell cascade transition stays finite");
+
+        const double expectedMag = std::pow(10.0, 12.0 / 20.0);
+        node.prepare(96000.0);
+        const double twoPi = 2.0 * 3.14159265358979323846;
+        const double mag = std::abs(node.getResponse(twoPi * 40.0 / 96000.0));
+        check(std::abs(mag - expectedMag) < 1e-6,
+              "Core: sample-rate change refreshes coefficients at 40 Hz");
+
+        EQEngine engine;
+        engine.prepare(48000.0);
+        auto& engineNode = engine.getNode(0);
+        engineNode.setSmoothingEnabled(false);
+        engineNode.setEnabled(true);
+        engineNode.update(40.0, 6.0, 0.707, FilterType::Bell);
+        std::vector<float> impulse(256, 0.0f);
+        impulse[0] = 1.0f;
+        float* ptrs[1] = { impulse.data() };
+        engine.processChannels(ptrs, 1, 256);
+        bool engineFinite = true;
+        for (float v : impulse) engineFinite = engineFinite && std::isfinite(v);
+        check(engineFinite, "Core: EQEngine processes an impulse without NaN");
     }
 
     std::printf("TOTAL CHECKS RUN: %d\n", checksRun);

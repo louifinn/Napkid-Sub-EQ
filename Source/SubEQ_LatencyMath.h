@@ -34,13 +34,6 @@ inline constexpr int convBlockLatency(int convBlockLen) noexcept
     return convBlockLen > 0 ? convBlockLen - 1 : 0;
 }
 
-inline constexpr int pipelineLatencyFromGroupDelay(int groupDelay,
-                                                   bool minimumPhase,
-                                                   int convBlockLen) noexcept
-{
-    return (minimumPhase ? 0 : groupDelay) + convBlockLatency(convBlockLen);
-}
-
 inline constexpr int pipelineLatency(int mode,
                                      int nominalFirLength,
                                      int convBlockLen) noexcept

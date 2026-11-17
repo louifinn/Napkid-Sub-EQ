@@ -76,11 +76,13 @@ inline void applyNodeValuesToEngine(EQEngine& engine, int nodeIndex,
 {
     auto& node = engine.getNode(nodeIndex);
     node.setEnabled(enabled);
-    if (enabled)
-        node.update(static_cast<double>(freq),
-                    static_cast<double>(gain),
-                    static_cast<double>(qVal),
-                    intToFilterType(type));
+    // Keep coefficients current even while the node is disabled: otherwise a
+    // type/frequency edit made in the disabled state is applied on re-enable
+    // from the old cascade and can leak a 15 ms stale transition.
+    node.update(static_cast<double>(freq),
+                static_cast<double>(gain),
+                static_cast<double>(qVal),
+                intToFilterType(type));
 }
 
 // Apply current APVTS parameter values to an EQEngine.
@@ -123,13 +125,21 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout
     auto typeChoices = getFilterTypeChoices();
     auto modeChoices = getEQModeChoices();
 
+    // True logarithmic automation: centre the frequency range at its geometric
+    // mean and the Q range at 1.0 (the audio parameters stay linear internally;
+    // this only fixes the host/GUI normalised mapping).
+    juce::NormalisableRange<float> freqRange (0.5f, 500.0f, 0.0f);
+    freqRange.setSkewForCentre (15.8114f);
+    juce::NormalisableRange<float> qRange (0.1f, 10.0f, 0.01f);
+    qRange.setSkewForCentre (1.0f);
+
     for (int i = 0; i < NumNodes; ++i)
     {
         // Frequency: 0.5 ~ 500 Hz, log scale, default 100 Hz
         layout.add(std::make_unique<juce::AudioParameterFloat>(
             getNodeParamID(i, ParamID::Freq),
             getNodeParamName(i, ParamID::Freq),
-            juce::NormalisableRange<float>(0.5f, 500.0f, 0.0f, 0.5f),
+            freqRange,
             100.0f,
             juce::AudioParameterFloatAttributes().withStringFromValueFunction(
                 [](float v, int) { return juce::String(v, 2) + " Hz"; })
@@ -149,7 +159,7 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout
         layout.add(std::make_unique<juce::AudioParameterFloat>(
             getNodeParamID(i, ParamID::Q),
             getNodeParamName(i, ParamID::Q),
-            juce::NormalisableRange<float>(0.1f, 10.0f, 0.01f, 0.5f),
+            qRange,
             0.707f,
             juce::AudioParameterFloatAttributes().withStringFromValueFunction(
                 [](float v, int) { return juce::String(v, 2); })

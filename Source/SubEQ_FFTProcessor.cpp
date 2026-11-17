@@ -354,6 +354,7 @@ void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
         return;
 
     designEpoch.fetch_add(1, std::memory_order_release);
+    buildEpoch.fetch_add(1, std::memory_order_release);
 
     preparedSampleRate = sr;
     numChannels = std::max(1, channels);
@@ -421,6 +422,8 @@ void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
     activeConvFFTSize = 0;
     activeGroupDelay = 0;
     processedVersion = 0;
+    activeDesignVersion.store(0, std::memory_order_release);
+    activeFirLength.store(0, std::memory_order_release);
     reportedActiveLatency.store(0, std::memory_order_release);
     invalidateLatencyAck();
     pdcGuardMirror.store(false, std::memory_order_release);
@@ -430,13 +433,13 @@ void FFTProcessor::prepare(double sr, int maxBlockSize, int channels)
     warmBuildSecondsEWMA.store(0.012, std::memory_order_relaxed);
     crossfadeRemaining = 0;
     fadeConvFFTSize = 0;
-    audioTwiddlesPrewarmed = false;
 
     // Invalidate every design published before this prepare. The epoch bump
     // above makes an in-flight worker abort; the version cutoff makes the
     // audio thread ignore a meta that raced the reset.
     const int cutoff = stateVersion.fetch_add(1, std::memory_order_acq_rel) + 1;
     minimumPlanVersion.store(cutoff, std::memory_order_release);
+    adoptionCutoffVersion.store(cutoff, std::memory_order_release);
     for (auto& state : designSlotStates)
     {
         // A producer may own a Reserved slot; preserve it so the worker and
@@ -485,6 +488,7 @@ void FFTProcessor::resetConvolution()
     activeConvFFTSize = 0;
     activeGroupDelay = 0;
     processedVersion = 0;
+    activeFirLength.store(0, std::memory_order_release);
     reportedActiveLatency.store(0, std::memory_order_release);
     invalidateLatencyAck();
     pdcGuardMirror.store(false, std::memory_order_release);
@@ -495,8 +499,10 @@ void FFTProcessor::resetConvolution()
 
     // Invalidate any design that is currently being computed. Without this,
     // a design started before a mode/length change could still publish and be
-    // adopted after the clear.
+    // adopted after the clear. Bump both epochs: this is a hard session reset,
+    // not a structural redesign.
     designEpoch.fetch_add(1, std::memory_order_release);
+    buildEpoch.fetch_add(1, std::memory_order_release);
 
     // Release every design slot. This runs on the audio thread (mode change)
     // or the setup thread (prepare); the ring state machine makes reuse safe.
@@ -534,7 +540,9 @@ void FFTProcessor::resetConvolution()
 
     const int cutoff = stateVersion.fetch_add(1, std::memory_order_acq_rel) + 1;
     minimumPlanVersion.store(cutoff, std::memory_order_release);
+    adoptionCutoffVersion.store(cutoff, std::memory_order_release);
     activeDesignVersion.store(0, std::memory_order_release);
+    activeFirLength.store(0, std::memory_order_release);
     audioWarmPtr = nullptr;
     audioWarmTargetSample = 0;
 }
@@ -569,7 +577,17 @@ void FFTProcessor::requestWarmRebuild()
 
 void FFTProcessor::invalidateDesigns()
 {
-    designEpoch.fetch_add(1, std::memory_order_release);
+    // Only the in-flight build generation changes. The published plan keeps
+    // its designEpoch and therefore stays valid: the active FIR continues to
+    // play (with advancing OLA state) until a replacement is published. This
+    // is what makes a FIR length/mode change a crossfade rather than a drop to
+    // the IIR bridge plus a stale-state fade.
+    buildEpoch.fetch_add(1, std::memory_order_release);
+    // A plan that is published but NOT yet active was built from the superseded
+    // parameters. Keep the active design running, but refuse to adopt that
+    // candidate: the next design (version > cutoff) belongs to the new params.
+    adoptionCutoffVersion.store(stateVersion.load (std::memory_order_acquire),
+                                std::memory_order_release);
     offlineDesignCooldown = 0;
     requestRedesign();
 }
@@ -581,7 +599,8 @@ void FFTProcessor::run()
 {
     int lastDesignSlot = -1;
     int lastDesignVersion = 0;
-    int lastDesignEpoch = -1;
+    int lastDesignEpoch = -1;          // plan-validity epoch (designEpoch)
+    int lastBuildGeneration = -1;      // in-flight generation (buildEpoch)
     uint64_t lastDesignTarget = 0;
 
     while (!threadShouldExit())
@@ -606,6 +625,7 @@ void FFTProcessor::run()
         const bool haveLastDesign = lastDesignSlot >= 0
             && lastDesignSlot < NumDesignSlots
             && lastDesignEpoch == designEpoch.load (std::memory_order_acquire)
+            && lastBuildGeneration == buildEpoch.load (std::memory_order_acquire)
             && lastDesignVersion >= minimumPlanVersion.load (std::memory_order_acquire)
             && designSlotStates[lastDesignSlot].load (std::memory_order_acquire)
                    != DesignSlotFree
@@ -630,6 +650,21 @@ void FFTProcessor::run()
                     sr, hostBlock, warmBuildSecondsEWMA.load (std::memory_order_relaxed));
                 lastDesignTarget = planWarmTarget (history.capturedCount(), lead,
                                                    hostBlock, ConvBlockLen).targetSample;
+
+                // Linear-phase FIR: its main lobe arrives after groupDelay
+                // samples. Adopting before the session history covers that
+                // delay hands over to an almost-zero output (audible dropout).
+                // Keep the IIR bridge audible until the target is late enough.
+                const uint64_t minHistory = historyValidFrom.load (std::memory_order_acquire)
+                    + static_cast<uint64_t> (std::max (0, design.groupDelay));
+                if (lastDesignTarget < minHistory)
+                {
+                    const uint64_t hb = static_cast<uint64_t> (hostBlock);
+                    uint64_t t = ((minHistory + hb - 1) / hb) * hb;
+                    if (t <= history.capturedCount())
+                        t = history.capturedCount() + hb;
+                    lastDesignTarget = t;
+                }
             }
 
             const int warmSlot = reserveFreeWarmSlot();
@@ -640,7 +675,7 @@ void FFTProcessor::run()
             else
             {
                 WarmState& warm = warmSlots[warmSlot].state;
-                if (buildWarmState (design, warm, lastDesignEpoch, lastDesignTarget))
+                if (buildWarmState (design, warm, lastBuildGeneration, lastDesignTarget))
                 {
                     warm.version = lastDesignVersion;
                     warmSlotStates[warmSlot].store (WarmSlotReady,
@@ -653,11 +688,13 @@ void FFTProcessor::run()
                 {
                     warmSlotStates[warmSlot].store (WarmSlotFree,
                                                     std::memory_order_release);
-                    if (lastDesignEpoch != designEpoch.load (std::memory_order_acquire))
+                    if (lastDesignEpoch != designEpoch.load (std::memory_order_acquire)
+                        || lastBuildGeneration != buildEpoch.load (std::memory_order_acquire))
                     {
                         lastDesignSlot = -1;
                         lastDesignVersion = 0;
                         lastDesignEpoch = -1;
+                        lastBuildGeneration = -1;
                     }
                     else
                     {
@@ -673,17 +710,41 @@ void FFTProcessor::run()
         if (mode == EQMode::ZeroLatency)
             continue;
 
-        int epoch = 0;
-        auto newState = buildDesignSnapshot (epoch);
+        int planEpoch = 0;
+        int buildGeneration = 0;
+        auto newState = buildDesignSnapshot (planEpoch, buildGeneration);
         if (newState == nullptr)
+        {
+            // try_lock contention or a transient build failure: keep the
+            // request latched and retry instead of silently dropping it.
+            redesignRequested.store (true, std::memory_order_release);
+            redesignEvent.signal();
             continue;
+        }
 
         const int hostBlock = std::max (1, currentHostBlockSamples.load (std::memory_order_acquire));
         const double sr = sampleRate.load (std::memory_order_acquire);
         const uint64_t lead = warmLeadSamples (
             sr, hostBlock, warmBuildSecondsEWMA.load (std::memory_order_relaxed));
-        const WarmTarget target = planWarmTarget (history.capturedCount(), lead,
-                                                  hostBlock, ConvBlockLen);
+        WarmTarget target = planWarmTarget (history.capturedCount(), lead,
+                                            hostBlock, ConvBlockLen);
+
+        // A linear-phase FIR cannot produce its main lobe until groupDelay
+        // samples have entered the session. A target earlier than that would
+        // adopt a near-zero FIR while the IIR bridge is faded out (cold-start
+        // dropout). Keep the bridge audible until the target covers it.
+        const uint64_t minHistory = historyValidFrom.load (std::memory_order_acquire)
+            + static_cast<uint64_t> (std::max (0, newState->groupDelay));
+        if (target.targetSample < minHistory)
+        {
+            const uint64_t hb = static_cast<uint64_t> (hostBlock);
+            uint64_t t = ((minHistory + hb - 1) / hb) * hb;
+            if (t <= history.capturedCount())
+                t = history.capturedCount() + hb;
+            target.targetSample = t;
+            target.olaBoundary = t - (t % static_cast<uint64_t> (ConvBlockLen));
+            target.prefixSamples = static_cast<int> (t - target.olaBoundary);
+        }
 
         // Wait for a free design slot (bounded; the audio mask keeps active,
         // fading and local designs pinned, so one of four slots is normally
@@ -691,7 +752,8 @@ void FFTProcessor::run()
         int slot = -1;
         for (int tries = 0; tries < 100 && slot < 0 && ! threadShouldExit(); ++tries)
         {
-            if (epoch != designEpoch.load (std::memory_order_acquire))
+            if (planEpoch != designEpoch.load (std::memory_order_acquire)
+                || buildGeneration != buildEpoch.load (std::memory_order_acquire))
                 break;
             slot = reserveFreeDesignSlot();
             if (slot < 0)
@@ -704,7 +766,8 @@ void FFTProcessor::run()
             continue;
         }
 
-        if (epoch != designEpoch.load (std::memory_order_acquire))
+        if (planEpoch != designEpoch.load (std::memory_order_acquire)
+            || buildGeneration != buildEpoch.load (std::memory_order_acquire))
         {
             designSlotStates[slot].store (DesignSlotFree, std::memory_order_release);
             continue;
@@ -720,7 +783,8 @@ void FFTProcessor::run()
 
         // A reset may have landed while we were moving the payload into the
         // reserved slot. Do not publish an old-epoch design; drop it.
-        if (epoch != designEpoch.load (std::memory_order_acquire))
+        if (planEpoch != designEpoch.load (std::memory_order_acquire)
+            || buildGeneration != buildEpoch.load (std::memory_order_acquire))
         {
             designSlotStates[slot].store (DesignSlotFree, std::memory_order_release);
             continue;
@@ -732,13 +796,14 @@ void FFTProcessor::run()
         publishFirResponseSnapshot (designSlots[slot].state);
         writePlanMeta (slot, -1, publishedVersion,
                        designSlots[slot].state.groupDelay + (ConvBlockLen - 1),
-                       target.targetSample, epoch);
+                       target.targetSample, planEpoch);
         designSlotStates[slot].store (DesignSlotReady, std::memory_order_release);
         pdcGuardMirror.store (false, std::memory_order_release);
 
         lastDesignSlot = slot;
         lastDesignVersion = publishedVersion;
-        lastDesignEpoch = epoch;
+        lastDesignEpoch = planEpoch;
+        lastBuildGeneration = buildGeneration;
         lastDesignTarget = target.targetSample;
 
         // Phase 2: build the exact warm state for the published target.
@@ -750,14 +815,17 @@ void FFTProcessor::run()
         }
 
         WarmState& warm = warmSlots[warmSlot].state;
-        if (! buildWarmState (designSlots[slot].state, warm, epoch, target.targetSample))
+        if (! buildWarmState (designSlots[slot].state, warm, buildGeneration,
+                              target.targetSample))
         {
             warmSlotStates[warmSlot].store (WarmSlotFree, std::memory_order_release);
-            if (epoch != designEpoch.load (std::memory_order_acquire))
+            if (planEpoch != designEpoch.load (std::memory_order_acquire)
+                || buildGeneration != buildEpoch.load (std::memory_order_acquire))
             {
                 lastDesignSlot = -1;
                 lastDesignVersion = 0;
                 lastDesignEpoch = -1;
+                lastBuildGeneration = -1;
             }
             else
             {
@@ -770,11 +838,12 @@ void FFTProcessor::run()
         warmSlotStates[warmSlot].store (WarmSlotReady, std::memory_order_release);
 
         if (publishedVersion == stateVersion.load (std::memory_order_acquire)
-            && epoch == designEpoch.load (std::memory_order_acquire))
+            && planEpoch == designEpoch.load (std::memory_order_acquire)
+            && buildGeneration == buildEpoch.load (std::memory_order_acquire))
         {
             writePlanMeta (slot, warmSlot, publishedVersion,
                            designSlots[slot].state.groupDelay + (ConvBlockLen - 1),
-                           target.targetSample, epoch);
+                           target.targetSample, planEpoch);
         }
         else
         {
@@ -787,7 +856,8 @@ void FFTProcessor::run()
 // Build FIR coefficients from the current APVTS snapshot. Safe to call from
 // the background worker or, in offline rendering, from the audio thread; the
 // designEngine is serialized by designMutex. Returns nullptr for ZL / failure.
-std::unique_ptr<FFTProcessor::FIRState> FFTProcessor::buildDesignSnapshot(int& outEpoch)
+std::unique_ptr<FFTProcessor::FIRState> FFTProcessor::buildDesignSnapshot(
+    int& outPlanEpoch, int& outBuildGeneration)
 {
     auto* source = parameterSource.load(std::memory_order_acquire);
     if (source == nullptr)
@@ -804,10 +874,16 @@ std::unique_ptr<FFTProcessor::FIRState> FFTProcessor::buildDesignSnapshot(int& o
                               ? FirLengthChoices[firChoice]
                               : DefaultFirLength;
 
-    outEpoch = designEpoch.load(std::memory_order_acquire);
+    outPlanEpoch = designEpoch.load(std::memory_order_acquire);
+    outBuildGeneration = buildEpoch.load(std::memory_order_acquire);
     const double sr = sampleRate.load(std::memory_order_acquire);
 
-    std::lock_guard<std::mutex> lock (designMutex);
+    // The worker and the offline audio path share the design engine. Never
+    // block the audio thread here: if the worker owns the lock, skip this
+    // block and let the offline path retry on the next callback.
+    std::unique_lock<std::mutex> lock (designMutex, std::try_to_lock);
+    if (! lock.owns_lock())
+        return nullptr;
 
     if (sr != designSampleRate)
     {
@@ -886,7 +962,7 @@ bool FFTProcessor::buildWarmState(const FIRState& design, WarmState& out,
     {
         return threadShouldExit()
             || nonRealtime.load(std::memory_order_acquire)
-            || designEpoch.load(std::memory_order_acquire) != expectedEpoch;
+            || buildEpoch.load(std::memory_order_acquire) != expectedEpoch;
     };
 
     std::lock_guard<std::mutex> warmBuildLock(warmBuildMutex);
@@ -1044,7 +1120,11 @@ bool FFTProcessor::ensureOfflineReady()
 
     auto published = getPublishedStateForAudioThread();
 
+    const bool superseded = published != nullptr
+        && published->version <= adoptionCutoffVersion.load (std::memory_order_acquire)
+        && published->version != activeDesignVersion.load (std::memory_order_acquire);
     const bool needDesign = published == nullptr
+                         || superseded
                          || redesignRequested.load (std::memory_order_acquire);
     if (needDesign)
     {
@@ -1054,10 +1134,12 @@ bool FFTProcessor::ensureOfflineReady()
         }
         else
         {
-            int epoch = 0;
-            auto design = buildDesignSnapshot (epoch);
+            int planEpoch = 0;
+            int buildGeneration = 0;
+            auto design = buildDesignSnapshot (planEpoch, buildGeneration);
             if (design != nullptr
-                && epoch == designEpoch.load (std::memory_order_acquire))
+                && planEpoch == designEpoch.load (std::memory_order_acquire)
+                && buildGeneration == buildEpoch.load (std::memory_order_acquire))
             {
                 const int warmSlot = reserveFreeWarmSlot();
                 if (warmSlot >= 0
@@ -1066,7 +1148,8 @@ bool FFTProcessor::ensureOfflineReady()
                     const int slot = reserveFreeDesignSlot();
                     if (slot >= 0)
                     {
-                        if (epoch == designEpoch.load (std::memory_order_acquire))
+                        if (planEpoch == designEpoch.load (std::memory_order_acquire)
+                            && buildGeneration == buildEpoch.load (std::memory_order_acquire))
                         {
                             const int v = stateVersion.fetch_add (1, std::memory_order_acq_rel) + 1;
                             design->version = v;
@@ -1074,7 +1157,8 @@ bool FFTProcessor::ensureOfflineReady()
 
                             designSlots[slot].state = std::move (*design);
 
-                            if (epoch != designEpoch.load (std::memory_order_acquire))
+                            if (planEpoch != designEpoch.load (std::memory_order_acquire)
+                                || buildGeneration != buildEpoch.load (std::memory_order_acquire))
                             {
                                 designSlotStates[slot].store (DesignSlotFree,
                                                               std::memory_order_release);
@@ -1086,7 +1170,7 @@ bool FFTProcessor::ensureOfflineReady()
                             publishFirResponseSnapshot (designSlots[slot].state);
                             writePlanMeta (slot, warmSlot, v,
                                            designSlots[slot].state.groupDelay + (ConvBlockLen - 1),
-                                           warmSlots[warmSlot].state.targetSample, epoch);
+                                           warmSlots[warmSlot].state.targetSample, planEpoch);
                             designSlotStates[slot].store (DesignSlotReady,
                                                           std::memory_order_release);
                             warmSlotStates[warmSlot].store (WarmSlotReady,
@@ -1190,23 +1274,27 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
         return false;
     }
 
-    // One-time lazy twiddle warm-up on the audio thread. prepareToPlay may run
-    // on a different thread, and the twiddle cache is thread_local; doing this
-    // once here avoids a hidden allocation on the first real FFT block.
-    if (!audioTwiddlesPrewarmed)
-    {
-        for (int i = 0; i < NumFirLengthChoices; ++i)
-            prewarmTwiddleTable<double>(convolutionFftSize(FirLengthChoices[i], ConvBlockLen));
-        audioTwiddlesPrewarmed = true;
-    }
-
     const int channelCount = std::min(buffer.getNumChannels(), numChannels);
     if (channelCount <= 0)
         return false;
 
     const uint64_t historyCount = history.publishedCount();
 
-    auto warm = getWarmStateForAudioThread(published->version);
+    // A structural parameter change may leave an older plan published but not
+    // yet active. Keep the active FIR running, but never adopt that candidate:
+    // request a fresh design and ignore its warm state until the new version
+    // (above the cutoff) is published.
+    const int adoptCutoff = adoptionCutoffVersion.load(std::memory_order_acquire);
+    const bool superseded = published->version <= adoptCutoff
+                         && published->version
+                                != activeDesignVersion.load(std::memory_order_acquire);
+    if (superseded)
+    {
+        redesignRequested.store(true, std::memory_order_release);
+        redesignEvent.signal();
+    }
+
+    auto warm = superseded ? nullptr : getWarmStateForAudioThread(published->version);
 
     // Track the candidate's progressed target on the audio thread only. The
     // published WarmState is immutable once published; writing its target in
@@ -1230,10 +1318,13 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
     if (warmOk)
     {
         warmGap = static_cast<int>(historyCount - audioWarmTargetSample);
-        // The worker may just miss the target when the host block is large.
-        // Catch up at most the current host block (bounded by the caller's
-        // block size); larger gaps are rebuilt rather than chased.
-        const int catchUpLimit = std::max(ConvBlockLen, numSamples);
+        // The worker publishes the exact warm state one replay-block after the
+        // target (it can only read the samples at the boundary). Allow at most
+        // two OLA blocks of audio-thread catch-up; anything larger is rebuilt
+        // on the worker. Scaling this with the host block would make a 4096
+        // callback replay eight OLA blocks (tens of 131072-point FFTs) inside
+        // the audio thread, which is exactly the work the worker exists for.
+        const int catchUpLimit = 2 * ConvBlockLen;
         if (warmGap > catchUpLimit)
             warmOk = false;
     }
@@ -1319,8 +1410,12 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
                 if (latencyGuardVersion != published->version)
                 {
                     latencyGuardVersion = published->version;
-                    const int guardByTime = (sr > 0.0) ? static_cast<int>(0.05 * sr) : 0;
-                    latencyGuardSamples = std::max(2 * numSamples, guardByTime);
+                    // One host block (or 20 ms for small buffers) is enough for
+                    // the host to apply setLatencySamples on the next callback.
+                    // Two full blocks made large-buffer handshakes consume the
+                    // entire bounded gate budget before adoption.
+                    const int guardByTime = (sr > 0.0) ? static_cast<int>(0.02 * sr) : 0;
+                    latencyGuardSamples = std::max (numSamples, guardByTime);
                     pdcGuardMirror.store(latencyGuardSamples > 0,
                                          std::memory_order_release);
                 }
@@ -1339,17 +1434,20 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
 
         if (!warmOk)
         {
-            const bool haveCandidate = warm != nullptr
-                && warm->version == published->version
-                && warm->convFFTSize == published->convFFTSize
-                && warm->states.size() == activeStates.size();
-            const bool missed = haveCandidate
-                && warm->targetSample < historyCount;
-            // A candidate for a future host block is valid: wait for it.
-            // Rebuild only when absent, malformed, or already behind the
-            // playhead. No gate/catch-up is involved here.
-            if (!haveCandidate || missed)
-                warmRebuildRequested.store(true, std::memory_order_release);
+            if (!superseded)
+            {
+                const bool haveCandidate = warm != nullptr
+                    && warm->version == published->version
+                    && warm->convFFTSize == published->convFFTSize
+                    && warm->states.size() == activeStates.size();
+                const bool missed = haveCandidate
+                    && warm->targetSample < historyCount;
+                // A candidate for a future host block is valid: wait for it.
+                // Rebuild only when absent, malformed, or already behind the
+                // playhead. No gate/catch-up is involved here.
+                if (!haveCandidate || missed)
+                    warmRebuildRequested.store(true, std::memory_order_release);
+            }
         }
         else if (pdcBlocked)
         {
@@ -1370,7 +1468,7 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
         // matching warm state. If the candidate's boundary was missed, keep
         // the active design (or the delayed IIR bridge) and rebuild the warm
         // for a new future boundary. Never start a FIR from zero history.
-        if (warmOk && !pdcBlocked)
+        if (warmOk && !pdcBlocked && !superseded)
         {
             const bool sameDelay = activeState != nullptr
                                 && published->groupDelay == activeGroupDelay;
@@ -1409,6 +1507,7 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
             activeGroupDelay = published->groupDelay;
             processedVersion = published->version;
             activeDesignVersion.store(published->version, std::memory_order_release);
+            activeFirLength.store(published->firLength, std::memory_order_release);
             reportedActiveLatency.store(published->groupDelay + (ConvBlockLen - 1),
                                         std::memory_order_release);
             pdcGuardMirror.store(false, std::memory_order_release);
@@ -1508,18 +1607,6 @@ bool FFTProcessor::process(juce::AudioBuffer<float>& buffer)
 int FFTProcessor::getLatencySamples() const
 {
     return reportedActiveLatency.load(std::memory_order_acquire);
-}
-
-int FFTProcessor::getTailLengthSamples() const
-{
-    PlanMeta meta;
-    if (readPlanMeta (meta) && meta.slot >= 0 && meta.slot < NumDesignSlots
-        && meta.version >= minimumPlanVersion.load (std::memory_order_acquire)
-        && meta.epoch == designEpoch.load (std::memory_order_acquire))
-    {
-        return tailSamples (designSlots[meta.slot].state.firLength, ConvBlockLen);
-    }
-    return tailSamples (firActualTaps (MaxFirLength), ConvBlockLen);
 }
 
 //==============================================================================
@@ -1668,17 +1755,6 @@ bool FFTProcessor::computeFirMagnitudeDb(const FIRState& state,
 juce::StringArray FFTProcessor::getModeChoices()
 {
     return { "Zero Latency", "Minimum Phase", "Linear Phase" };
-}
-
-juce::String FFTProcessor::getModeName(EQMode mode)
-{
-    switch (mode)
-    {
-        case EQMode::ZeroLatency:   return "Zero Latency";
-        case EQMode::MinimumPhase:  return "Minimum Phase";
-        case EQMode::LinearPhase:   return "Linear Phase";
-    }
-    return "Zero Latency";
 }
 
 juce::String FFTProcessor::getLatencyText(int latencySamples, double sr)

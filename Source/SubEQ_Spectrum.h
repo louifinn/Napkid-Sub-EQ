@@ -31,6 +31,8 @@
 #include "SubEQ_DSPMath.h"
 #include "SubEQ_VQTDesign.h"
 
+#include <atomic>
+
 namespace SubEQ
 {
 
@@ -68,9 +70,6 @@ public:
     //（核半径见 smoothingRadiusBands）。
     void configure(int resolutionIndex, int numBands, int hopSize, WindowType window,
                    int smoothingIndex);
-
-    int getNumBands() const noexcept { return numBands.load(); }
-    int getHopSize() const noexcept { return hopSize.load(); }
 
     // Push audio samples (called from audio thread)
     void process(const float* samples, int numSamples);
@@ -156,13 +155,16 @@ private:
     double dcState = 0.0;
 
     // Three-buffer spectrum frames. Audio writes a back frame, publishes its
-    // index, and never writes the frame the GUI is currently reading.
+    // index, and never writes the frame the GUI is currently reading. Every
+    // shared field is atomic: the reader validates `seq` after copying, so a
+    // concurrent publish is detected and retried (a plain seqlock payload
+    // would be a formal C++ data race even if x86 word loads are benign).
     struct SpectrumFrame
     {
         std::atomic<uint32_t> seq { 0 };
-        uint32_t resetEpoch = 0;
-        int bands = 0;
-        float values[MaxBands] {};
+        std::atomic<uint32_t> resetEpoch { 0 };
+        std::atomic<int> bands { 0 };
+        std::atomic<float> values[MaxBands] {};
     };
     SpectrumFrame frames[3];
     std::atomic<uint32_t> readyFrame { 0 };

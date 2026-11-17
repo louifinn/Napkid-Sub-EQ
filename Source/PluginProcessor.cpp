@@ -62,8 +62,9 @@ SubEQAudioProcessor::SubEQAudioProcessor()
     }
 
     // Deferred PDC reporting poll (message thread) — see timerCallback.
-    // 30 Hz keeps the report→ack→guard handshake well below the old 100 ms.
-    startTimerHz (30);
+    // 60 Hz keeps the report→ack handshake short enough for the bounded
+    // gate budget (a 30 Hz poll alone can consume half of it).
+    startTimerHz (60);
 }
 
 void SubEQAudioProcessor::timerCallback()
@@ -150,19 +151,33 @@ double SubEQAudioProcessor::getTailLengthSeconds() const
     const auto mode = static_cast<SubEQ::EQMode> (
         juce::roundToInt (eqModeParam != nullptr ? eqModeParam->load() : 0.0f));
     if (mode == SubEQ::EQMode::ZeroLatency)
-        return 0.0;
+    {
+        // The IIR path has no fixed FIR tail, but 0.5 Hz / Q10 biquads can
+        // ring for seconds; report a conservative tail so freeze/bounce does
+        // not truncate it.
+        return 2.0;
+    }
 
     const double sr = getSampleRate();
     if (sr <= 0.0)
         return 0.0;
 
+    // While a structural change is pending, the selected FIR length can differ
+    // from the design actually feeding the audio path. Prefer the mirrored
+    // active length (exact for both linear and minimum phase) so a host
+    // truncating the old tail cannot cut audible samples.
+    const int activeTaps = fftProcessor.getActiveFirLength();
+    if (activeTaps > 0)
+        return static_cast<double> (SubEQ::tailSamples (activeTaps, SubEQ::FFTProcessor::ConvBlockLen)) / sr;
+
+    // No active FIR design (warming or ZL): fall back to the selected length.
     const int choice = firLengthParam != nullptr
                            ? juce::roundToInt (firLengthParam->load()) : 0;
     const int index = juce::jlimit (0, SubEQ::FFTProcessor::NumFirLengthChoices - 1, choice);
     const int nominal = SubEQ::FFTProcessor::FirLengthChoices[index];
     const int taps = (mode == SubEQ::EQMode::LinearPhase)
                          ? std::max (1, nominal - 1) : nominal;
-    return static_cast<double> (taps + SubEQ::FFTProcessor::ConvBlockLen) / sr;
+    return static_cast<double> (SubEQ::tailSamples (taps, SubEQ::FFTProcessor::ConvBlockLen)) / sr;
 }
 
 bool SubEQAudioProcessor::getFirResponseSnapshot(
@@ -304,7 +319,10 @@ void SubEQAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
         switchGateHoldSamples = 0;
         latencyCoordinator.reset();
     }
-    switchGateStep = 1.0f / static_cast<float> (std::max (1.0, 0.005 * sampleRate));
+    // 1 ms fade: long enough to avoid a hard-mute click, short enough that the
+    // PDC report can follow in the next block (the coordinator only reports
+    // once the gate is fully closed).
+    switchGateStep = 1.0f / static_cast<float> (std::max (1.0, 0.001 * sampleRate));
     firEntryFadeRemaining = 0;
     fftProcessor.prepare (sampleRate, samplesPerBlock, getTotalNumInputChannels());
     fftProcessor.setParameterSource (&apvts);
@@ -547,7 +565,8 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     // Input spectrum: analyze BEFORE processing (buffer still holds the raw
     // input at this point; EQ processing overwrites it in place). 频谱分析
     // 仅在编辑器存在时运行（spectrumEditorCount 由编辑器构造/析构维护）。
-    if (spectrumEditorCount.load() > 0 && totalNumInputChannels > 0)
+    if (spectrumEditorCount.load() > 0 && spectrumEditorActiveCount.load() > 0
+        && totalNumInputChannels > 0)
         inputAnalyzer.process (buffer.getReadPointer (0), buffer.getNumSamples());
 
     // Bounded latency coordinator (pure state machine in
@@ -578,8 +597,12 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         int recheckLatency = 0;
         bool recheckWarmReady = false;
         fftProcessor.getPublishedPlan (recheckVersion, recheckLatency, recheckWarmReady);
+        const uint64_t recheckTarget = fftProcessor.getPendingTargetSample();
 
-        if (recheckVersion == planVersion && recheckLatency == planLatency)
+        if (recheckVersion == planVersion
+            && recheckLatency == planLatency
+            && recheckWarmReady == planWarmReady
+            && recheckTarget == planTarget)
             break;
 
         if (attempt == 1)
@@ -597,6 +620,8 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     latencyInput.publishedLatency = planLatency;
     latencyInput.guardActive = fftProcessor.isPdcGuardActive();
     latencyInput.warmReady = planWarmReady;
+    latencyInput.gateAtZero = switchGateGain <= 1.0e-4f;
+    latencyInput.catchUpLimitSamples = 2 * SubEQ::FFTProcessor::ConvBlockLen;
 
     const auto latencyDecision = latencyCoordinator.evaluate (latencyInput);
 
@@ -781,7 +806,8 @@ void SubEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     }
 
     // Feed audio to the output spectrum analyzer (final post-EQ/output signal)
-    if (spectrumEditorCount.load() > 0 && totalNumInputChannels > 0)
+    if (spectrumEditorCount.load() > 0 && spectrumEditorActiveCount.load() > 0
+        && totalNumInputChannels > 0)
         spectrumAnalyzer.process (buffer.getReadPointer (0), buffer.getNumSamples());
 
     // Publish this block's raw input only after convolution has advanced.
@@ -806,7 +832,7 @@ void SubEQAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
     std::unique_ptr<juce::XmlElement> xml (state.createXml());
     // Explicit state version for future parameter-semantics migrations. A
     // missing attribute means a pre-0.5.0 session.
-    xml->setAttribute ("stateVersion", 3);
+    xml->setAttribute ("stateVersion", kCurrentStateVersion);
     copyXmlToBinary (*xml, destData);
 }
 
@@ -818,6 +844,14 @@ void SubEQAudioProcessor::setStateInformation (const void* data, int sizeInBytes
         return;
 
     const int stateVersion = xmlState->getIntAttribute ("stateVersion", 1);
+
+    // v1/v2 -> v3: the only structural change is the added spectrum_range
+    // parameter, handled by the missing-ID loop below. A future state is
+    // loaded best-effort but flagged in Debug rather than silently treated as
+    // current; unknown choice semantics should be added here as explicit
+    // migrations, never inferred from the current layout.
+    if (stateVersion > kCurrentStateVersion)
+        jassertfalse;
 
     // Collect parameter IDs present in the incoming tree. APVTS's
     // replaceState() creates missing parameter children from the *current*
@@ -854,10 +888,11 @@ void SubEQAudioProcessor::setStateInformation (const void* data, int sizeInBytes
             ranged->setValueNotifyingHost (ranged->getDefaultValue());
     }
 
-    // v3 is current. The missing-parameter loop above is the active migration
-    // for v1/v2 sessions; semantic choice-index migrations remain versioned
-    // here when a future session format requires them.
-    juce::ignoreUnused (stateVersion);
+    if (stateVersion < kCurrentStateVersion)
+    {
+        // v1/v2: missing spectrum_range is now the layout default (60 dB);
+        // all pre-existing choice indices are already compatible with v3.
+    }
 
     // Do not write modeChanged/eqParamsChanged/lastRequestedDesignVersion from
     // the message thread: those are audio-thread caches. updateEQParameters()

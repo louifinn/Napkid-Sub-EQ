@@ -14,17 +14,6 @@
 namespace SubEQ
 {
 
-// A warm state at warmBlockIndex can be advanced to currentBlockIndex by
-// replaying at most maxCatchUpBlocks OLA blocks. A warm state ahead of the
-// current boundary is never adopted.
-inline bool firWarmCatchUpAllowed(int warmBlockIndex, int currentBlockIndex,
-                                  int maxCatchUpBlocks) noexcept
-{
-    return warmBlockIndex >= 0
-        && warmBlockIndex <= currentBlockIndex
-        && (currentBlockIndex - warmBlockIndex) <= maxCatchUpBlocks;
-}
-
 // New-side weight for sample n of a crossfade that started with startRemaining
 // samples left. Weight 0 = old design, 1 = new design.
 inline float firCrossfadeWeight(int sampleIndex, int startRemaining, int fadeLen) noexcept

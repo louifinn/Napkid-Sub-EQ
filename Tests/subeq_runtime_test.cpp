@@ -13,11 +13,38 @@
 #include <JuceHeader.h>
 #include "PluginProcessor.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <limits>
+#include <new>
 #include <vector>
+
+namespace
+{
+std::atomic<bool> trackAudioAllocations { false };
+std::atomic<int> audioAllocationCount { 0 };
+thread_local bool trackThisThread = false;
+}
+
+void* operator new (std::size_t size)
+{
+    if (trackThisThread && trackAudioAllocations.load (std::memory_order_relaxed))
+        audioAllocationCount.fetch_add (1, std::memory_order_relaxed);
+    if (auto* p = std::malloc (size == 0 ? 1 : size))
+        return p;
+    throw std::bad_alloc();
+}
+void* operator new[] (std::size_t size)
+{
+    return ::operator new (size);
+}
+void operator delete (void* p) noexcept { std::free (p); }
+void operator delete[] (void* p) noexcept { std::free (p); }
+void operator delete (void* p, std::size_t) noexcept { std::free (p); }
+void operator delete[] (void* p, std::size_t) noexcept { std::free (p); }
 
 #if JUCE_WINDOWS
  #include <windows.h>
@@ -33,7 +60,7 @@ namespace
 {
 int failures = 0;
 int checksRun = 0;
-constexpr int kExpectedChecks = 66;
+constexpr int kExpectedChecks = 96;
 
 void check(bool condition, const char* message)
 {
@@ -64,17 +91,6 @@ float setChoice(SubEQAudioProcessor& processor, const char* id, int index)
         return norm;
     }
     return 0.0f;
-}
-
-void pumpMessages(int ms)
-{
-    // runDispatchLoopUntil() is not available in this JUCE 7 build; run the
-    // message loop with a one-shot timer that stops it after `ms`.
-    juce::Timer::callAfterDelay(ms, []
-    {
-        juce::MessageManager::getInstance()->stopDispatchLoop();
-    });
-    juce::MessageManager::getInstance()->runDispatchLoop();
 }
 
 // Real wall-clock pump for the VST3 bundle test: the hosted instance lives in
@@ -109,6 +125,12 @@ struct Host
     juce::MidiBuffer midi;
     int phase = 0;
     bool pumpLatency = true;   // false = simulate a host that never acks PDC
+    float lastBlockPeak = 0.0f;
+    int silentRunBlocks = 0;
+    int maxSilentRunBlocks = 0;
+    int lastProcessAllocationCount = 0;
+    int maxProcessAllocationCount = 0;
+    bool sawNonFinite = false;
 
     explicit Host(int bs = 512, double sr = 48000.0, int channels = 2)
         : sampleRate(sr), blockSize(bs), buffer(channels, bs)
@@ -126,7 +148,27 @@ struct Host
                 buffer.setSample(ch, n, 0.25f * std::sin(2.0f * juce::MathConstants<float>::pi * 100.0f * t));
             }
         phase += blockSize;
+        audioAllocationCount.store (0, std::memory_order_relaxed);
+        trackThisThread = true;
+        trackAudioAllocations.store (true, std::memory_order_relaxed);
         processor.processBlock(buffer, midi);
+        trackAudioAllocations.store (false, std::memory_order_relaxed);
+        trackThisThread = false;
+        lastProcessAllocationCount = audioAllocationCount.load (std::memory_order_relaxed);
+        maxProcessAllocationCount = std::max (maxProcessAllocationCount,
+                                              lastProcessAllocationCount);
+        if (! outputFinite())
+            sawNonFinite = true;
+        lastBlockPeak = peak();
+        if (lastBlockPeak < 1.0e-5f)
+        {
+            ++silentRunBlocks;
+            maxSilentRunBlocks = std::max(maxSilentRunBlocks, silentRunBlocks);
+        }
+        else
+        {
+            silentRunBlocks = 0;
+        }
         // Drive the deferred PDC report/ack deterministically instead of
         // relying on the message-thread timer in a console harness.
         if (pumpLatency)
@@ -139,6 +181,54 @@ struct Host
     {
         for (int i = 0; i < count; ++i)
             processBlock(sleepMs);
+    }
+
+    // Feed a unit impulse at impulseSample and return the index of the largest
+    // output sample. Used to verify the reported PDC against the real path.
+    int findImpulsePeak(int impulseSample, int totalSamples)
+    {
+        int peakIndex = -1;
+        float peak = 0.0f;
+        for (int start = 0; start < totalSamples; start += blockSize)
+        {
+            const int n = std::min(blockSize, totalSamples - start);
+            for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+                for (int i = 0; i < blockSize; ++i)
+                    buffer.setSample(ch, i,
+                        (start + i == impulseSample) ? 1.0f : 0.0f);
+
+            processor.processBlock(buffer, midi);
+            if (pumpLatency)
+                processor.processDeferredLatencyForTest();
+
+            for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+                for (int i = 0; i < n; ++i)
+                {
+                    const float v = std::abs(buffer.getSample(ch, i));
+                    if (v > peak)
+                    {
+                        peak = v;
+                        peakIndex = start + i;
+                    }
+                }
+        }
+        return peakIndex;
+    }
+
+    void resetBlockStats()
+    {
+        lastBlockPeak = 0.0f;
+        silentRunBlocks = 0;
+        maxSilentRunBlocks = 0;
+        lastProcessAllocationCount = 0;
+        maxProcessAllocationCount = 0;
+        sawNonFinite = false;
+    }
+
+    double maxSilentRunSeconds() const
+    {
+        return static_cast<double>(maxSilentRunBlocks)
+             * static_cast<double>(blockSize) / sampleRate;
     }
 
     void changeSampleRate(double newRate)
@@ -181,7 +271,7 @@ struct Host
 
     void dump(const char* tag)
     {
-        std::printf("  [%s] mode=%d fir=%g enabled=%g bypass=%g hostLat=%d reported=%d designV=%d active=%d iirL=%d trans=%d target=%llu committed=%llu peak=%g\n",
+        std::printf("  [%s] mode=%d fir=%g enabled=%g bypass=%g hostLat=%d reported=%d planL=%d designV=%d active=%d iirL=%d trans=%d cool=%d target=%llu committed=%llu peak=%g\n",
                     tag,
                     processor.getCurrentMode(),
                     rawParam("fir_length"),
@@ -189,10 +279,12 @@ struct Host
                     rawParam("bypass"),
                     processor.getLatencySamples(),
                     processor.getCurrentLatencySamples(),
+                    processor.getPublishedLatencyForTest(),
                     processor.getFirDesignVersion(),
                     processor.isFirActiveForTest() ? 1 : 0,
                     processor.getIirPathLatencyForTest(),
                     processor.isLatencyTransitionForTest() ? 1 : 0,
+                    processor.getLatencyAbortCooldownForTest(),
                     static_cast<unsigned long long>(processor.getPendingTargetForTest()),
                     static_cast<unsigned long long>(processor.getCommittedForTest()),
                     peak());
@@ -510,8 +602,11 @@ int main(int argc, char** argv)
         // audio alive while the design/warm is built; the worker needs real
         // time to synthesize, so process at roughly host cadence.
         setChoice(host.processor, "eq_mode", 2);
-        host.runBlocks(40, 10);
-        host.dump("Linear 65536 after 40 blocks");
+        host.resetBlockStats();   // include the first FIR activation block
+        // Linear 65536 cannot legally adopt before its 32767-sample group
+        // delay has entered the session; allow the bridge to cover that lead.
+        host.runBlocks(120, 10);
+        host.dump("Linear 65536 after 120 blocks");
         const int expectedLatency = 33278;
         check(host.processor.getCurrentMode() == SubEQ::EQMode::LinearPhase,
               "mode switch reaches Linear Phase");
@@ -526,6 +621,8 @@ int main(int argc, char** argv)
         check(host.peak() > 1.0e-4f, "65536 linear phase produces audio after warm-up");
         check(host.processor.isFirActiveForTest(), "65536 Linear FIR design is active after warm-up");
         check(host.outputFinite(), "65536 warm-up output stays finite");
+        check(host.maxProcessAllocationCount == 0,
+              "FIR activation and steady state perform no operator-new allocation");
 
         // Switch to Minimum Phase: active Linear design must keep playing
         // until the new candidate is ready; latency becomes 511.
@@ -536,6 +633,23 @@ int main(int argc, char** argv)
               "minimum phase reports 511-sample latency");
         check(host.outputFinite(), "Min<->Linear transition output stays finite");
         check(host.peak() > 1.0e-4f, "minimum phase produces audio");
+
+        // A structural mode change must not invalidate the already-active
+        // design: the old FIR stays audible while the replacement warms.
+        const int activeBeforeStructural = host.processor.getActiveFirDesignVersion();
+        host.resetBlockStats();
+        setChoice(host.processor, "eq_mode", 2);   // Minimum -> Linear
+        host.runBlocks(1, 10);
+        host.dump("structural hold after mode request");
+        check(host.processor.isFirActiveForTest(),
+              "structural change keeps the old FIR audible");
+        check(host.processor.getActiveFirDesignVersion() == activeBeforeStructural,
+              "structural change does not drop the active design");
+        check(host.maxProcessAllocationCount == 0,
+              "structural transition processBlock performs no operator-new allocation");
+        host.runBlocks(200, 10);
+        check(host.processor.isFirActiveForTest(),
+              "structural replacement becomes active");
 
         // Bypass with a latency-compensated dry path; output must not go NaN
         // or silent and the FIR path must keep running.
@@ -562,6 +676,52 @@ int main(int argc, char** argv)
         std::printf("Host test peak=%.6f latency=%d tail=%.3f s\n",
                     host.peak(), host.processor.getLatencySamples(),
                     host.processor.getTailLengthSeconds());
+    }
+
+    // Host tail hint during a pending structural change: a shorter FIR request
+    // must not make the host truncate the still-active 65536-tap tail.
+    {
+        Host tail;
+        setChoice(tail.processor, "eq_mode", 2);
+        setChoice(tail.processor, "fir_length", 2);   // 65536
+        setParam(tail.processor, "node0_enabled", 1.0f);
+        setParam(tail.processor, "node0_freq", 80.0f);
+        setParam(tail.processor, "node0_gain", 6.0f);
+        tail.runBlocks(250, 10);
+        check(tail.processor.isFirActiveForTest(),
+              "tail test: 65536 linear design is active");
+
+        setChoice(tail.processor, "fir_length", 0);   // request 4096
+        tail.runBlocks(1, 10);
+        check(tail.processor.getAPVTS().getRawParameterValue("fir_length")->load() == 0.0f,
+              "tail test: shorter FIR request is recorded");
+        check(tail.processor.getLatencySamples() == 33278
+                  && tail.processor.isFirActiveForTest(),
+              "tail test: 65536 design is still the active path");
+        check(tail.processor.getTailLengthSeconds() > 1.0,
+              "tail length follows the active design while a shorter FIR is pending");
+    }
+
+    // Minimum-phase active design with a shorter Linear request: the tail must
+    // still follow the active 65536-tap design (latency alone cannot reveal a
+    // minimum-phase length).
+    {
+        Host minTail;
+        setChoice(minTail.processor, "eq_mode", 1);
+        setChoice(minTail.processor, "fir_length", 2);
+        setParam(minTail.processor, "node0_enabled", 1.0f);
+        setParam(minTail.processor, "node0_freq", 80.0f);
+        setParam(minTail.processor, "node0_gain", 6.0f);
+        minTail.runBlocks(250, 10);
+        check(minTail.processor.isFirActiveForTest()
+                  && minTail.processor.getLatencySamples() == 511,
+              "tail test: 65536 minimum-phase design is active");
+
+        setChoice(minTail.processor, "eq_mode", 2);
+        setChoice(minTail.processor, "fir_length", 0);   // request Linear 4096
+        minTail.runBlocks(1, 10);
+        check(minTail.processor.getTailLengthSeconds() > 1.0,
+              "tail length follows the active minimum-phase design");
     }
 
     // Cold start directly in Linear Phase (no Zero Latency history first).
@@ -627,6 +787,19 @@ int main(int argc, char** argv)
         check(large.outputFinite(), "4096-block linear phase output stays finite");
         check(large.peak() > 1.0e-4f, "4096-block linear phase produces audio");
         check(large.processor.isFirActiveForTest(), "4096-block Linear FIR design is active");
+        // A PDC handshake is block-quantized: the gate closes while the planned
+        // warm target (up to four host blocks ahead) is awaited, then report,
+        // ack, guard and switch. At 4096 samples that spans five blocks; the
+        // assertion still rejects an abort/retry loop that would stretch it.
+        std::printf("4096 transition max silent=%.3f s\n",
+                    large.maxSilentRunSeconds());
+        const double blockSeconds = static_cast<double>(large.blockSize)
+                                  / large.sampleRate;
+        check(large.maxSilentRunSeconds() >= blockSeconds,
+              "4096-block transition actually engages the gate");
+        check(large.maxSilentRunSeconds()
+                  <= std::max(0.20, 6.0 * blockSeconds) + 1.0e-9,
+              "4096-block transition mute stays within the block-quantized budget");
         setParam(large.processor, "bypass", 1.0f);
         large.runBlocks(8);
         check(large.outputFinite(), "4096-block bypass output stays finite");
@@ -725,11 +898,15 @@ int main(int argc, char** argv)
         setParam(host.processor, "node0_enabled", 1.0f);
         setParam(host.processor, "node0_freq", 80.0f);
         setParam(host.processor, "node0_gain", 6.0f);
+        host.resetBlockStats();
         const float noAckPeak = host.runBlocksTracked(120, 5);
         host.dump("no-PDC-ack after 120 blocks");
 
         check(host.outputFinite(), "no-PDC-ack: output stays finite");
         check(noAckPeak > 1.0e-5f, "no-PDC-ack: IIR bridge stays audible");
+        check(!host.sawNonFinite, "no-PDC-ack: no non-finite block is emitted");
+        check(host.maxSilentRunSeconds() <= 0.20,
+              "no-PDC-ack: worst mute run stays within the bounded gate budget");
         check(!host.processor.isFirActiveForTest(),
               "no-PDC-ack: unacknowledged design is never adopted");
 
@@ -744,6 +921,90 @@ int main(int argc, char** argv)
               "no-PDC-ack: recovered output is audible");
     }
 
+    // Bypass toggled across a latency transition: the dry path must stay
+    // finite and audible while the PDC coordinator is mid-handshake, and the
+    // pending transition must still settle on the new design.
+    {
+        Host host;
+        setParam(host.processor, "node0_enabled", 1.0f);
+        setParam(host.processor, "node0_freq", 80.0f);
+        setParam(host.processor, "node0_gain", 6.0f);
+        setParam(host.processor, "bypass", 1.0f);
+        host.runBlocks(6);
+
+        setChoice(host.processor, "eq_mode", 2);
+        setChoice(host.processor, "fir_length", 2);   // 65536: long PDC handshake
+        bool sawTransition = false;
+        host.resetBlockStats();
+        for (int i = 0; i < 160; ++i)
+        {
+            if (i % 8 == 0)
+                setParam(host.processor, "bypass", ((i / 8) % 2) ? 1.0f : 0.0f);
+            host.runBlocks(1, 10);
+            sawTransition = sawTransition
+                         || host.processor.isLatencyTransitionForTest();
+        }
+
+        setParam(host.processor, "bypass", 0.0f);
+        host.runBlocks(200, 10);
+        host.dump("bypass across PDC transition");
+        check(sawTransition, "bypass across PDC transition exercises the handshake");
+        check(!host.sawNonFinite,
+              "bypass across PDC transition never emits a non-finite block");
+        std::printf("bypass transition max silent=%.3f s\n",
+                    host.maxSilentRunSeconds());
+        check(host.maxSilentRunSeconds() <= 0.20,
+              "bypass across PDC transition mute stays bounded");
+        check(host.outputFinite(), "bypass across PDC transition stays finite");
+        check(host.peak() > 1.0e-5f, "bypass across PDC transition stays audible");
+        check(host.processor.getLatencySamples() == 33278
+                  && host.processor.isFirActiveForTest(),
+              "bypass across PDC transition settles on the new FIR");
+    }
+
+    // A published-but-unadopted candidate must be discarded when a newer
+    // structural change supersedes it: construct a Min 4096 candidate while
+    // the Linear 65536 design stays active and the host never acks, then go
+    // back to Linear. The candidate must never be adopted in between.
+    {
+        Host cutoffHost;
+        setChoice(cutoffHost.processor, "eq_mode", 2);
+        setChoice(cutoffHost.processor, "fir_length", 2);
+        setParam(cutoffHost.processor, "node0_enabled", 1.0f);
+        setParam(cutoffHost.processor, "node0_freq", 80.0f);
+        setParam(cutoffHost.processor, "node0_gain", 6.0f);
+        cutoffHost.runBlocks(250, 10);
+        check(cutoffHost.processor.isFirActiveForTest()
+                  && cutoffHost.processor.getLatencySamples() == 33278,
+              "cutoff test: Linear 65536 is active");
+
+        cutoffHost.pumpLatency = false;
+        setChoice(cutoffHost.processor, "eq_mode", 1);   // request Min 4096
+        setChoice(cutoffHost.processor, "fir_length", 0);
+        cutoffHost.runBlocks(150, 10);
+        check(cutoffHost.processor.getPublishedLatencyForTest() == 511,
+              "cutoff test: Min candidate is published but not acknowledged");
+        check(cutoffHost.processor.getLatencySamples() == 33278
+                  && cutoffHost.processor.isFirActiveForTest(),
+              "cutoff test: old Linear design remains active");
+
+        setChoice(cutoffHost.processor, "eq_mode", 2);   // supersede the candidate
+        setChoice(cutoffHost.processor, "fir_length", 2);
+        cutoffHost.pumpLatency = true;
+        bool sawMinLatency = false;
+        for (int i = 0; i < 240; ++i)
+        {
+            cutoffHost.runBlocks(1, 10);
+            if (cutoffHost.processor.getLatencySamples() == 511)
+                sawMinLatency = true;
+        }
+        check(!sawMinLatency,
+              "cutoff test: superseded candidate is never adopted");
+        check(cutoffHost.processor.isFirActiveForTest()
+                  && cutoffHost.processor.getLatencySamples() == 33278,
+              "cutoff test: Linear 65536 is active after the supersede");
+    }
+
     // Stress: rapid mode/FIR-length switches with interleaved prepareToPlay
     // re-entry must leave a finite, audible output (design epochs, retirement
     // rings and the PDC coordinator all reset/recover).
@@ -753,12 +1014,12 @@ int main(int argc, char** argv)
         setParam(stress.processor, "node0_freq", 80.0f);
         setParam(stress.processor, "node0_gain", 6.0f);
 
-        for (int i = 0; i < 24; ++i)
+        for (int i = 0; i < 200; ++i)
         {
             setChoice(stress.processor, "eq_mode",
                       (i % 3 == 0) ? 0 : ((i % 3 == 1) ? 1 : 2));
             setChoice(stress.processor, "fir_length", i % 3);
-            stress.runBlocks(3, 1);
+            stress.runBlocks(1, 0);
             if (i % 6 == 5)
                 stress.processor.prepareToPlay(stress.sampleRate, stress.blockSize);
         }
@@ -768,6 +1029,8 @@ int main(int argc, char** argv)
         const float stressPeak = stress.runBlocksTracked(150, 10);
 
         check(stress.outputFinite(), "rapid mode/FIR/prepare stress output stays finite");
+        check(!stress.sawNonFinite,
+              "rapid mode/FIR/prepare stress never emits a non-finite block");
         check(stressPeak > 1.0e-5f, "rapid mode/FIR/prepare stress output stays audible");
         check(stress.processor.getLatencySamples() == 2558,
               "rapid mode/FIR/prepare stress recovers the latency report");
@@ -789,6 +1052,23 @@ int main(int argc, char** argv)
               "offline Minimum Phase first block is audible (no startup gate)");
         check(offlineFirst.processor.isFirActiveForTest(),
               "offline Minimum Phase activates on the first block");
+    }
+
+    // PDC truth: an impulse must emerge at exactly the reported latency.
+    {
+        Host linearImpulse(4096);
+        linearImpulse.processor.setNonRealtime(true);
+        setChoice(linearImpulse.processor, "eq_mode", 2);    // Linear
+        setChoice(linearImpulse.processor, "fir_length", 0); // 4096
+        const int peak = linearImpulse.findImpulsePeak(0, 4096 * 3);
+        check(peak == 2558, "PDC: Linear 4096 impulse emerges at 2558 samples");
+
+        Host minImpulse(4096);
+        minImpulse.processor.setNonRealtime(true);
+        setChoice(minImpulse.processor, "eq_mode", 1);       // Minimum
+        setChoice(minImpulse.processor, "fir_length", 0);    // 4096
+        const int minPeak = minImpulse.findImpulsePeak(0, 4096 * 3);
+        check(minPeak == 511, "PDC: Minimum 4096 impulse emerges at 511 samples");
     }
 
     // Runtime spectrum: configure, feed 3 s, read a complete frame, reset to
@@ -828,13 +1108,33 @@ int main(int argc, char** argv)
             allFloor = allFloor && std::abs(bands[i] + 60.0f) < 1.0e-3f;
         check(allFloor, "runtime spectrum: editor reopen shows the floor frame");
 
+        // Advance the reset epoch before injecting NaN: resetPublishedDisplay
+        // alone floors every frame, so the old test never observed the
+        // analyser's own state.
+        spec.resetDisplayState();
         for (auto& v : block) v = std::numeric_limits<float>::quiet_NaN();
         spec.process(block.data(), 512);
         const int nanBands = spec.getSpectrum(bands);
         bool nanFinite = nanBands == 121;
         for (int i = 0; i < nanBands; ++i)
             nanFinite = nanFinite && std::isfinite(bands[i]);
-        check(nanFinite, "runtime spectrum: NaN input does not poison the frame");
+        check(nanFinite,
+              "runtime spectrum: NaN input frame stays finite (input guard + display clamp)");
+
+        // Recovery: after the NaN block, a valid tone must bring energy back.
+        for (int n = 0; n < 48000; n += 512)
+        {
+            for (int i = 0; i < 512; ++i)
+                block[static_cast<size_t>(i)] =
+                    0.5f * std::sin(2.0f * juce::MathConstants<float>::pi
+                                    * 100.0f * static_cast<float>(n + i) / 48000.0f);
+            spec.process(block.data(), 512);
+        }
+        bool recovered = false;
+        const int recoveredBands = spec.getSpectrum(bands);
+        for (int i = 0; i < recoveredBands; ++i)
+            recovered = recovered || bands[i] > -50.0f;
+        check(recovered, "runtime spectrum: analyser recovers after NaN input");
     }
 
     // Accelerated soak: 60 s of offline audio with periodic node automation.

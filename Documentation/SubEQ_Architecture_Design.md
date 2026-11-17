@@ -217,6 +217,16 @@ Source/
 ├── SubEQ_FFTConvolver.h     [新增] overlap-add 卷积原语（共享纯计算，无 JUCE）
 ├── SubEQ_SpectrumMath.h     [新增] octave 频段/显示平滑/包络（共享纯计算）
 ├── SubEQ_SpectrumConfig.h   [新增] 频谱 choice 下标→语义值解码（共享纯计算）
+├── SubEQ_WindowFunctions.h  [新增] Hann/Blackman/BH-4/Nuttall 窗族（共享纯计算）
+├── SubEQ_VQTDesign.h        [新增] VQT 层/帧长/匹配核/抽取/直流阻断（共享纯计算）
+├── SubEQ_FIRHistory.h       [新增] captured/committed 输入历史环（共享纯计算）
+├── SubEQ_WarmPlan.h         [新增] host-block 对齐 warm 目标规划（共享纯计算）
+├── SubEQ_FIRSwitchState.h   [新增] FIR 交叉淡化权重（共享纯计算）
+├── SubEQ_OlaBank.h          [新增] 固定容量 OLA 与精确 warm 合成（共享纯计算）
+├── SubEQ_OutputStage.h      [新增] 后置主增益/延迟补偿旁路（共享纯计算）
+├── SubEQ_FirResolution.h    [新增] FIR 分辨率评估（共享纯计算）
+├── SubEQ_LatencyMath.h      [新增] FIR 抽头/群延迟/管线延迟统一换算
+├── SubEQ_LatencyCoordinator.h [新增] 有界 PDC 迁移纯状态机
 ├── SubEQ_CoordinateMapper.h [新增] 频响图坐标映射（共享纯计算）
 ├── SubEQ_NodeInteraction.h  [新增] 增益敏感类型/切换重置/对数 Q 步进（共享纯计算）
 ├── SubEQ_Spring.h           [新增] 二阶弹簧积分器（共享纯计算）
@@ -270,7 +280,7 @@ Source/
 | ASIO 支持 | **已添加**，Standalone 版本可用 |
 | 处理模式 | **三种全局模式**（Zero Latency / Minimum Phase / Linear Phase）+ FIR 长度可选（4096 / 16384 / 65536） |
 
-> **FIR 实现注记（v0.5.0）**：标称 4096 / 16384 / 65536 在 Linear Phase 内部对应 Type-I 奇数抽头 4095 / 16383 / 65535，群延迟为整数 (N-1)/2，Nyquist 不再被结构性强制为零。切换采用 T2 精确边界预热：后台用 overlap-save 求边界 S 处累加器，再回放最后一块重建 pending outQueue；设计与 warm 状态原子发布，音频只在 `blockIndex == currentOlaBlockIndex` 时采纳，不做 K 块逐块回放/音频线程 catch-up/零状态超时兜底。同 groupDelay 走 1024 样本交叉淡化（两侧均处理真实输入），异 groupDelay 经 PDC 握手（packed version+latency、按采样数 guard）后冲刷切换；延迟变化期间由静音门控遮住 host PDC 更新窗口，IIR 桥按 host-facing latency 延迟。最小相位 FIR 由倒谱/解析零点法设计，双精度抽头。默认平滑档为 Off，底部 VQT 帧长为“≥2 s 的 2 的幂”；低频频段镜像支撑不做抑制（物理限制）。
+> **FIR 实现注记（v0.5.0）**：标称 4096 / 16384 / 65536 在 Linear Phase 内部对应 Type-I 奇数抽头 4095 / 16383 / 65535，群延迟为整数 (N-1)/2，Nyquist 不再被结构性强制为零。切换采用 T2 精确边界预热：后台用 overlap-save 求边界 S 处累加器，再回放最后一块重建 pending outQueue；设计与 warm 状态原子发布，音频只在目标 host block 起点采纳，允许最多 2 个 OLA 块（1024 样本）的音频线程有界追赶，更大间隔由后台按同一设计重选目标，不丢弃设计、不无限静音。线性相位冷启动的 warm 目标不早于 session 历史覆盖 group delay。同 groupDelay 走 1024 样本交叉淡化（两侧均处理真实输入），异 groupDelay 经 PDC 握手（packed version+latency、按采样数 guard）后冲刷切换；延迟变化期间由静音门控遮住 host PDC 更新窗口，IIR 桥按 host-facing latency 延迟。最小相位 FIR 由倒谱/解析零点法设计，双精度抽头。默认平滑档为 Off，底部 VQT 帧长为“≥2 s 的 2 的幂”；低频频段镜像支撑不做抑制（物理限制）。
 
 ---
 

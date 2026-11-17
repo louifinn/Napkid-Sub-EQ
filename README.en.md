@@ -182,7 +182,7 @@ Sub EQ/
 │   ├── SubEQ_FilterType.h           # FilterType enum + int↔enum mapping (shared pure computation)
 │   ├── SubEQ_OutputStage.h          # post master-gain ramp / latency-compensated bypass (shared pure computation)
 │   ├── SubEQ_FIRHistory.h           # T2 captured/committed input history ring
-│   ├── SubEQ_FIRSwitchState.h       # warm boundary / crossfade pure policy
+│   ├── SubEQ_FIRSwitchState.h       # FIR crossfade weights
 │   ├── SubEQ_WarmPlan.h             # host-block-aligned warm target planning (shared pure computation)
 │   ├── SubEQ_OlaBank.h              # exact-boundary OLA warm synthesis (shared pure computation)
 │   ├── SubEQ_FirResolution.h        # FIR resolution assessment (shared pure computation)
@@ -195,7 +195,7 @@ Sub EQ/
 │       ├── ModeSelector.h/.cpp      # bottom mode-selection panel (new in v0.2.0)
 │       └── DesignSystem/            # liquid-glass design system (colours/fonts/animation/glass effects/LookAndFeel)
 │   └── Fonts/                       # embedded Inter Regular/Bold (SIL OFL 1.1, compiled into BinaryData via the jucer resources)
-├── Tests/                           # 642 offline regression checks + JUCE runtime integration (66) + real VST3 bundle load (23)
+├── Tests/                           # 651 offline regression checks + JUCE runtime integration (96) + real VST3 bundle load (23)
 ├── Builds/VisualStudio2022/         # VS project output directory (gitignored)
 ├── Napkid Sub EQ.jucer              # Projucer project file
 └── README.md                        # Chinese README (this file is its English translation)
@@ -242,11 +242,13 @@ One of the design goals of this plugin is processing near-DC control signals. At
 ## Known Limitations
 
 - **GUI is Windows-only**: currently uses the Projucer VS2022 export target
-- **Display wobble in the extreme low-frequency spectrum (0.5–1 Hz)**: since v0.4.0 the VQT engine restores full octave resolution above roughly 4–16 Hz (depending on window/resolution tier); v0.5.0 changes the bottom-tier window from “largest power of two ≤2 s” to “smallest power of two ≥2 s” (~2.73 s @48 kHz), improving cycle coverage, but the 0.5 Hz band still contains fewer than two full cycles, so readings exhibit a slow phase wobble (a physical constraint; no mirror-support rejection is applied). The 12th-order decimator adds about 1.4 s of low-frequency display lag @48k (about 2.2 s @4k); this affects the display only. See `Documentation/SubEQ_VQT_Feasibility.md` §8.
+- **Display wobble in the extreme low-frequency spectrum (0.5–1 Hz)**: since v0.4.0 the VQT engine restores full octave resolution above roughly 4–16 Hz (depending on window/resolution tier); v0.5.0 changes the bottom-tier window from “largest power of two ≤2 s” to “smallest power of two ≥2 s” (~2.73 s @48 kHz), improving cycle coverage, but the 0.5 Hz band still contains fewer than two full cycles, so readings exhibit a slow phase wobble (a physical constraint; no mirror-support rejection is applied). The 12th-order decimator adds about 1.4 s of group delay @48k (about 2.2 s @4k); with the bottom-tier half-window (~1.4 s @48k, ~1.0 s @4k) the total low-frequency display lag is about 2.8 s @48k (3.2 s @4k); this affects the display only. At 4 kHz the top 512 Hz band also has about -0.37 dB decimator deviation. See `Documentation/SubEQ_VQT_Feasibility.md` §8.
 - **Spectrum noise-floor definition**: VQT band energy is aggregated by window ENBW × tier bandwidth (2× steps between tiers), so the noise-floor shape differs from the old "single-bin sampling" — it is flatter (constant bandwidth ratio per octave), which is expected behaviour
 - **Relatively high spectrum CPU at 44.1 kHz**: the power-of-two decimation divisibility constraint makes the top-tier oversampling ratio high (about 2× that at 48 kHz), bringing the cost back to the order of the old engine; 48/96/192 kHz are unaffected
 - **Peak broadening from spectrum smoothing (v0.4.1)**: inter-band smoothing tames noise fluctuation but broadens isolated pure-tone peaks — in the worst case (an isolated high-frequency tone) about -4.8 dB at 1/6, -7.0 dB at 1/3 and -9.5 dB at 2/3; the low-frequency range loses significantly less because its analysis kernel already overlaps bands. Choose Off when precise per-band readings are needed
+- **Host block limit and offline automation**: the bypass dry-copy buffer is preallocated for `max(samplesPerBlock, 32768)`; host blocks larger than 32768 fall back silently to a no-dry-copy bypass path, so keep blocks ≤32768. Automation of `eq_mode`/`fir_length` during an offline bounce may not re-apply host PDC; bounce in a fixed mode or re-open in segments. The realtime path is unaffected
 - **Low-frequency accuracy vs latency trade-off in FIR modes**: the FIR length is selectable (4096 / 16384 / 65536 points); 4096 points @48 kHz gives ~11.7 Hz frequency resolution, so the response below 10 Hz is an interpolated approximation; 65536 points gives ~0.73 Hz resolution, but Linear Phase latency reaches 0.69 s and CPU usage is high. FIR modes also add 511 samples (~10.6 ms @48 kHz) of overlap-add block processing latency. An N-tap FIR has a fixed frequency-sampling resolution of `fs/N`: when `fc·N/fs < 1` (the corner is below one design bin), the target shape cannot be represented by an FIR of that length — a physical limit, not an implementation defect. The analytic zero matrix in the minimum-phase FIR regression tests consequently covers only resolvable combinations
+- **Linear Phase cold-start handover (realtime path)**: the main lobe of a linear-phase FIR arrives after its group delay. On a realtime cold start the plugin keeps the IIR bridge audible until the session history covers that delay (about 0.68 s for 65536 taps @48 kHz) before handing audio to the FIR. This prevents a dropout while the FIR has no valid output yet; changes with existing history are not delayed by this wait. Offline rendering still hands over at the current boundary, so its beginning naturally contains the FIR transient of that length
 
 ---
 
@@ -266,7 +268,7 @@ This project is built on the following third-party technology stack. The license
 
 - **Inter** (Regular / Bold)
   - Copyright (c) 2016 The Inter Project Authors
-  - SIL Open Font License 1.1; full text in [Source/Fonts/OFL.txt](Source/Fonts/OFL.txt)
+  - SIL Open Font License 1.1; full text in [Source/Fonts/OFL.txt](Source/Fonts/OFL.txt) in the source tree; the release package places it at the package root as `OFL.txt`
   - The OFL text must accompany release packages
 
 ### Plugin Technology
@@ -293,4 +295,9 @@ This project is built on the following third-party technology stack. The license
 
 ## License
 
-This project is released under the **GNU General Public License v3**. See the [LICENSE](LICENSE) file for details.
+This project is released under the **GNU General Public License v3 only**. See the [LICENSE](LICENSE) file for details.
+
+The Corresponding Source for distributed binaries is available at
+<https://github.com/louifinn/Napkid-Sub-EQ>; the release tag/commit is recorded
+in the release notes. `THIRD_PARTY_NOTICES.md` also serves as the GPLv3
+written source offer.

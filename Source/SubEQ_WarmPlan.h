@@ -53,26 +53,20 @@ inline WarmTarget planWarmTarget(uint64_t capturedSamples,
     return out;
 }
 
-// A plan is adoptable only at its exact host block start.
-inline bool warmAdoptableAt(uint64_t targetSample, uint64_t blockStartSample) noexcept
-{
-    return targetSample == blockStartSample;
-}
-
 // Convert a measured/estimated build duration to a sample lead with a hard
 // scheduling slack. This is deliberately conservative: the old path stays
 // audible while waiting, so a larger lead costs latency-to-update, not audio.
 inline uint64_t warmLeadSamples(double sampleRate,
                                 int hostBlockSamples,
                                 double estimatedBuildSeconds,
-                                double slackSeconds = 0.10) noexcept
+                                double slackSeconds = 0.25) noexcept
 {
     const double sr = (sampleRate > 0.0) ? sampleRate : 48000.0;
     const double seconds = std::max(0.0, estimatedBuildSeconds)
                          + std::max(0.0, slackSeconds);
     const uint64_t byTime = static_cast<uint64_t>(seconds * sr);
     const uint64_t byBlock = static_cast<uint64_t>(std::max(1, hostBlockSamples)) * 2u;
-    const uint64_t maxLead = static_cast<uint64_t>(0.35 * sr);
+    const uint64_t maxLead = static_cast<uint64_t>(0.60 * sr);
     // Clamp runaway EWMA; still guarantee at least two host blocks of lead.
     return std::min<uint64_t>(std::max<uint64_t>(byTime, byBlock),
                               std::max<uint64_t>(maxLead, byBlock));

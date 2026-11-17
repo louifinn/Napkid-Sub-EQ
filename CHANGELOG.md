@@ -2,7 +2,7 @@
 
 Napkid Sub EQ 的所有重要变更都将记录在此文件中。
 
-> 状态：**0.5.0 未发布**（最后更新 2026-10-27）；发布需完成人工 DAW 验收与代码签名。
+> 状态：**0.5.0 未发布**（最后更新 2026-10-31）；发布需完成人工 DAW 验收与代码签名。
 
 ## [0.5.0] - 2026-10-22
 
@@ -10,7 +10,7 @@ Napkid Sub EQ 的所有重要变更都将记录在此文件中。
 
 ### 修复
 
-- **FIR 切换（T2）**：新增 `captured/committed` 输入历史环 + 后台精确边界 warm 合成（overlap-save 在 `kM-M` 求累加器，回放到 `kM`，再前馈 `r` 样本到任意 host-block 起点 `T=kM+r`）。设计+target 元数据先发布，音频协调器据此提前调度延迟切换；warm 就绪后附加，音频仅在 design version/target/warm 三者一致时采纳。允许最多一个当前 host block 的音频线程追赶；错过则保留旧设计并请求同一设计的新 warm 目标，不丢弃设计、不无限静音。同 groupDelay 走 1024 样本交叉淡化（两侧都处理真实输入），异 groupDelay 经 packed PDC 握手 + 有界门控后切换。**离线渲染**（`AudioProcessor::isNonRealtime()`）走同步路径：音频线程在当前边界直接构建设计与 warm，冷启动 65536 从首块进入 FIR，且不套用实时门控。修复了交叉淡化把暂存缓冲当卷积输入、最小相位长度先减后增时新侧 overlap 未清零、以及 OLA 状态容量不足导致的越界风险。
+- **FIR 切换（T2）**：新增 `captured/committed` 输入历史环 + 后台精确边界 warm 合成（overlap-save 在 `kM-M` 求累加器，回放到 `kM`，再前馈 `r` 样本到任意 host-block 起点 `T=kM+r`）。设计+target 元数据先发布，音频协调器据此提前调度延迟切换；warm 就绪后附加，音频仅在 design version/target/warm 三者一致时采纳。允许最多 2 个 OLA 块（1024 样本）的音频线程追赶，更大间隔交回 worker 重建；线性相位冷启动的 warm 目标不早于 session 历史覆盖 group delay，IIR 桥保持可闻直至 FIR 主瓣有效。错过则保留旧设计并请求同一设计的新 warm 目标，不丢弃设计、不无限静音。同 groupDelay 走 1024 样本交叉淡化（两侧都处理真实输入），异 groupDelay 经 packed PDC 握手 + 有界门控后切换。**离线渲染**（`AudioProcessor::isNonRealtime()`）走同步路径：音频线程在当前边界直接构建设计与 warm，冷启动 65536 从首块进入 FIR，且不套用实时门控。修复了交叉淡化把暂存缓冲当卷积输入、最小相位长度先减后增时新侧 overlap 未清零、以及 OLA 状态容量不足导致的越界风险。
 - **输出级**：主增益与旁路从 EQEngine/FIR 设计目标移到 OutputStage；主增益逐样本 ramp（目标变化才重启），旁路使用 activeLatency 延迟补偿的 dry/wet；latency 变化不清空 dry 历史（旁路混合时 128 样本交叉淡化），主增益自动化不再触发 FIR 重设计。EQEngine 删除临时缓冲，音频线程无 malloc/OOM 路径；IIR 桥按 host-facing latency 延迟，FIR 预热期间不再输出 0 延迟信号。
 - **平滑与状态**：节点启停/系数平滑改为 32 样本子块推进；Tilt 第二 biquad 从 identity 淡入时清零状态；FIR→Zero Latency 复位 IIR 状态；重新启用完全淡出的节点时清 biquad 状态；采样率变化直接落到新系数；Biquad 系数增加 NaN/有限性防护；总线响应上限从 1e9 提升到 1e13。
 - **FIR 设计**：线性相位改为 Type-I 奇数抽头（标称 4096/16384/65536 内部为 4095/16383/65535），消除偶数 Type-II 的 0.5 样本群延迟误差并允许非零 Nyquist；设计改为 4× 密集网格 + BH-4 窗化，不再逐 bin 强制 `H(π)=0`；最小相位 legacy 8× 候选改为按需计算；频率响应构建改为按实际抽头数安全构造。
@@ -22,11 +22,14 @@ Napkid Sub EQ 的所有重要变更都将记录在此文件中。
 
 ### 测试与工程
 
-- 离线回归 **538 → 642 项全部通过**（新增精确 warm 合成/容量守卫、历史环、OutputStage 延迟保持/ramp 完成/float 钳位、8 类型 biquad、FIR 边界/NaN、安全频率响应构建、计数守卫、任意 host-block warm 规划、TwiddleBank 等价性、多采样率底部帧长（含 4 kHz 层布局）、有界 PDC 协调器状态机（含 warmReady/guard/新设计续期）、共享 VQT 内核库等）。
+- 离线回归 **538 → 651 项全部通过**（新增精确 warm 合成/容量守卫（含生产尺寸 65535 抽头、131072 点 OLA）、历史环、OutputStage 延迟保持/ramp 完成/float 钳位、8 类型 biquad、FIR 边界/NaN、安全频率响应构建、计数守卫、任意 host-block warm 规划、TwiddleBank 等价性、多采样率底部帧长（含 4 kHz 层布局）、有界 PDC 协调器状态机（含 warmReady/guard/新设计续期）、共享 VQT 内核库、频谱 24/60 dB 范围解码，以及 Core 运行时状态机：32 样本平滑/启停/Tilt/采样率系数刷新）。
 - **PlanRing（WS2）**：FIR 设计/预热发布改为固定 ring slot（4 设计 + 2 warm）+ `PlanMeta` seqlock；音频线程以原子 mask 固定/释放 slot，完全移除 `shared_ptr`、退役环与 `stateMutex` 音频路径；GUI 改用 1024 点 FIR 幅相响应快照。复审加固：meta 携带 `designEpoch`（reset 前发布的设计被音频侧忽略）、slot 增加 `Reserved` 状态（worker/offline 两个 producer 不会写入同一 slot，reset 用 CAS 保留 Reserved）、seqlock 写入加 release fence、读取 4 次重试且撕裂时保留 pin / 使用上一份一致 plan（不再误判为“无计划”）、旧版本/旧 epoch meta 不得覆盖新 plan、`Ready` 只在 payload+响应快照+meta 全部写完后发布（reset 不会在读取中途释放 slot）；若音频在新 meta 落点早于 Ready 的瞬时窗口读到它，继续使用当前 active FIR 而不是掉回 IIR；warm 撕裂读同样保留已 pin 的 warm/进度；GUI 相位插值不跨越 ±180° 回绕、响应快照扩到 16 份且不驱逐 active 设计。
-- 新增 JUCE 控制台集成测试 `Tests/subeq_runtime_test.cpp`：驱动真实 `SubEQAudioProcessor`，验证 512/4096 host block 下的 65536 Linear、Min↔Linear、旁路、重复 ZL↔FIR 的 PDC 上报/ack 与输出连续性、**96 kHz/128 块**、**非 512 的 1000 块**、**44.1 kHz 单声道**、**host 长期不 pump PDC（无 ack）时 IIR 桥保持可闻并可在恢复 ack 后接管**、**模式/FIR 长度/prepareToPlay 高频重入压力**、离线首块可闻、旧 session 缺 `spectrum_range` 迁移到 60 dB 默认（0 失败）。新增 `--soak <min>` 真实时基 soak 模式（512/10 ms、Linear 65536、周期节点自动化，断言输出有限/可闻、FIR 保持 active、延迟保持上报）。
+- 新增 JUCE 控制台集成测试 `Tests/subeq_runtime_test.cpp`：驱动真实 `SubEQAudioProcessor`，验证 512/4096 host block 下的 65536 Linear、Min↔Linear、旁路、重复 ZL↔FIR 的 PDC 上报/ack 与输出连续性、**96 kHz/128 块**、**非 512 的 1000 块**、**44.1 kHz 单声道**、**host 长期不 pump PDC（无 ack）时 IIR 桥保持可闻并可在恢复 ack 后接管**、**模式/FIR 长度/prepareToPlay 高频重入压力**、离线首块可闻、旧 session 缺 `spectrum_range` 迁移到 60 dB 默认；新增 **PDC 脉冲对齐（Linear 2558 / Min 511）**、**实时 processBlock 无 operator-new 分配（run 内最大值；JUCE 缓冲均预分配）**、**no-ack 末块可闻/最长静音上界**、**结构切换保留 active FIR**、**过渡期间反复切换 bypass 仍收敛**、**4096 块下 PDC 静音跨度不超过 6 个 host block 且确实经过门控**、**结构变更待定时尾长仍按 active 设计上报（含 minimum phase）**、**被取代的已发布未采纳候选永不采纳**、**逐块非有限检测与 run 内最大分配计数**、**NaN 后频谱恢复**（96 项，0 失败）。新增 `--soak <min>` 真实时基 soak 模式（512/10 ms、Linear 65536、周期节点自动化，断言输出有限/可闻、FIR 保持 active、延迟保持上报）。
 - 新增真实 VST3 bundle 主机装载测试（`--vst3`，23 项）：通过 JUCE VST3 hosting 走真实 COM 工厂扫描/参数映射/立体声总线/编辑器创建与原生 peer 挂载、65536 Linear 有限且可闻处理、PDC 33278 上报、状态保存/恢复；测试用 Win32 消息泵驱动插件 Timer，避免宿主消息循环差异造成的假失败。VQT 性能对比改为 best-of-3，消除机器负载下的单次时基抖动误报。
 - 故障注入修复：host 不 ack PDC 超过 1 s 时不再把 `publishedLatency` 回退成可闻延迟（那会让协调器再也看不到待切换目标而永久停在 IIR）；现在保留设计目标延迟，由有界协调器中止并上报旧延迟，ack 恢复后自动重试。`prepareToPlay` 的 warm 暂存/history 重分配与后台 warm 构建共用 `warmBuildMutex`（先 bump epoch 让构建在 1 ms 检查点退出），消除重入 prepare 时与后台 FFT 读取暂存缓冲的数据竞争（实测可致进程崩溃）。此外：采样率/声道重准备后，同延迟的新设计不再等待一次永远不会发生的 PDC 上报（`setHostLatency` 让 FIR 侧识别“host 已补偿该总延迟”并直接采纳）；音频线程不再原地改写已发布 `WarmState::targetSample`（改为线程私有进度），修复与后台发布/重建的竞争及候选目标漂移。复审又修复：版本与延迟改为单原子打包读取（避免发布撕裂导致按错误延迟 ack）；PDC ack 加入 epoch CAS（中止后旧 timer 不能再确认已失效的设计）；协调器识别 50 ms ack guard，不把 guard 期间越过的 warm 目标误判为 miss；活动迁移期间发布的新设计会立即重启握手（重新上报新版本/延迟，不再等 2×hardCap）；abort 同时复位 guard，重新 ack 会重新等待 50 ms；timer 先做 epoch CAS 再调用 `setLatencySamples`（中止后不再把已取消的延迟写给 host）；plan/target 采用双读校验，避免把新 target 配到旧版本；FIR→ZL 后按版本 cutoff 拒绝旧设计（即使 reset 时 stateMutex 被占用）；共享 kernel bank 重建时清理线程局部 twiddle 指针，消除潜在悬空访问；warm EWMA 改为原子量；GUI 节点/主增益在参数变化时发送 valueChanged、UIA 写入改投消息线程、组合框暴露字段名、主增益增加焦点环。
+- 复审加固：拆分 plan reset epoch 与 in-flight build epoch，结构变更不再丢弃正在发声的 FIR；PDC 门控改为 1 ms 淡出 + 门控归零后才上报 + 有界 nearWindow/hardCap，no-ack 宿主保持 IIR 可闻；warm 目标/追赶上限/配对重检收紧；prepare/offline 设计锁改 try_lock；状态 `stateVersion` 迁移与未知版本标记；参数频率/Q 改真对数 skew；主增益/旁路/尾长/显示响应与编辑器可见性门控收口；README/VQT 文档同步延迟口径、4k 偏差、GPL 对应源码与 VST3 许可。
+- 最终审查收口：频谱三缓冲发布改为全原子 payload（消除 seqlock 形式数据竞争、读取器加 acquire fence）并在 reset 分支复核 seq；非法分辨率不再每次 configure 都复位分析状态；删除无生产调用的旧 warm catch-up/latency 辅助与 GUI 死函数；首个 FIR 块不再在音频线程预热 twiddle 表（全部命中 prepare 阶段构建的 `TwiddleBank`，消除首块分配/三角函数）；PDC 重试/中止的 guard 收敛为 1 个 host block、hardCap 放宽到 6 个 host block，abort 后门控保持 50 ms（覆盖 60 Hz 延迟上报），修复 4096 块过渡被 cap 中止与 10 ms 开门早于 host 回退的问题；音频线程 warm 追赶上限固定为 2 个 OLA 块（大 host block 不再在回调内追赶整块），线性相位冷启动目标不早于 group delay（消除激活后约 0.3 s 的 FIR 主瓣未到达静音）；结构变更用 adoption cutoff 拒绝已发布未采纳旧 plan，同时保留 active FIR；新增 active FIR 长度镜像，尾长在 Linear/Minimum 待定切换时均跟随 active 设计；TooltipWindow 只在编辑器可见时创建；编辑器仅在真实可见时上报 active（构造不再假报，子面板要求父编辑器可见）；测试改为逐块非有限/分配累计、-6 dBFS 双边校准、pending/active 尾长与 4096 静音下界；离线测试补生产尺寸 warm 合成与频谱范围解码；最终 20 min 实时 soak 20/20（latency 33278、FIR active、finite/audible），96 项 runtime、23 项 VST3、651 项离线与 ASan 651 全通过（记录于 BASELINE）。
+
 - `.jucer` 补齐此前遗漏的 13 个共享头与 4 个新头，版本升至 0.5.0；Projucer 重存生成 BinaryData/VS 工程；Release x64 构建通过。
 - 参数总数 50 → 51（新增 `spectrum_range`）；参数 ID 与既有 choice 索引保持兼容。
 

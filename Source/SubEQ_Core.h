@@ -137,6 +137,11 @@ public:
 
         enabled = shouldBeEnabled;
         fadeTarget = shouldBeEnabled ? 1.0 : 0.0;
+
+        // GUI/design engines disable smoothing; snap the fade so the displayed
+        // response is the exact target and a disabled node is identity.
+        if (!smoothingEnabled)
+            fadeGain = fadeTarget;
     }
 
     // True while the node must stay in the processing chain: enabled, or

@@ -297,7 +297,7 @@ constexpr int VQTNumResolutionLevels = 3;
 
 // Immutable set of all 24 kernel combinations for one sample rate, plus the
 // FFT twiddles for every tier size. The input and output analyzers share one
-// bank instead of each building ~50 MB of identical window/kernel tables.
+// bank instead of each building a duplicate of the same window/kernel tables.
 struct VQTKernelBank
 {
     double sampleRate = 0.0;

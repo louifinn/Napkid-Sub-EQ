@@ -189,23 +189,18 @@ void ModeSelector::syncChoiceBoxes()
         sync (spectrumBox (controls[i]), controls[i].paramId);
 }
 
-juce::ComboBox* ModeSelector::boxForParameter (const juce::String& parameterID)
-{
-    if (parameterID == "eq_mode")    return &modeBox;
-    if (parameterID == "fir_length") return &firLengthBox;
-
-    int numControls = 0;
-    const SpectrumControl* controls = spectrumControlTable (numControls);
-    for (int i = 0; i < numControls; ++i)
-        if (parameterID == controls[i].paramId)
-            return &spectrumBox (controls[i]);
-
-    return nullptr;
-}
-
 void ModeSelector::visibilityChanged()
 {
-    if (isVisible())
+    // addAndMakeVisible() in the editor constructor fires this while the parent
+    // editor is still hidden; require the parent to be visible so a created but
+    // never-shown editor does not leave the 10 Hz timer running.
+    const auto* parent = getParentComponent();
+    setEditorActive (isVisible() && parent != nullptr && parent->isVisible());
+}
+
+void ModeSelector::setEditorActive (bool active)
+{
+    if (active)
     {
         if (!isTimerRunning())
             startTimerHz (10);

@@ -47,8 +47,10 @@ public:
         uint64_t pendingTarget = 0;       // host-block-aligned warm target
         uint64_t committed = 0;           // raw input samples committed so far
         int designVersion = 0;
-        bool guardActive = false;         // acked design is in its 50 ms guard
+        bool guardActive = false;         // acked design is in its PDC guard
         bool warmReady = false;           // matching warm state is available
+        bool gateAtZero = false;          // output gate has fully closed
+        int catchUpLimitSamples = 512;    // audio-thread warm catch-up budget
     };
 
     // Effects the caller must apply (audio thread, no allocation).
@@ -71,13 +73,24 @@ public:
         if (abortCooldownSamples > 0)
             abortCooldownSamples -= in.hostBlockSamples;
 
+        // The gate must cover: fade to zero, one 60 Hz timer tick, the PDC
+        // guard and the post-switch hold. Keep it to a few blocks rather than
+        // the whole warm-build lead. For very large host blocks one block is
+        // already longer than 60 ms; that block floor is unavoidable.
         const int nearWindow = static_cast<int> (
-            std::max (0.10 * in.sampleRate, 2.0 * in.hostBlockSamples));
+            std::max (0.04 * in.sampleRate, 4.0 * in.hostBlockSamples));
         const int margin = static_cast<int> (
-            std::max (0.12 * in.sampleRate, 2.0 * in.hostBlockSamples));
+            std::max (0.06 * in.sampleRate, 5.0 * in.hostBlockSamples));
+        // The handshake is block-quantized: begin, report (after gate zero),
+        // ack+guard, then switch. A switch can legitimately need five host
+        // blocks (one extra for timer/ack jitter), so the cap must leave room
+        // for it; a four-block cap aborted large-buffer transitions on the
+        // very block that would have adopted the design.
         const int hardCap = static_cast<int> (
-            std::max (0.60 * in.sampleRate, 8.0 * in.hostBlockSamples));
+            std::max (0.12 * in.sampleRate, 6.0 * in.hostBlockSamples));
 
+        // Never start a transition for a design whose warm state is not ready,
+        // or whose target is too stale for the bounded audio-side catch-up.
         const bool canTransition = in.firMode
                                 && ! in.nonRealtime
                                 && in.publishedLatency > 0
@@ -85,12 +98,19 @@ public:
                                 && abortCooldownSamples <= 0;
 
         // A future target can start the handshake early; a ready warm whose
-        // target has already been reached can also start (the audio thread
-        // catches up at most one block). Without the latter, a host that
-        // ignored earlier reports could never be re-reported.
-        const bool targetUsable = in.pendingTarget > in.committed
+        // target was just crossed can also start (the audio thread catches up
+        // at most one block). A target older than that is not recoverable:
+        // wait for the worker to publish a fresh future target instead of
+        // gating the output.
+        const bool targetInFuture = in.pendingTarget > in.committed;
+        const bool targetRecoverable = ! targetInFuture
+            && in.warmReady
+            && in.pendingTarget != 0
+            && (in.committed - in.pendingTarget)
+                   <= static_cast<uint64_t> (std::max (1, in.catchUpLimitSamples));
+        const bool targetUsable = targetInFuture
             ? (in.pendingTarget - in.committed) <= static_cast<uint64_t> (nearWindow)
-            : in.warmReady;
+            : targetRecoverable;
 
         if (canTransition && targetUsable && ! active)
         {
@@ -131,7 +151,10 @@ public:
                 deadlineSamples = scaledDeadline (in, hardCap, margin);
             }
 
-            if (! reported)
+            // Report only after the gate has fully closed: the host may apply
+            // the new PDC on the next block, and no mistimed sample may leak
+            // while the gate is still partially open.
+            if (! reported && in.gateAtZero)
             {
                 result.reportLatency = true;
                 result.reportVersion = version;
@@ -142,11 +165,18 @@ public:
             // While the acked design sits in its 50 ms guard, the warm target
             // is allowed to pass: it is waiting for the switch, not missed.
             // Keep an absolute cap so a stuck guard can never gate forever.
+            // Allow the warm builder a bounded grace period after the target:
+            // it cannot finish the final replay before the boundary samples
+            // exist, so a target that is one or two OLA blocks old is not a
+            // miss yet.
             const bool missed = ! in.guardActive && ! in.warmReady
                              && (in.pendingTarget == 0
-                                 || in.pendingTarget < in.committed);
+                                 || in.pendingTarget
+                                        + static_cast<uint64_t>(
+                                              std::max (1, in.catchUpLimitSamples))
+                                      < in.committed);
             const bool expired = in.guardActive
-                                   ? totalSamples > 2 * hardCap
+                                   ? totalSamples > hardCap
                                    : (elapsedSamples > deadlineSamples
                                       || totalSamples > hardCap);
 
@@ -157,13 +187,26 @@ public:
                 result.reportLatency = true;
                 result.reportVersion = 0;          // never ack a pending design
                 result.reportSamples = in.activeBridgeLatency;
+                // The restored latency is applied by the message-thread timer
+                // (60 Hz, worst-case ~16.7 ms) and takes effect on the host's
+                // next callback. A 10 ms hold could reopen the gate before the
+                // host stops compensating the acked-but-unswitched latency.
                 result.gateHoldSamples = static_cast<int> (
-                    std::max (1.0, 0.01 * in.sampleRate));
+                    std::max (1.0, 0.05 * in.sampleRate));
 
+                // If the deadline expired while waiting for an ack, the host
+                // is not pumping the timer (or is extremely late). Do not
+                // immediately re-enter the handshake and gate again: keep the
+                // IIR bridge audible for a longer cooldown and retry later.
+                const bool ackMissing = ! in.guardActive && in.warmReady
+                                     && elapsedSamples > deadlineSamples;
                 active = false;
                 reported = false;
-                abortCooldownSamples = static_cast<int> (
-                    std::max (0.02 * in.sampleRate, 1.0 * in.hostBlockSamples));
+                abortCooldownSamples = ackMissing
+                    ? static_cast<int> (std::max (0.50 * in.sampleRate,
+                                                  2.0 * in.hostBlockSamples))
+                    : static_cast<int> (std::max (0.02 * in.sampleRate,
+                                                  1.0 * in.hostBlockSamples));
             }
         }
 
@@ -183,11 +226,15 @@ public:
 
         active = false;
         reported = false;
-        gateHoldSamplesOut = static_cast<int> (std::max (1.0, 0.02 * sampleRate));
+        gateHoldSamplesOut = static_cast<int> (std::max (1.0, 0.01 * sampleRate));
         return true;
     }
 
     bool isActive() const noexcept  { return active; }
+
+#if SUBEQ_TESTING
+    int getAbortCooldownForTest() const noexcept { return abortCooldownSamples; }
+#endif
 
     void reset() noexcept
     {
@@ -205,10 +252,12 @@ public:
 private:
     static int scaledDeadline (const BlockInput& in, int hardCap, int margin) noexcept
     {
+        const uint64_t distance = in.pendingTarget > in.committed
+                                      ? in.pendingTarget - in.committed
+                                      : 0;
         return static_cast<int> (
             std::min<uint64_t> (static_cast<uint64_t> (hardCap),
-                                (in.pendingTarget - in.committed)
-                                    + static_cast<uint64_t> (margin)));
+                                distance + static_cast<uint64_t> (margin)));
     }
 
     void begin (const BlockInput& in, int hardCap, int margin) noexcept

@@ -1,21 +1,21 @@
 Napkid Sub EQ test baseline
 ===========================
 
-offline_regression_checks = 642
-runtime_checks            = 66
+offline_regression_checks = 651
+runtime_checks            = 96
 vst3_bundle_checks        = 23
 soak_checks               = 4
-asan_offline_checks       = 642
-asan_command              = cl /EHsc /std:c++17 /O1 /utf-8 /fsanitize=address Tests/subeq_fft_test.cpp (MSVC 14.51 clang_rt.asan_dynamic-x86_64.dll beside exe); GUI edits after this run are editor-only
+asan_offline_checks       = 651
+asan_command              = cl /EHsc /std:c++17 /O1 /Zi /utf-8 /fsanitize=address Tests/subeq_fft_test.cpp Source/SubEQ_Core.cpp; run with MSVC 14.51 clang_rt.asan_dynamic-x86_64.dll beside the exe (ASan init completes; "failed to intercept ucrtbase!_recalloc_base" is benign)
 runtime_test_failures     = 0
-last_verified             = 2026-10-27
+last_verified             = 2026-10-31
 
 Real VST3 bundle load (JUCE VST3 hosting, not a direct processor link):
 - Tests/subeq_runtime_test.exe --vst3 "Builds/VisualStudio2022/x64/Release/VST3/Napkid Sub EQ.vst3"
   (COM factory scan, one plugin with name/version/manufacturer/identifier,
    51 params + host bypass, stereo buses, default ZL 0 latency, editor
    creation, Linear 65536 finite+audible processing, PDC 33278, state
-   save/restore). Result: 23/23 pass on 2026-10-27.
+   save/restore). Result: 23/23 pass on 2026-10-28.
 
 Real host (JUCE AudioPluginHost, Release, 2026-10-27):
 - Loaded the packaged VST3 bundle in a filtergraph with Audio Input ->
@@ -28,11 +28,24 @@ Real host (JUCE AudioPluginHost, Release, 2026-10-27):
   never-processed edit-controller nominal-latency fallback.
 
 Soak:
-- 60 s offline soak is part of the 66 runtime checks (passed).
+- 60 s offline soak is part of the 96 runtime checks (passed).
 - Extended host-simulated soak: `--soak 20` completed 20/20 simulated minutes
   on 2026-10-27 with 0 failures (latency 33278, FIR active, finite/audible).
   The 512/10 ms Linear 65536 + periodic node automation stress keeps the FIR
   designer saturated, so wall time is several times the simulated time.
+- 2026-10-28 verification: `--soak 20` passed 20/20 on the build immediately
+  before the final PDC-budget/GUI/tail cleanups (the steady FIR path exercised
+  by the soak is identical; latency 33278, FIR active, finite/audible). The
+  cleaned build passed `--soak 5` (5/5); the exact final binary passed
+  `--soak 1` (4/4) plus the 83-check runtime suite (including its 60 s offline
+  soak) and the 23-check VST3 bundle suite. (That suite has since grown to 91
+  checks; see the 2026-10-29 entry below.)
+- 2026-10-29 hardening: PDC abort gate hold raised to 50 ms, audio catch-up
+  capped at 2 OLA blocks, linear-phase cold-start targets cover group delay,
+  superseded unpublished plans blocked by adoption cutoff, active-FIR tail
+  mirror, tooltip gating. Final 20 min soak on this production build passed
+  20/20 (latency 33278, FIR active, finite/audible). The exact final binary
+  also passed `--soak 1` (4/4), offline 651/651, VST3 23/23 and ASan 651/651.
 
 Runtime matrix (JUCE integration test):
 - host block: 128, 512, 1000, 4096
@@ -41,8 +54,14 @@ Runtime matrix (JUCE integration test):
 - FIR: 4096, 65536
 - ZL<->FIR, Min<->Linear, bypass, PDC report/ack, offline first block,
   no-PDC-ack recovery, mid-session sample-rate change, rapid
-  mode/FIR/prepareToPlay stress, 60 s offline soak,
-  state migration with missing spectrum_range.
+  mode/FIR/prepareToPlay stress, bypass toggled across a PDC transition,
+  4096-sample PDC mute bound (gate engagement + upper bound), active-design
+  tail hint (linear and minimum phase), linear cold-start group-delay wait,
+  superseded published candidate never adopted,
+  per-block non-finite tracking, run-wide operator-new allocation cap,
+  60 s offline soak, state migration with missing spectrum_range.
+- Allocation note: the console harness intercepts C++ operator new only;
+  JUCE HeapBlock/malloc buffers are prepared off the audio thread.
 
 Release build: VST3 + Standalone x64 (MSBuild Release).
 

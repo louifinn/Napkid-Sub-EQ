@@ -36,6 +36,7 @@ public:
 
     void paint(juce::Graphics& g) override;
     void visibilityChanged() override;
+    void setEditorActive (bool active);
     void focusGained(FocusChangeType) override;
     void focusLost(FocusChangeType) override;
     std::unique_ptr<juce::AccessibilityHandler> createAccessibilityHandler() override;

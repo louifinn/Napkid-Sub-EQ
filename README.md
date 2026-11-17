@@ -180,7 +180,7 @@ Sub EQ/
 │   ├── SubEQ_FilterType.h           # FilterType 枚举 + int↔枚举映射（共享纯计算）
 │   ├── SubEQ_OutputStage.h          # 后置主增益 ramp / 延迟补偿旁路（共享纯计算）
 │   ├── SubEQ_FIRHistory.h           # T2 captured/committed 输入历史环
-│   ├── SubEQ_FIRSwitchState.h       # warm 边界 / 交叉淡化纯策略
+│   ├── SubEQ_FIRSwitchState.h       # FIR 交叉淡化权重
 │   ├── SubEQ_WarmPlan.h             # host-block 对齐的 warm 目标规划（共享纯计算）
 │   ├── SubEQ_OlaBank.h              # 精确边界 OLA warm 合成（共享纯计算）
 │   ├── SubEQ_FirResolution.h        # FIR 分辨率评估
@@ -193,7 +193,7 @@ Sub EQ/
 │       ├── ModeSelector.h/.cpp      # 底部模式选择面板（v0.2.0 新增）
 │       └── DesignSystem/            # 液态玻璃设计系统（颜色/字体/动画/玻璃效果/LookAndFeel）
 │   └── Fonts/                       # 内嵌 Inter Regular/Bold（SIL OFL 1.1，经 jucer 资源编入 BinaryData）
-├── Tests/                           # 642 项离线回归 + JUCE runtime 集成测试（66 项）+ 真实 VST3 装载（23 项）
+├── Tests/                           # 651 项离线回归 + JUCE runtime 集成测试（96 项）+ 真实 VST3 装载（23 项）
 ├── scripts/package_release.ps1      # 发布打包（VST3/Standalone + 许可/OFL）
 ├── Builds/VisualStudio2022/         # VS 项目生成目录（gitignored）
 ├── Napkid Sub EQ.jucer              # Projucer 项目文件
@@ -242,11 +242,13 @@ Sub EQ/
 
 - **GUI 仅限 Windows**：当前使用 Projucer 的 VS2022 导出目标
 - **未签名二进制**：Release 产物未做 Authenticode 签名，Windows SmartScreen 可能提示未知发布者；签名需要发布者代码签名证书，属发布流程的外部步骤（`scripts/package_release.ps1` 会报告签名状态但不阻断打包）
-- **频谱极低频段（0.5~1 Hz）的显示摆动**：v0.4.0 起 VQT 引擎在约 4~16 Hz 以上（随窗型/分辨率档）恢复满倍频程分辨；v0.5.0 把底部帧长从“≤2 s 的 2 的幂”改为“≥2 s 的 2 的幂”（48 kHz 约 2.73 s），0.5 Hz 段的周期覆盖改善，但窗内仍不足两个完整周期，读数存在慢速相位摆动（物理约束；不做镜像支撑抑制，仅靠包络平滑）。12 阶抽取链使低频显示相对音频滞后约 1.4 s@48k（4k 约 2.2 s），仅影响显示。详见 `Documentation/SubEQ_VQT_Feasibility.md` §8
+- **频谱极低频段（0.5~1 Hz）的显示摆动**：v0.4.0 起 VQT 引擎在约 4~16 Hz 以上（随窗型/分辨率档）恢复满倍频程分辨；v0.5.0 把底部帧长从“≤2 s 的 2 的幂”改为“≥2 s 的 2 的幂”（48 kHz 约 2.73 s），0.5 Hz 段的周期覆盖改善，但窗内仍不足两个完整周期，读数存在慢速相位摆动（物理约束；不做镜像支撑抑制，仅靠包络平滑）。12 阶抽取链群延迟约 1.4 s@48k（4k 约 2.2 s），叠加底部帧半窗约 1.4 s（4k 约 1.0 s）后，低频总显示滞后约 2.8 s@48k（4k 约 3.2 s）；仅影响显示。4k 时顶部 512 Hz 另有约 −0.37 dB 抽取偏差。详见 `Documentation/SubEQ_VQT_Feasibility.md` §8
 - **频谱噪声底口径**：VQT 段能量按窗 ENBW × 层带宽聚合（层间 2 倍阶梯），噪声底形状与旧"单 bin 取样"不同——更平（每倍频程恒定带宽比例），属预期行为
 - **44.1 kHz 下频谱 CPU 偏高**：2 的幂抽取整除约束使顶层过采样比偏高（约 2 倍于 48 kHz），成本回到旧引擎量级；48/96/192 kHz 不受影响
 - **频谱平滑的峰展宽（v0.4.1）**：段间平滑在驯服噪声起伏的同时会展宽孤立纯音峰——最坏情形（高频孤立单音）1/6 档约 -4.8 dB、1/3 档 -7.0 dB、2/3 档 -9.5 dB；低频段因分析核本就跨段重叠，损失显著更小。需要逐段精确读数时选 Off
+- **宿主块上限与离线自动化**：dry 旁路复制缓冲按 `max(samplesPerBlock, 32768)` 预分配；超过 32768 的 host block 会静默退化为无旁路 dry 副本，建议宿主块 ≤32768。离线渲染中自动化切换 `eq_mode`/`fir_length` 时，宿主可能不会重新应用 PDC，建议在固定模式下 bounce 或分段重开；实时路径不受影响
 - **FIR 模式低频精度与延迟的权衡**：FIR 长度可选（4096 / 16384 / 65536 点）；4096 点 @48 kHz 频域分辨率约 11.7 Hz，10 Hz 以下响应为插值近似；65536 点分辨率约 0.73 Hz，但 Linear Phase 延迟达 0.69 秒且 CPU 占用较高。FIR 模式另有 511 样本（约 10.6 ms @48 kHz）overlap-add 块处理延迟。N 抽头 FIR 的频率采样分辨率固定为 `fs/N`：当 `fc·N/fs < 1`（拐点低于一个设计 bin）时，目标幅频形状无法由该长度 FIR 表示，属物理限制而非实现缺陷；最小相位 FIR 的解析零点矩阵也据此只覆盖可分辨组合
+- **Linear Phase 冷启动接管时序（实时路径）**：线性相位 FIR 的主瓣在 group delay 之后才到达；实时冷启动时插件会让 IIR 桥持续发声，直到 session 历史覆盖 group delay 才把音频交给 FIR（65536 点 @48 kHz 约 0.68 s）。这避免 FIR 尚未产生有效输出时出现静音，不是 dropout；已有历史时切换不受此等待影响。离线渲染仍按当前边界同步接管，开头自然包含该长度的 FIR 瞬态
 
 ---
 
@@ -266,7 +268,7 @@ Sub EQ/
 
 - **Inter**（Regular / Bold）
   - Copyright (c) 2016 The Inter Project Authors
-  - SIL Open Font License 1.1，完整文本见 [Source/Fonts/OFL.txt](Source/Fonts/OFL.txt)
+  - SIL Open Font License 1.1，源码树中见 [Source/Fonts/OFL.txt](Source/Fonts/OFL.txt)；发布包中置于包根 `OFL.txt`
   - 发布包需随附该 OFL 文本
 
 ### 插件技术
@@ -293,5 +295,7 @@ Sub EQ/
 
 ## 许可证
 
-本项目按 **GNU General Public License v3** 发布。详见 [LICENSE](LICENSE) 文件。
+本项目按 **GNU General Public License v3 only** 发布。详见 [LICENSE](LICENSE) 文件。
+
+分发二进制时，Corresponding Source 可从 <https://github.com/louifinn/Napkid-Sub-EQ> 获取；发布 tag/commit 记录在发布说明中，`THIRD_PARTY_NOTICES.md` 同时作为 GPLv3 的书面源码提供声明。
  

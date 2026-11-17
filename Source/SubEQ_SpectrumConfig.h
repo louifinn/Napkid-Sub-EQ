@@ -71,7 +71,7 @@ inline int spectrumSmoothingChoiceToIndex (int choice) noexcept
 // full analyser range).
 inline double spectrumRangeChoiceToDb (int choice) noexcept
 {
-    return choice == 0 ? 24.0 : 60.0;
+    return choice == 0 ? 24.0 : kDisplayRangeDb;
 }
 
 } // namespace SubEQ

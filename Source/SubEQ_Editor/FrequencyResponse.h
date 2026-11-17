@@ -33,6 +33,7 @@ public:
     void paint(juce::Graphics& g) override;
     void resized() override;
     void visibilityChanged() override;
+    void setEditorActive (bool active);
     std::unique_ptr<juce::AccessibilityHandler> createAccessibilityHandler() override;
 
     // Mouse interaction
@@ -96,9 +97,10 @@ private:
     int draggedNode = -1;
     bool dragGestureGain = false;            // Gain gesture begun at drag start
     bool dragGestureQ = false;               // Q gesture begun at drag start
-    bool gestureFreqOpen = false;
-    bool gestureGainOpen = false;
-    bool gestureQOpen = false;
+    // Gesture ownership is per (node, parameter): a UIA write or a type change
+    // on one node must never close another node's drag gesture.
+    bool gestureOpen[SubEQ::NumNodes][3] {};
+    static int gestureSlot (SubEQ::ParamID param) noexcept;
     int activeMouseSource = -1;              // multi-touch isolation: owning source
     juce::Point<float> dragStartPos;
     float dragStartFreq = 0.0f;

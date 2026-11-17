@@ -107,7 +107,19 @@ public:
     uint64_t getPendingTargetForTest() const { return fftProcessor.getPendingTargetSample(); }
     uint64_t getCommittedForTest() const { return fftProcessor.getCommittedSampleCount(); }
     int getIirPathLatencyForTest() const { return iirPathLatency; }
+    int getPublishedLatencyForTest() const
+    {
+        int version = 0;
+        int latency = 0;
+        bool warmReady = false;
+        fftProcessor.getPublishedPlan (version, latency, warmReady);
+        return latency;
+    }
     bool isLatencyTransitionForTest() const { return latencyCoordinator.isActive(); }
+    int getLatencyAbortCooldownForTest() const
+    {
+        return latencyCoordinator.getAbortCooldownForTest();
+    }
     int getWarmVersionForTest() const { return fftProcessor.getWarmVersionForTest(); }
     uint64_t getWarmTargetForTest() const { return fftProcessor.getWarmTargetForTest(); }
     int getAudioLocalVersionForTest() const { return fftProcessor.getAudioLocalVersionForTest(); }
@@ -116,6 +128,11 @@ public:
 
     // 已发布 FIR 设计的版本号：GUI 据此在后台设计异步发布后自动重绘相位曲线。
     int getFirDesignVersion() const;
+
+    // Session format version. v1/v2 predate spectrum_range; v3 is current.
+    // Missing parameter IDs are filled from the layout defaults and the choice
+    // indices used by spectrum_fft_size are unchanged since v0.4.0.
+    static constexpr int kCurrentStateVersion = 3;
 
     // 实际接管音频路径的 FIR 设计版本（0 = 无）；GUI 用它匹配响应快照。
     int getActiveFirDesignVersion() const { return fftProcessor.getActiveDesignVersion(); }
@@ -136,9 +153,26 @@ public:
         }
     }
     void spectrumEditorClosed() noexcept { spectrumEditorCount.fetch_sub (1); }
+    void setSpectrumEditorActive (bool active) noexcept
+    {
+        if (active)
+        {
+            spectrumEditorActiveCount.fetch_add (1, std::memory_order_release);
+        }
+        else
+        {
+            int current = spectrumEditorActiveCount.load (std::memory_order_acquire);
+            while (current > 0
+                   && ! spectrumEditorActiveCount.compare_exchange_weak (
+                          current, current - 1, std::memory_order_acq_rel,
+                          std::memory_order_acquire))
+            {
+            }
+        }
+    }
 
 private:
-    // juce::Timer (message thread, 30 Hz): deferred latency (PDC) reporting.
+    // juce::Timer (message thread, 60 Hz): deferred latency (PDC) reporting.
     // setLatencySamples() -> updateHostDisplay() allocates and takes the
     // message queue lock, so the audio thread only sets latencyDirty and this
     // callback performs the actual host notification.
@@ -238,6 +272,7 @@ private:
     std::atomic<int> currentMode { static_cast<int> (SubEQ::EQMode::ZeroLatency) };
     std::atomic<bool> firActiveMirror { false };
     std::atomic<int> spectrumEditorCount { 0 };   // 存活的编辑器数
+    std::atomic<int> spectrumEditorActiveCount { 0 }; // 可见编辑器引用计数
     std::atomic<bool> spectrumDisplayResetRequested { false };
     std::atomic<bool> latencyDirty { false };   // audio thread -> timer: report PDC
     int lastRequestedDesignVersion = -1;        // audio thread only

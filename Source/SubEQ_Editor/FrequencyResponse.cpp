@@ -92,6 +92,11 @@ private:
                 {
                     if (auto* self = safe.getComponent())
                     {
+                        // Never fight an in-progress mouse drag: it owns the
+                        // gesture and will commit on mouse-up.
+                        if (self->isDragging)
+                            return;
+
                         self->beginNodeGesture (index, SubEQ::ParamID::Freq);
                         self->setNodeParamValue (index, SubEQ::ParamID::Freq, value);
                         self->endNodeGesture (index, SubEQ::ParamID::Freq);
@@ -103,7 +108,15 @@ private:
 
         juce::String getCurrentValueAsString() const override
         {
-            return FrequencyResponse::formatFreq (static_cast<float> (getCurrentValue())) + " Hz";
+            // Include all three node values: Up/Down change gain (or Q for
+            // non-gain-sensitive types) and a frequency-only string would make
+            // the screen reader announce an unchanged value.
+            const float f = owner.getNodeParamValue (nodeIndex, SubEQ::ParamID::Freq);
+            const float g = owner.getNodeParamValue (nodeIndex, SubEQ::ParamID::Gain);
+            const float q = owner.getNodeParamValue (nodeIndex, SubEQ::ParamID::Q);
+            return juce::String (f, 2) + " Hz, "
+                 + juce::String (g, 1) + " dB, Q "
+                 + juce::String (q, 2);
         }
 
         void setValueAsString (const juce::String& newValue) override
@@ -154,10 +167,43 @@ public:
         if (selectedMode != 0 && ! owner.processor.isFirActive())
             return "FIR warming; the latency-compensated IIR bridge is audible.";
 
+        juce::String base;
         if (owner.selectedNode >= 0 && owner.isNodeEnabled (owner.selectedNode))
-            return "Selected node " + juce::String (owner.selectedNode + 1) + ". "
-                   + "Tab moves between nodes; arrow keys adjust the selected node.";
-        return "No node selected. Press Enter to create a node, or Tab to move through existing nodes.";
+            base = "Selected node " + juce::String (owner.selectedNode + 1) + ". "
+                 + "Tab moves between nodes; arrow keys adjust the selected node.";
+        else
+            base = "No node selected. Press Enter to create a node, or Tab to move through existing nodes.";
+
+        base += " Spectrum range " + juce::String (juce::roundToInt (
+                    owner.getSpectrumDisplayRangeDb())) + " dB.";
+        if (auto* b = owner.apvts.getRawParameterValue ("bypass");
+            b != nullptr && b->load() > 0.5f)
+            base += " Bypassed.";
+
+        if (auto* f = owner.apvts.getRawParameterValue ("fir_length");
+            f != nullptr && owner.processor.getCurrentMode() != SubEQ::EQMode::ZeroLatency)
+        {
+            const int choice = juce::jlimit (0, SubEQ::FFTProcessor::NumFirLengthChoices - 1,
+                                             juce::roundToInt (f->load()));
+            const int taps = SubEQ::FFTProcessor::FirLengthChoices[choice]
+                           - (owner.processor.getCurrentMode() == SubEQ::EQMode::LinearPhase ? 1 : 0);
+            bool insufficient = false;
+            for (int i = 0; i < SubEQ::NumNodes; ++i)
+            {
+                if (! owner.isNodeEnabled (i))
+                    continue;
+                const auto a = SubEQ::assessFirResolution (
+                    owner.getNodeParamValue (i, SubEQ::ParamID::Freq),
+                    owner.getNodeParamValue (i, SubEQ::ParamID::Q),
+                    SubEQ::intToFilterType (juce::roundToInt (
+                        owner.getNodeParamValue (i, SubEQ::ParamID::Type))),
+                    taps, owner.processor.getSampleRate());
+                insufficient = insufficient || ! a.resolvable;
+            }
+            if (insufficient)
+                base += " FIR resolution warning: one or more nodes exceed the selected FIR length.";
+        }
+        return base;
     }
 
     juce::String getHelp() const override
@@ -244,12 +290,12 @@ FrequencyResponse::FrequencyResponse(SubEQAudioProcessor& proc)
 FrequencyResponse::~FrequencyResponse()
 {
     // A window can be closed mid-drag; always close every gesture we opened.
-    if (gestureFreqOpen && draggedNode >= 0)
-        endNodeGesture(draggedNode, SubEQ::ParamID::Freq);
-    if (gestureGainOpen && draggedNode >= 0)
-        endNodeGesture(draggedNode, SubEQ::ParamID::Gain);
-    if (gestureQOpen && draggedNode >= 0)
-        endNodeGesture(draggedNode, SubEQ::ParamID::Q);
+    for (int node = 0; node < SubEQ::NumNodes; ++node)
+    {
+        endNodeGesture(node, SubEQ::ParamID::Freq);
+        endNodeGesture(node, SubEQ::ParamID::Gain);
+        endNodeGesture(node, SubEQ::ParamID::Q);
+    }
 
     apvts.removeParameterListener("spectrum_range", this);
     for (int i = 0; i < SubEQ::NumNodes; ++i)
@@ -336,9 +382,18 @@ void FrequencyResponse::updateNodeComponentBounds()
 
 void FrequencyResponse::visibilityChanged()
 {
+    // addAndMakeVisible() during editor construction fires this while the
+    // parent editor is still hidden; require parent visibility so a created
+    // but never-shown editor does not run the 60 Hz physics/spectrum timers.
+    const auto* parent = getParentComponent();
+    setEditorActive (isVisible() && parent != nullptr && parent->isVisible());
+}
+
+void FrequencyResponse::setEditorActive (bool active)
+{
     // A hidden editor must not keep repainting (or running the node physics
     // timer) at full rate; the host may keep the window alive for a long time.
-    if (isVisible())
+    if (active)
     {
         if (!isTimerRunning())
             startTimerHz (currentTimerHz > 0 ? currentTimerHz : 30);
@@ -439,13 +494,14 @@ void FrequencyResponse::paint(juce::Graphics& g)
     updateResponsePaths();
     drawBackground(g);
     drawGrid(g);
-    drawFirResolutionWarning(g);
-    drawFirWarmStatus(g);
     drawSpectrum(g);
     if (shouldShowPhaseCurve())
         drawPhaseCurve(g);
     drawResponseCurve(g);
     drawNodes(g);
+    // Draw status last so curves/nodes cannot cover the warning text.
+    drawFirResolutionWarning(g);
+    drawFirWarmStatus(g);
 
     if (hasKeyboardFocus (true))
     {
@@ -598,9 +654,10 @@ void FrequencyResponse::drawGrid(juce::Graphics& g)
             g.drawHorizontalLine(static_cast<int>(y),
                                  area.getRight() - 16.0f, area.getRight());
             g.setColour(DesignColours::textSecondary().withAlpha(0.45f));
+            const bool bottomTick = db <= -60.0f;
             g.drawText(juce::String(static_cast<int>(db)),
                        static_cast<int>(area.getRight()) - 38,
-                       static_cast<int>(y) - 7, 20, 14,
+                       static_cast<int>(y) - (bottomTick ? 18 : 7), 20, 14,
                        juce::Justification::right, false);
         }
     }
@@ -670,8 +727,10 @@ void FrequencyResponse::drawFirResolutionWarning(juce::Graphics& g)
     auto area = getResponseArea();
     // Keep clear of the frequency labels at the top of the plot.
     auto textArea = area.reduced (10.0f).withTrimmedTop (20.0f).removeFromTop (16.0f);
+    g.setColour (DesignColours::surface().withAlpha (0.82f));
+    g.fillRoundedRectangle (textArea.expanded (5.0f, 2.0f), 4.0f);
     g.setFont (DesignFonts::caption());
-    g.setColour (DesignColours::morandiBrown());
+    g.setColour (DesignColours::textPrimary());
     g.drawText ("FIR resolution too low - increase FIR length or use Zero Latency",
                 textArea, juce::Justification::left, true);
 }
@@ -2093,32 +2152,43 @@ void FrequencyResponse::notifyNodeValueChanged(int nodeIndex)
         handler->notifyAccessibilityEvent (juce::AccessibilityEvent::valueChanged);
 }
 
+int FrequencyResponse::gestureSlot (SubEQ::ParamID param) noexcept
+{
+    switch (param)
+    {
+        case SubEQ::ParamID::Freq: return 0;
+        case SubEQ::ParamID::Gain: return 1;
+        case SubEQ::ParamID::Q:    return 2;
+        default:                   return -1;
+    }
+}
+
 void FrequencyResponse::beginNodeGesture(int nodeIndex, SubEQ::ParamID param)
 {
-    bool* flag = (param == SubEQ::ParamID::Freq) ? &gestureFreqOpen
-               : (param == SubEQ::ParamID::Gain) ? &gestureGainOpen
-               : (param == SubEQ::ParamID::Q)    ? &gestureQOpen
-                                                  : nullptr;
-    if (flag != nullptr && *flag)
+    if (nodeIndex < 0 || nodeIndex >= SubEQ::NumNodes)
+        return;
+
+    const int slot = gestureSlot(param);
+    if (slot >= 0 && gestureOpen[nodeIndex][slot])
         return;
 
     getNodeParam(nodeIndex, param)->beginChangeGesture();
-    if (flag != nullptr)
-        *flag = true;
+    if (slot >= 0)
+        gestureOpen[nodeIndex][slot] = true;
 }
 
 void FrequencyResponse::endNodeGesture(int nodeIndex, SubEQ::ParamID param)
 {
-    bool* flag = (param == SubEQ::ParamID::Freq) ? &gestureFreqOpen
-               : (param == SubEQ::ParamID::Gain) ? &gestureGainOpen
-               : (param == SubEQ::ParamID::Q)    ? &gestureQOpen
-                                                  : nullptr;
-    if (flag != nullptr && !*flag)
+    if (nodeIndex < 0 || nodeIndex >= SubEQ::NumNodes)
+        return;
+
+    const int slot = gestureSlot(param);
+    if (slot >= 0 && !gestureOpen[nodeIndex][slot])
         return;
 
     getNodeParam(nodeIndex, param)->endChangeGesture();
-    if (flag != nullptr)
-        *flag = false;
+    if (slot >= 0)
+        gestureOpen[nodeIndex][slot] = false;
 }
 
 //==============================================================================
@@ -2170,7 +2240,8 @@ void FrequencyResponse::startTextEdit(EditTarget target, int nodeIndex)
 
     textEditor->onReturnKey = [this]() { finishTextEdit(true); };
     textEditor->onEscapeKey = [this]() { finishTextEdit(false); };
-    textEditor->onFocusLost = [this]() { finishTextEdit(true); };
+    // Clicking outside cancels, matching the mouseDown guard; Enter commits.
+    textEditor->onFocusLost = [this]() { finishTextEdit(false); };
 
     addAndMakeVisible(textEditor.get());
     textEditor->grabKeyboardFocus();

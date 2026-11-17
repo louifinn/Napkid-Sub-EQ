@@ -699,7 +699,7 @@ JUCE Framework
 
 VST3 Technology
   Copyright (c) Steinberg Media Technologies GmbH
-  VST3 SDK License: Apache License 2.0
+  VST3 SDK License: Steinberg VST3 License, or GPLv3 (this project uses GPLv3)
   Website: https://www.steinberg.net/vst3
 
 ASIO Technology (optional, Standalone mode)
@@ -710,5 +710,5 @@ ASIO Technology (optional, Standalone mode)
 Inter font family
   Copyright (c) 2016 The Inter Project Authors
   License: SIL Open Font License 1.1
-  Full text: Source/Fonts/OFL.txt
+  Full text: OFL.txt (package root; source tree: Source/Fonts/OFL.txt)
   Website: https://github.com/rsms/inter

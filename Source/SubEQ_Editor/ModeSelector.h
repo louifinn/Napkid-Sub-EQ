@@ -103,6 +103,7 @@ public:
     void resized() override;
     void paint (juce::Graphics& g) override;
     void visibilityChanged() override;
+    void setEditorActive (bool active);
 
 private:
     void timerCallback() override;
@@ -130,7 +131,6 @@ private:
     // 10 Hz Timer 在消息线程重读参数并更新 ComboBox；音频线程不分配/不加锁。
     void parameterChanged(const juce::String& parameterID, float newValue) override;
     void attachChoice(const juce::String& parameterID, juce::ComboBox& box);
-    juce::ComboBox* boxForParameter(const juce::String& parameterID);
     void syncChoiceBoxes();
 
     std::atomic<bool> uiDirty { false };
@@ -143,7 +143,7 @@ private:
 
     // 频谱显示六组下拉的单一事实来源（控件指针 + 参数 ID + 标题 + 提示 + 项清单）。
     // 新增一个频谱参数只需在 spectrumControlTable() 加一行——构造、attachChoice、
-    // 析构、boxForParameter 与 resized 五处全部遍历该表（STD-06）。
+    // 析构与 resized 四处全部遍历该表（STD-06）。
     struct SpectrumControl
     {
         CaptionedComboBox ModeSelector::* box;

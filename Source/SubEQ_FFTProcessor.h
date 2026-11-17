@@ -87,10 +87,11 @@ public:
         nonRealtime.store(shouldBeNonRealtime, std::memory_order_release);
     }
 
-    // Structural change (mode/FIR length/prepare): invalidate any design
-    // currently being computed, but keep the active design running until the
-    // replacement is ready. Used to avoid starvation under continuous
-    // automation.
+    // Structural change (mode/FIR length): invalidate any design currently
+    // being computed, but keep the published/active design running until the
+    // replacement is ready. Implemented with buildEpoch (not designEpoch), so
+    // the audio path never drops to the IIR bridge merely because a new design
+    // was requested.
     void invalidateDesigns();
 
     // Process entire audio buffer (all channels). Returns true when an active
@@ -129,7 +130,8 @@ public:
         }
 
         const int epoch = designEpoch.load (std::memory_order_acquire);
-        if (meta.epoch == epoch)
+        if (meta.epoch == epoch
+            && meta.version > adoptionCutoffVersion.load (std::memory_order_acquire))
         {
             version = meta.version;
             latency = meta.latency;
@@ -267,9 +269,6 @@ public:
     }
 #endif
 
-    // Total pipeline tail (FIR length + block latency), for tail-length reporting
-    int getTailLengthSamples() const;
-
     // 已发布设计的版本号（每次发布/丢弃都自增）：GUI 据此在后台设计异步发布
     // 之后刷新相位曲线，无需依赖参数变更通知。
     int getDesignVersion() const noexcept { return stateVersion.load(std::memory_order_acquire); }
@@ -314,13 +313,20 @@ public:
         return activeDesignVersion.load(std::memory_order_acquire);
     }
 
+    // FIR length of the design actually feeding the audio path (0 = none).
+    // Used for the host tail hint so a pending shorter design cannot make the
+    // host truncate the still-active tail (both linear and minimum phase).
+    int getActiveFirLength() const noexcept
+    {
+        return activeFirLength.load(std::memory_order_acquire);
+    }
+
     static bool computeFirPhaseResponseDegrees(const FIRState& state,
                                                double normalizedW, double& phaseDeg);
     static bool computeFirMagnitudeDb(const FIRState& state,
                                       double normalizedW, double& magnitudeDb);
 
     static juce::StringArray getModeChoices();
-    static juce::String getModeName(EQMode mode);
     static juce::String getLatencyText(int latencySamples, double sampleRate);
 
 private:
@@ -382,6 +388,10 @@ private:
     mutable bool cachedPlanValid = false;
     mutable std::mutex planMetaMutex;           // serializes producer writes only
     std::atomic<int> minimumPlanVersion { 0 };  // ignore meta below reset cutoff
+    // Published candidates at or below this version were built from parameters
+    // that a structural change has superseded. They must not be adopted; the
+    // already-active design (if any) keeps playing until a newer plan arrives.
+    std::atomic<int> adoptionCutoffVersion { 0 };
     void writePlanMeta(int slot, int warmSlot, int version, int latency,
                        uint64_t target, int epoch) noexcept;
     bool readPlanMeta(PlanMeta& out) const noexcept;
@@ -405,6 +415,7 @@ private:
     int responseSnapshotNext = 0;
     void publishFirResponseSnapshot(const FIRState& state);
     std::atomic<int> activeDesignVersion { 0 };
+    std::atomic<int> activeFirLength { 0 };
 
     std::atomic<int> stateVersion { 0 };        // bumped on every publish/reset
 
@@ -430,10 +441,18 @@ private:
 
     std::atomic<bool> warmRebuildRequested { false };
 
-    // Bumped by prepare(); a design started before the latest prepare is
-    // stale (e.g. wrong sample rate) and must not be published. The worker
-    // re-checks the epoch before writing/publishing a slot.
+    // Plan-validity epoch: bumped only by prepare()/resetConvolution(). Every
+    // published PlanMeta carries this epoch; changing it invalidates both the
+    // active plan and any in-flight build. Structural FIR changes (mode/length)
+    // must NOT touch this: the old plan stays valid and keeps playing until the
+    // replacement is published.
     std::atomic<int> designEpoch { 0 };
+
+    // In-flight build generation: bumped by structural invalidation
+    // (invalidateDesigns) and by prepare()/resetConvolution(). The worker
+    // captures it at build start and aborts before publishing if it changed.
+    // Unlike designEpoch this does not invalidate an already-published plan.
+    std::atomic<int> buildEpoch { 0 };
 
     // Redesign request (audio thread -> background thread)
     std::atomic<bool> redesignRequested { false };
@@ -494,10 +513,6 @@ private:
     int crossfadeRemaining = 0;                             // remaining fade samples
     juce::AudioBuffer<float> xfadeOld, xfadeNew;            // real-input convolution outputs
 
-    // 音频线程惰性 twiddle 预热去重（F-010）：prepareToPlay 可能运行于其他
-    // 线程（thread_local 缓存未命中），音频线程首块对实际尺寸惰性预热。
-    bool audioTwiddlesPrewarmed = false;
-
     // Background warm-up scratch (never touched by the audio thread).
     std::vector<float> warmInput;
     std::vector<float> warmOutput;
@@ -516,8 +531,11 @@ private:
                         int expectedEpoch, uint64_t targetSample);
 
     // Offline path: synchronously build the design coefficients and an exact
-    // warm state at the current committed boundary.
-    std::unique_ptr<FIRState> buildDesignSnapshot(int& outEpoch);
+    // warm state at the current committed boundary. Returns the plan-validity
+    // epoch and the in-flight build generation captured before the build so
+    // callers can reject a design whose session changed mid-build.
+    std::unique_ptr<FIRState> buildDesignSnapshot(int& outPlanEpoch,
+                                                  int& outBuildGeneration);
     bool buildWarmAtCurrentBoundary(const FIRState& design, WarmState& out);
     bool ensureOfflineReady();
 

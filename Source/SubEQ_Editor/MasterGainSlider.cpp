@@ -74,6 +74,11 @@ private:
                     if (auto* self = safe.getComponent(); self != nullptr
                         && self->gainParam != nullptr)
                     {
+                        // A mouse drag owns the gesture; do not begin/end a
+                        // second one on top of it.
+                        if (self->isDragging)
+                            return;
+
                         self->gainParam->beginChangeGesture();
                         self->setValue (value);
                         self->gainParam->endChangeGesture();
@@ -147,9 +152,17 @@ void MasterGainSlider::focusLost(FocusChangeType)
 
 void MasterGainSlider::visibilityChanged()
 {
+    // See FrequencyResponse: require a visible parent so construction alone
+    // cannot start the 20 Hz polling timer.
+    const auto* parent = getParentComponent();
+    setEditorActive (isVisible() && parent != nullptr && parent->isVisible());
+}
+
+void MasterGainSlider::setEditorActive (bool active)
+{
     // The idle 20 Hz poll exists only to surface host automation; a hidden
     // editor does not need it.
-    if (isVisible())
+    if (active)
     {
         if (!isTimerRunning())
             startTimerHz (20);
@@ -438,6 +451,8 @@ void MasterGainSlider::mouseMove(const juce::MouseEvent& event)
         }
     }
 
+    isHovering = isInTravelArea(event.position) || isThumbHitArea(event.position);
+    thumbHovered = isThumbHitArea(event.position);
     updateTrackHover();
 }
 
@@ -451,10 +466,9 @@ void MasterGainSlider::mouseDown(const juce::MouseEvent& event)
         return;
     }
 
-    isPressed = true;
-
     if (isThumbHitArea(event.position))
     {
+        isPressed = true;
         // Drag from the thumb — track + fill stay widened while dragging.
         // (JUCE 7 routes mouse events to the pressed component automatically,
         // so mouseUp always arrives even outside the panel.)
@@ -484,6 +498,8 @@ void MasterGainSlider::mouseDown(const juce::MouseEvent& event)
         // on the left/right blank margins from jumping the value too.
         if (!isInTravelArea(event.position))
             return;
+
+        isPressed = true;
 
         // Click on the track: jump the thumb. Capture the OLD edge position
         // first so the spring visibly travels from there to the new position.
@@ -553,7 +569,7 @@ void MasterGainSlider::mouseUp(const juce::MouseEvent& event)
 
 void MasterGainSlider::mouseEnter(const juce::MouseEvent& event)
 {
-    isHovering = true;
+    isHovering = isInTravelArea(event.position) || isThumbHitArea(event.position);
     thumbHovered = isThumbHitArea(event.position);
     if (!isDragging)
     {

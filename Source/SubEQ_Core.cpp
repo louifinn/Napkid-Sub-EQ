@@ -144,12 +144,13 @@ void EQNode::update(double freqHz, double gain, double qValue, FilterType type)
 
 std::complex<double> EQNode::getResponse(double w) const noexcept
 {
-    if (!enabled)
-        return std::complex<double>(1.0, 0.0);
-
     std::complex<double> response = biquadResponse(coeffs[0], w);
     if (numBiquads > 1 || extraBiquadFadeOut)
         response *= biquadResponse(coeffs[1], w);
+
+    if (fadeGain < 1.0)
+        response = std::complex<double>(1.0 - fadeGain, 0.0)
+                 + fadeGain * response;
 
     return response;
 }

@@ -165,18 +165,22 @@ void SpectrumAnalyzer::configure (int resolutionIndex, int numBandsIn, int hopSi
 {
     const int bands = kBandsByDensity[bandDensityForBands (numBandsIn)];
     const int hop = (hopSizeIn == 1024) ? 1024 : (hopSizeIn == 2048 ? 2048 : 512);
+    const int resolution = (resolutionIndex >= 0 && resolutionIndex < NumResolutionLevels)
+                               ? resolutionIndex : 1;
 
     // Only reset the analysis state when the analysis grid actually changes.
     // A smoothing-only or hop-only change must keep powers/env/rings; hop
-    // changes only restart the per-tier stride counters.
+    // changes only restart the per-tier stride counters. Compare the clamped
+    // resolution so a repeated invalid value cannot reset the analyser on
+    // every block (which would keep the display permanently at the floor).
     const bool analysisChanged = (bands != activeNumBands)
-                              || (resolutionIndex != lastResolutionIndex)
+                              || (resolution != lastResolutionIndex)
                               || (window != lastWindow);
     const bool hopChanged = (hop != hopSize.load());
 
     // 状态全部一致后才发布新配置
     activeNumBands = bands;
-    lastResolutionIndex = (resolutionIndex >= 0 && resolutionIndex < NumResolutionLevels) ? resolutionIndex : 1;
+    lastResolutionIndex = resolution;
     lastWindow = window;
     smoothRadius = smoothingRadiusBands (smoothingIndex, bands);
     if (! kernelSetList().empty())
@@ -278,10 +282,12 @@ void SpectrumAnalyzer::publishFrame() noexcept
     auto& frame = frames[next];
 
     frame.seq.fetch_add (1, std::memory_order_release);   // odd: writing
-    frame.resetEpoch = resetEpoch.load (std::memory_order_acquire);
-    frame.bands = activeNumBands;
+    frame.resetEpoch.store (resetEpoch.load (std::memory_order_acquire),
+                            std::memory_order_relaxed);
+    frame.bands.store (activeNumBands, std::memory_order_relaxed);
     for (int i = 0; i < MaxBands; ++i)
-        frame.values[i] = static_cast<float> (displayBands[i]);
+        frame.values[i].store (static_cast<float> (displayBands[i]),
+                               std::memory_order_relaxed);
     frame.seq.fetch_add (1, std::memory_order_release);   // even: complete
 
     readyFrame.store (next, std::memory_order_release);
@@ -303,18 +309,27 @@ int SpectrumAnalyzer::getSpectrum (float* outputBands) const
         if ((seq & 1u) != 0)
             continue;
 
-        const int bands = juce::jlimit (0, MaxBands, frame.bands);
+        const int bands = juce::jlimit (0, MaxBands,
+                                       frame.bands.load (std::memory_order_relaxed));
+        const uint32_t frameEpoch = frame.resetEpoch.load (std::memory_order_relaxed);
 
-        if (frame.resetEpoch < floorUntil)
+        // Both the reset check and the payload copy must be covered by the
+        // same seqlock window; a publish that lands during either one retries.
+        if (frameEpoch < floorUntil)
         {
+            std::atomic_thread_fence (std::memory_order_acquire);
+            if (frame.seq.load (std::memory_order_acquire) != seq)
+                continue;
+
             for (int i = 0; i < fallbackBands && i < MaxBands; ++i)
                 outputBands[i] = -RangeDb;
             return fallbackBands;
         }
 
         for (int i = 0; i < bands; ++i)
-            outputBands[i] = frame.values[i];
+            outputBands[i] = frame.values[i].load (std::memory_order_relaxed);
 
+        std::atomic_thread_fence (std::memory_order_acquire);
         if (frame.seq.load (std::memory_order_acquire) == seq)
             return bands;
     }
